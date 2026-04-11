@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "origo"
-version = "0.1.0"
+version = "0.1.1"
 description = "Drop-in OAuth 2.1 provider for MCP servers. Works with FastMCP, FastAPI, and the raw MCP SDK."
 authors = [
   { name = "Ilari Pirkkalainen", email = "iladevv0@gmail.com" }
