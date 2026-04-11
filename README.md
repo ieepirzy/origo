@@ -1,4 +1,4 @@
-# oauth-mcp
+# origo
 > Implements the OAuth flow for a MCP server as a Starlette based middleware layer, with public and private registeration modes.
 
 Drop-in OAuth 2.1 provider for MCP servers. Handles the full Authorization Code + PKCE flow with no external identity provider required.
@@ -58,6 +58,25 @@ app.add_middleware(OAuthMiddleware, provider=auth)
 app.mount("/oauth", auth.asgi_app())
 ```
 
+## How this differs from enterprise OAuth
+Traditional OAuth deployments separate the authorization server from the resource server — the MCP server asks a dedicated auth service "is this token valid?" on every request (RFC 7662 token introspection). This is correct for multi-tenant systems where tokens need to be revoked instantly across many services.
+
+`origo` collapses this into a single process. Token validation is an in-memory lookup. Fast, zero network overhead, no second service to run. The tradeoff is that token revocation requires a server restart, and there's no centralized auth service to share across multiple resource servers. This also introduce a single point of failure and security relies on the shared memory with the application it is authenticating for.
+
+
+**Use this when:**
+
+- You're running a personal or private MCP server
+- You control who gets client credentials
+- Operational simplicity matters more than enterprise auth guarantees
+
+**Use a proper auth server (Keycloak, Auth0, etc.) when:**
+
+- Multiple users need independent identities
+- You need instant token revocation
+- You're sharing one auth service across many MCP servers
+- Compliance requirements mandate it
+
 ## Two Modes
 
 ### Private (default)
@@ -103,3 +122,5 @@ auth = OAuthProvider(
 | `POST /register` | Dynamic client registration (public mode only) |
 | `GET /authorize` | Authorization + consent |
 | `POST /token` | Token exchange |
+
+

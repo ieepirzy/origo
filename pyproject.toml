@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "oauth-mcp"
+name = "origo"
 version = "0.1.0"
 description = "Drop-in OAuth 2.1 provider for MCP servers. Works with FastMCP, FastAPI, and the raw MCP SDK."
 authors = [
