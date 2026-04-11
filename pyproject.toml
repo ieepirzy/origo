@@ -30,10 +30,10 @@ fastapi = ["fastapi>=0.100.0"]
 dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.urls]
-Homepage = "https://github.com/ieepirzy/oauth-mcp"
-Documentation = "https://github.com/ieepirzy/oauth-mcp/blob/main/README.md"
-Source = "https://github.com/ieepirzy/oauth-mcp"
-Issues = "https://github.com/ieepirzy/oauth-mcp/issues"
+Homepage = "https://github.com/ieepirzy/origo"
+Documentation = "https://github.com/ieepirzy/origo/blob/main/README.md"
+Source = "https://github.com/ieepirzy/origo"
+Issues = "https://github.com/ieepirzy/origo/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["origo"]
