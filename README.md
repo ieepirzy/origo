@@ -8,7 +8,7 @@ Works with **FastMCP**, **FastAPI**, and the raw **MCP SDK**.
 ## Install
 
 ```bash
-pip install oauth-mcp
+pip install origo
 ```
 
 ## Quickstart
