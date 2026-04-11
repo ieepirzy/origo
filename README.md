@@ -17,7 +17,7 @@ pip install origo
 
 ```python
 from fastmcp import FastMCP
-from oauth_mcp import OAuthProvider, OAuthMiddleware
+from origo import OAuthProvider, OAuthMiddleware
 import os
 
 auth = OAuthProvider(
@@ -45,7 +45,7 @@ root = Starlette(routes=[
 
 ```python
 from fastapi import FastAPI
-from oauth_mcp import OAuthProvider, OAuthMiddleware
+from origo import OAuthProvider, OAuthMiddleware
 import os
 
 auth = OAuthProvider(
