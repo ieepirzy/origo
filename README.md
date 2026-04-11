@@ -18,6 +18,8 @@ pip install origo
 ```python
 from fastmcp import FastMCP
 from origo import OAuthProvider, OAuthMiddleware
+from starlette.routing import Mount
+from starlette.applications import Starlette
 import os
 
 auth = OAuthProvider(
@@ -33,8 +35,6 @@ app = mcp.streamable_http_app()
 app.add_middleware(OAuthMiddleware, provider=auth)
 
 # Mount OAuth endpoints at root
-from starlette.routing import Mount
-from starlette.applications import Starlette
 root = Starlette(routes=[
     Mount("/oauth", app=auth.asgi_app()),
     Mount("/", app=app),
