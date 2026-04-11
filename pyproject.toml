@@ -36,4 +36,4 @@ Source = "https://github.com/ieepirzy/oauth-mcp"
 Issues = "https://github.com/ieepirzy/oauth-mcp/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["oauth_mcp"]
+packages = ["origo"]
