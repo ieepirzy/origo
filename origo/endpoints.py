@@ -10,6 +10,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 from .storage import OAuthStorage
 
+import base64
 
 def _b64decode(s: str) -> bytes:
     """URL-safe base64 decode with padding."""
@@ -20,7 +21,6 @@ def _b64decode(s: str) -> bytes:
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     if method == "S256":
         digest = hashlib.sha256(code_verifier.encode()).digest()
-        import base64
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
         return hmac.compare_digest(expected, code_challenge)
     elif method == "plain":
@@ -184,7 +184,6 @@ async def token(request: Request) -> JSONResponse:
     if not client_id:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Basic "):
-            import base64
             decoded = base64.b64decode(auth[6:]).decode()
             if ":" in decoded:
                 client_id, client_secret = decoded.split(":", 1)
