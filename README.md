@@ -1,7 +1,7 @@
 # origo
-> Implements the OAuth flow for a MCP server as a Starlette based middleware layer, with public and private registeration modes.
+> Implements the OAuth2.1 + PKCE flow as a drop-in Starlette based middleware layer, with public and private registration modes.
 
-Drop-in OAuth 2.1 provider for MCP servers. Handles the full Authorization Code + PKCE flow with no external identity provider required.
+Drop-in OAuth 2.1 provider, originally developed for use in custom/private MCP servers. Handles the full Authorization Code + PKCE flow with no external identity provider required.
 
 Works with **FastMCP**, **FastAPI**, and the raw **MCP SDK**.
 
@@ -50,7 +50,7 @@ import os
 
 auth = OAuthProvider(
     base_url="https://api.yourdomain.com",
-    clients={os.getenv("MCP_CLIENT_ID"): os.getenv("MCP_CLIENT_SECRET")},
+    clients={os.getenv("OAUTH_CLIENT_ID"): os.getenv("OAUTH_CLIENT_SECRET")},
 )
 
 app = FastAPI()
@@ -66,7 +66,7 @@ Traditional OAuth deployments separate the authorization server from the resourc
 
 **Use this when:**
 
-- You're running a personal or private MCP server
+- You're running a personal or private server (ex. MCP server) with simple OAuth requirements
 - You control who gets client credentials
 - Operational simplicity matters more than enterprise auth guarantees
 
@@ -74,7 +74,7 @@ Traditional OAuth deployments separate the authorization server from the resourc
 
 - Multiple users need independent identities
 - You need instant token revocation
-- You're sharing one auth service across many MCP servers
+- You're sharing one auth service across many servers (ex. MCP servers)
 - Compliance requirements mandate it
 
 ## Two Modes
