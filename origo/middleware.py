@@ -1,6 +1,17 @@
 import json
 
+import anyio
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    """Return True if exc is (or wraps only) anyio.ClosedResourceError."""
+    if isinstance(exc, anyio.ClosedResourceError):
+        return True
+    if hasattr(exc, "exceptions"):  # ExceptionGroup / BaseExceptionGroup (Python 3.11+)
+        return all(_is_client_disconnect(e) for e in exc.exceptions)
+    return False
+
 
 # Paths that must be publicly accessible for the OAuth flow to work
 _PUBLIC_PREFIXES = (
@@ -67,4 +78,9 @@ class OAuthMiddleware:
             )
             return
 
-        await self.app(scope, receive, send)
+        try:
+            await self.app(scope, receive, send)
+        except BaseException as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
