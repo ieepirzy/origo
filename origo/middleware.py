@@ -1,6 +1,6 @@
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+import json
+
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # Paths that must be publicly accessible for the OAuth flow to work
 _PUBLIC_PREFIXES = (
@@ -11,7 +11,18 @@ _PUBLIC_PREFIXES = (
 )
 
 
-class OAuthMiddleware(BaseHTTPMiddleware):
+async def _send_json(send: Send, body: dict, status: int, extra_headers: list[tuple[bytes, bytes]] = ()):
+    encoded = json.dumps(body).encode()
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(encoded)).encode()),
+        *extra_headers,
+    ]
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": encoded, "more_body": False})
+
+
+class OAuthMiddleware:
     """
     Validates Bearer tokens on all requests except OAuth flow endpoints.
 
@@ -19,31 +30,41 @@ class OAuthMiddleware(BaseHTTPMiddleware):
         app.add_middleware(OAuthMiddleware, provider=my_oauth_provider)
     """
 
-    def __init__(self, app, provider):
-        super().__init__(app)
+    def __init__(self, app: ASGIApp, provider):
+        self.app = app
         self.provider = provider
 
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
 
-        # Let OAuth flow endpoints through unauthenticated
+        path = scope.get("path", "")
+
         if any(path.startswith(p) for p in _PUBLIC_PREFIXES):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        auth = request.headers.get("Authorization", "")
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+
         if not auth.startswith("Bearer "):
-            return JSONResponse(
+            await _send_json(
+                send,
                 {"error": "unauthorized", "error_description": "Bearer token required."},
-                status_code=401,
-                headers={"WWW-Authenticate": f'Bearer realm="{self.provider.base_url}"'},
+                401,
+                [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}"'.encode())],
             )
+            return
 
         token = auth[len("Bearer "):]
         if self.provider.verify_token(token) is None:
-            return JSONResponse(
+            await _send_json(
+                send,
                 {"error": "invalid_token", "error_description": "Token is invalid or expired."},
-                status_code=401,
-                headers={"WWW-Authenticate": f'Bearer realm="{self.provider.base_url}" error="invalid_token"'},
+                401,
+                [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}" error="invalid_token"'.encode())],
             )
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
