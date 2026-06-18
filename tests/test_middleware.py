@@ -1,0 +1,105 @@
+import json
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from origo import OAuthMiddleware, OAuthProvider
+
+
+async def _protected(request: Request):
+    return JSONResponse({"ok": True})
+
+
+def _make_app(provider: OAuthProvider):
+    inner = Starlette(routes=[Route("/mcp", _protected)])
+    inner.add_middleware(OAuthMiddleware, provider=provider)
+    return inner
+
+
+@pytest.fixture
+def provider():
+    return OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"},
+        auto_approve=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_paths_bypass_well_known(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        # /.well-known/ routes are served by the OAuth app, not the inner app,
+        # but the middleware should not block them at all.
+        resp = await client.get("/.well-known/oauth-authorization-server")
+        assert resp.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_protected_path_without_token_returns_401(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp")
+        assert resp.status_code == 401
+        body = resp.json()
+        assert body["error"] == "unauthorized"
+        assert "WWW-Authenticate" in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_protected_path_with_invalid_token_returns_401(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp", headers={"Authorization": "Bearer bogus-token"})
+        assert resp.status_code == 401
+        assert resp.json()["error"] == "invalid_token"
+
+
+@pytest.mark.asyncio
+async def test_protected_path_with_valid_token_passes(provider):
+    token = provider.storage.store_token("c")
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_authorize_path_is_public(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+        }, follow_redirects=False)
+        assert resp.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_token_path_is_public(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.post("/token", data={
+            "grant_type": "authorization_code",
+            "client_id": "c",
+            "client_secret": "s",
+            "code": "fake",
+            "code_verifier": "fake",
+        })
+        # Should get an auth error, not 401 unauthorized from middleware
+        assert resp.status_code != 401 or resp.json().get("error") != "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_www_authenticate_header_includes_realm(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp")
+        assert "testserver" in resp.headers.get("WWW-Authenticate", "")
