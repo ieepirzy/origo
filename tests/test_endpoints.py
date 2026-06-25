@@ -111,6 +111,30 @@ async def test_authorize_shows_consent_page(client_public):
 
 
 @pytest.mark.asyncio
+async def test_authorize_shows_consent_page_xss_escaped(client_public):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    xss_payload = 'c<script>alert(1)</script>'
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={xss_payload: "s"},
+        auto_approve=False,
+    )
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": xss_payload,
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        })
+    assert resp.status_code == 200
+    assert b"<form" in resp.content
+    assert b"<script>alert(1)</script>" not in resp.content
+    assert b"c&lt;script&gt;alert(1)&lt;/script&gt;" in resp.content
+
+
+@pytest.mark.asyncio
 async def test_authorize_unknown_client(client_private):
     client, _ = client_private
     verifier, challenge = make_pkce_pair()
