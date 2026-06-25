@@ -184,9 +184,12 @@ async def token(request: Request) -> JSONResponse:
     if not client_id:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Basic "):
-            decoded = base64.b64decode(auth[6:]).decode()
-            if ":" in decoded:
-                client_id, client_secret = decoded.split(":", 1)
+            try:
+                decoded = base64.b64decode(auth[6:]).decode()
+                if ":" in decoded:
+                    client_id, client_secret = decoded.split(":", 1)
+            except Exception:
+                return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     code = params.get("code")
     code_verifier = params.get("code_verifier")
