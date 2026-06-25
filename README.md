@@ -1,4 +1,9 @@
 # origo
+
+[![CI](https://github.com/ieepirzy/origo/actions/workflows/ci.yml/badge.svg)](https://github.com/ieepirzy/origo/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/origo)](https://pypi.org/project/origo/)
+[![Python versions](https://img.shields.io/pypi/pyversions/origo)](https://pypi.org/project/origo/)
+
 > Implements the OAuth2.1 + PKCE flow as a drop-in Starlette based middleware layer, with public and private registration modes.
 
 Drop-in OAuth 2.1 provider, originally developed for use in custom/private MCP servers. Handles the full Authorization Code + PKCE flow with no external identity provider required.
@@ -59,10 +64,10 @@ app.mount("/oauth", auth.asgi_app())
 ```
 
 ## How this differs from enterprise OAuth
+
 Traditional OAuth deployments separate the authorization server from the resource server — the MCP server asks a dedicated auth service "is this token valid?" on every request (RFC 7662 token introspection). This is correct for multi-tenant systems where tokens need to be revoked instantly across many services.
 
 `origo` collapses this into a single process. Token validation is an in-memory lookup. Fast, zero network overhead, no second service to run. The tradeoff is that token revocation requires a server restart, and there's no centralized auth service to share across multiple resource servers. This also introduce a single point of failure and security relies on the shared memory with the application it is authenticating for.
-
 
 **Use this when:**
 
@@ -105,7 +110,7 @@ auth = OAuthProvider(
 ## Options
 
 | Parameter | Type | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `base_url` | `str` | required | Public base URL, no trailing slash |
 | `clients` | `dict` | `None` | Pre-registered `{client_id: client_secret}` |
 | `public_registration` | `bool` | `False` | Allow dynamic client registration |
@@ -116,11 +121,9 @@ auth = OAuthProvider(
 ## OAuth Endpoints
 
 | Endpoint | Description |
-|---|---|
+| --- | --- |
 | `GET /.well-known/oauth-authorization-server` | Discovery |
 | `GET /.well-known/oauth-protected-resource` | Resource metadata |
 | `POST /register` | Dynamic client registration (public mode only) |
 | `GET /authorize` | Authorization + consent |
 | `POST /token` | Token exchange |
-
-
