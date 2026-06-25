@@ -72,6 +72,7 @@ async def do_full_flow(client, provider, client_id, client_secret, redirect_uri=
         "client_secret": client_secret,
         "code": code,
         "code_verifier": verifier,
+        "redirect_uri": redirect_uri,
     })
     assert resp.status_code == 200
     return resp.json()["access_token"]

@@ -191,11 +191,12 @@ async def token(request: Request) -> JSONResponse:
     code = params.get("code")
     code_verifier = params.get("code_verifier")
     grant_type = params.get("grant_type")
+    redirect_uri = params.get("redirect_uri")
 
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    if not all([client_id, client_secret, code, code_verifier]):
+    if not all([client_id, client_secret, code, code_verifier, redirect_uri]):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     # Verify client credentials
@@ -209,6 +210,9 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant", "error_description": "Code expired or invalid."}, status_code=401)
 
     if code_entry["client_id"] != client_id:
+        return JSONResponse({"error": "invalid_grant"}, status_code=401)
+
+    if code_entry["redirect_uri"] != redirect_uri:
         return JSONResponse({"error": "invalid_grant"}, status_code=401)
 
     # Verify PKCE
