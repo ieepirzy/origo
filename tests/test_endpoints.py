@@ -269,6 +269,19 @@ async def test_token_basic_auth(client_private):
 
 
 @pytest.mark.asyncio
+async def test_token_invalid_base64(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    resp = await client.post("/token",
+        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier},
+        headers={"Authorization": "Basic invalid-base64-string!@#"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_token_wrong_grant_type(client_private):
     client, _ = client_private
     resp = await client.post("/token", data={
