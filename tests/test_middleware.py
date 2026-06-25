@@ -6,8 +6,10 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+import anyio
 
 from origo import OAuthMiddleware, OAuthProvider
+from origo.middleware import _is_client_disconnect
 
 
 async def _protected(request: Request):
@@ -103,3 +105,24 @@ async def test_www_authenticate_header_includes_realm(provider):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         resp = await client.get("/mcp")
         assert "testserver" in resp.headers.get("WWW-Authenticate", "")
+
+
+def test_is_client_disconnect():
+    assert _is_client_disconnect(anyio.ClosedResourceError()) is True
+    assert _is_client_disconnect(Exception()) is False
+    assert _is_client_disconnect(ValueError()) is False
+
+    assert _is_client_disconnect(ExceptionGroup("msg", [anyio.ClosedResourceError()])) is True
+    assert _is_client_disconnect(ExceptionGroup("msg", [anyio.ClosedResourceError(), anyio.ClosedResourceError()])) is True
+
+    assert _is_client_disconnect(ExceptionGroup("msg", [anyio.ClosedResourceError(), ValueError()])) is False
+
+    assert _is_client_disconnect(ExceptionGroup("msg", [
+        anyio.ClosedResourceError(),
+        ExceptionGroup("msg2", [anyio.ClosedResourceError()])
+    ])) is True
+
+    assert _is_client_disconnect(ExceptionGroup("msg", [
+        anyio.ClosedResourceError(),
+        ExceptionGroup("msg2", [anyio.ClosedResourceError(), ValueError()])
+    ])) is False
