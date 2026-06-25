@@ -307,3 +307,30 @@ async def test_token_missing_params(client_private):
     client, _ = client_private
     resp = await client.post("/token", data={"grant_type": "authorization_code"})
     assert resp.status_code == 400
+
+# --- Utilities ---
+
+def test_b64decode():
+    from origo.endpoints import _b64decode
+
+    # Test cases with different lengths to hit different padding scenarios
+    # "a" -> "YQ==" (needs 2 pads)
+    # "ab" -> "YWI=" (needs 1 pad)
+    # "abc" -> "YWJj" (needs 0 pads)
+    # "abcd" -> "YWJjZA==" (needs 2 pads)
+
+    assert _b64decode("YQ") == b"a"
+    assert _b64decode("YQ==") == b"a"
+
+    assert _b64decode("YWI") == b"ab"
+    assert _b64decode("YWI=") == b"ab"
+
+    assert _b64decode("YWJj") == b"abc"
+
+    assert _b64decode("YWJjZA") == b"abcd"
+    assert _b64decode("YWJjZA==") == b"abcd"
+
+    # URL-safe characters
+    # b"\xfb\xff" -> "-_8="
+    assert _b64decode("-_8") == b"\xfb\xff"
+    assert _b64decode("-_8=") == b"\xfb\xff"
