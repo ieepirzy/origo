@@ -107,6 +107,14 @@ async def test_www_authenticate_header_includes_realm(provider):
         assert "testserver" in resp.headers.get("WWW-Authenticate", "")
 
 
+try:
+    ExceptionGroup  # type: ignore
+except NameError:
+    class ExceptionGroup(Exception):
+        def __init__(self, message, exceptions):
+            self.exceptions = exceptions
+
+
 def test_is_client_disconnect():
     assert _is_client_disconnect(anyio.ClosedResourceError()) is True
     assert _is_client_disconnect(Exception()) is False
