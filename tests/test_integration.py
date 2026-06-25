@@ -44,6 +44,7 @@ async def test_token_is_rejected_after_second_code_use(client_private):
         "client_secret": "test-secret",
         "code": code,
         "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
     })
     assert r1.status_code == 200
 
@@ -54,6 +55,7 @@ async def test_token_is_rejected_after_second_code_use(client_private):
         "client_secret": "test-secret",
         "code": code,
         "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
     })
     assert r2.status_code == 401
 

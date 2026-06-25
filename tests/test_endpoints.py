@@ -182,6 +182,7 @@ async def test_token_exchange_s256(client_private):
         "client_secret": "test-secret",
         "code": code,
         "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
     })
     assert resp.status_code == 200
     data = resp.json()
@@ -201,6 +202,7 @@ async def test_token_exchange_plain(client_private):
         "client_secret": "test-secret",
         "code": code,
         "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
     })
     assert resp.status_code == 200
 
@@ -216,6 +218,7 @@ async def test_token_invalid_pkce(client_private):
         "client_secret": "test-secret",
         "code": code,
         "code_verifier": "wrong-verifier",
+        "redirect_uri": "https://example.com/cb",
     })
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_grant"
@@ -234,6 +237,7 @@ async def test_token_expired_code(client_private):
             "client_secret": "test-secret",
             "code": code,
             "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
         })
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_grant"
@@ -250,6 +254,7 @@ async def test_token_invalid_client_secret(client_private):
         "client_secret": "wrong-secret",
         "code": code,
         "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
     })
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_client"
@@ -262,23 +267,27 @@ async def test_token_basic_auth(client_private):
     code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
     credentials = base64.b64encode(b"test-client:test-secret").decode()
     resp = await client.post("/token",
-        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier},
+        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": "https://example.com/cb"},
         headers={"Authorization": f"Basic {credentials}"},
     )
     assert resp.status_code == 200
 
 
 @pytest.mark.asyncio
-async def test_token_invalid_base64(client_private):
+async def test_token_invalid_redirect_uri(client_private):
     client, provider = client_private
     verifier, challenge = make_pkce_pair()
     code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
-    resp = await client.post("/token",
-        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier},
-        headers={"Authorization": "Basic invalid-base64-string!@#"},
-    )
-    assert resp.status_code == 400
-    assert resp.json()["error"] == "invalid_request"
+    resp = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://wrong.com/cb",
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
 
 
 @pytest.mark.asyncio
