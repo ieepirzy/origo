@@ -6,6 +6,12 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
+from origo.endpoints import _verify_pkce
+
+def test_verify_pkce_unsupported_method():
+    """Test that _verify_pkce returns False for an unsupported method."""
+    assert _verify_pkce("test-verifier", "test-challenge", "unsupported") is False
+
 
 # --- Discovery ---
 
