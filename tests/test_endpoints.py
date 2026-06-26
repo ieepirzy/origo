@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import secrets
+import warnings
 
 import pytest
 
@@ -136,7 +137,7 @@ async def test_authorize_invalid_redirect_uri(client_public):
     # Register a client with a specific redirect_uri, then try a different one
     reg = await client.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
     assert reg.status_code == 201
-    cid, csecret = reg.json()["client_id"], reg.json()["client_secret"]
+    cid = reg.json()["client_id"]
     _, challenge = make_pkce_pair()
     resp = await client.get("/authorize", params={
         "client_id": cid,
@@ -331,3 +332,56 @@ async def test_token_missing_params(client_private):
     client, _ = client_private
     resp = await client.post("/token", data={"grant_type": "authorization_code"})
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_token_basic_auth_malformed_base64(client_private):
+    client, _ = client_private
+    # b"\xff\xfe" is valid base64 but not valid UTF-8, triggering the except branch
+    bad_b64 = base64.b64encode(b"\xff\xfe").decode()
+    resp = await client.post("/token",
+        data={"grant_type": "authorization_code", "code": "x", "code_verifier": "x", "redirect_uri": "https://example.com/cb"},
+        headers={"Authorization": f"Basic {bad_b64}"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_token_client_id_mismatch():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"client-a": "secret-a", "client-b": "secret-b"},
+        auto_approve=True,
+    )
+    verifier, challenge = make_pkce_pair()
+    code = p.storage.store_code("client-a", "https://example.com/cb", challenge)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/token", data={
+            "grant_type": "authorization_code",
+            "client_id": "client-b",
+            "client_secret": "secret-b",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
+        })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+
+
+def test_no_clients_warning():
+    from origo import OAuthProvider
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        OAuthProvider(base_url="http://testserver")
+    assert len(w) == 1
+    assert issubclass(w[0].category, UserWarning)
+    assert "no clients" in str(w[0].message).lower()
+
+
+def test_middleware_method():
+    from origo import OAuthProvider, OAuthMiddleware
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
+    assert p.middleware() is OAuthMiddleware

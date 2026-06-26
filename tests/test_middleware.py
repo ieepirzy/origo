@@ -134,3 +134,46 @@ def test_is_client_disconnect():
         anyio.ClosedResourceError(),
         ExceptionGroup("msg2", [anyio.ClosedResourceError(), ValueError()])
     ])) is False
+
+
+@pytest.mark.asyncio
+async def test_non_http_scope_passes_through(provider):
+    passed = []
+
+    async def inner(scope, receive, send):
+        passed.append(scope["type"])
+
+    mw = OAuthMiddleware(inner, provider=provider)
+    await mw({"type": "lifespan"}, None, None)
+    assert passed == ["lifespan"]
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_swallowed(provider):
+    async def inner(scope, receive, send):
+        raise anyio.ClosedResourceError()
+
+    token = provider.storage.store_token("c")
+    mw = OAuthMiddleware(inner, provider=provider)
+    scope = {
+        "type": "http",
+        "path": "/mcp",
+        "headers": [(b"authorization", f"Bearer {token}".encode())],
+    }
+    await mw(scope, None, None)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_non_disconnect_exception_propagates(provider):
+    async def inner(scope, receive, send):
+        raise RuntimeError("boom")
+
+    token = provider.storage.store_token("c")
+    mw = OAuthMiddleware(inner, provider=provider)
+    scope = {
+        "type": "http",
+        "path": "/mcp",
+        "headers": [(b"authorization", f"Bearer {token}".encode())],
+    }
+    with pytest.raises(RuntimeError, match="boom"):
+        await mw(scope, None, None)

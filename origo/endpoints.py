@@ -3,7 +3,6 @@ import hmac
 import html
 import json
 import secrets
-from base64 import urlsafe_b64decode
 from urllib.parse import urlencode
 
 from starlette.requests import Request
@@ -12,11 +11,6 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from .storage import OAuthStorage
 
 import base64
-
-def _b64decode(s: str) -> bytes:
-    """URL-safe base64 decode with padding."""
-    s += "=" * (-len(s) % 4)
-    return urlsafe_b64decode(s)
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:

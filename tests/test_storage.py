@@ -82,3 +82,7 @@ def test_token_ttl_respected(storage):
     assert short_storage.verify_token(token) is not None
     with patch("origo.storage._now", return_value=9999999999.0):
         assert short_storage.verify_token(token) is None
+
+
+def test_is_redirect_uri_allowed_unknown_client(storage):
+    assert storage.is_redirect_uri_allowed("nonexistent", "https://example.com") is False
