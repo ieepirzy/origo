@@ -52,7 +52,7 @@ class OAuthMiddleware:
 
         path = scope.get("path", "")
 
-        if any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        if path.startswith(_PUBLIC_PREFIXES):
             await self.app(scope, receive, send)
             return
 

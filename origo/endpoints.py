@@ -82,7 +82,7 @@ async def register(request: Request) -> JSONResponse:
 
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
-    storage.register_client(client_id, client_secret)
+    storage.register_client(client_id, client_secret, redirect_uris)
 
     return JSONResponse({
         "client_id": client_id,
@@ -155,6 +155,9 @@ async def authorize(request: Request) -> Response:
 
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
+
+    if not storage.is_redirect_uri_allowed(client_id, redirect_uri):
+        return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not allowed."}, status_code=400)
 
     # Show consent page on GET unless auto_approve
     if request.method == "GET" and not auto_approve:

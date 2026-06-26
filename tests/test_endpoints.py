@@ -131,6 +131,24 @@ async def test_authorize_unknown_client(client_private):
 
 
 @pytest.mark.asyncio
+async def test_authorize_invalid_redirect_uri(client_public):
+    client, _ = client_public
+    # Register a client with a specific redirect_uri, then try a different one
+    reg = await client.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+    assert reg.status_code == 201
+    cid, csecret = reg.json()["client_id"], reg.json()["client_secret"]
+    _, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
+        "client_id": cid,
+        "redirect_uri": "https://evil.com/steal",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }, follow_redirects=False)
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_authorize_missing_params(client_private):
     client, _ = client_private
     resp = await client.get("/authorize", params={"client_id": "test-client"})

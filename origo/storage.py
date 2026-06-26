@@ -1,34 +1,44 @@
 import secrets
-from datetime import datetime, timezone
+import time
 from typing import Optional
 
 
 def _now() -> float:
-    return datetime.now(timezone.utc).timestamp()
+    return time.time()
 
 
 class OAuthStorage:
     def __init__(self, token_ttl: int = 3600):
         self.token_ttl = token_ttl
-        self._clients: dict[str, str] = {}        # client_id -> client_secret
+        self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris}
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
 
     # --- Clients ---
 
     def seed_clients(self, clients: dict[str, str]) -> None:
-        """Seed pre-registered clients."""
-        self._clients.update(clients)
+        """Seed pre-registered clients. Empty redirect_uris means any URI is allowed."""
+        for client_id, secret in clients.items():
+            self._clients[client_id] = {"secret": secret, "redirect_uris": []}
 
-    def register_client(self, client_id: str, client_secret: str) -> None:
+    def register_client(self, client_id: str, client_secret: str, redirect_uris: list[str] = ()) -> None:
         """Dynamically register a new client (public mode)."""
-        self._clients[client_id] = client_secret
+        self._clients[client_id] = {"secret": client_secret, "redirect_uris": list(redirect_uris)}
 
     def get_client_secret(self, client_id: str) -> Optional[str]:
-        return self._clients.get(client_id)
+        entry = self._clients.get(client_id)
+        return entry["secret"] if entry else None
 
     def client_exists(self, client_id: str) -> bool:
         return client_id in self._clients
+
+    def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
+        """Return True if redirect_uri is allowed for the client. No stored URIs means any is allowed."""
+        entry = self._clients.get(client_id)
+        if entry is None:
+            return False
+        allowed = entry["redirect_uris"]
+        return not allowed or redirect_uri in allowed
 
     # --- Auth codes ---
 
