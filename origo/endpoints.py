@@ -97,9 +97,10 @@ async def register(request: Request) -> JSONResponse:
 # --- Authorize ---
 
 def _consent_page(params: dict) -> HTMLResponse:
+    expected_params = ["client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state"]
     hidden = "\n".join(
-        f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(v))}">'
-        for k, v in params.items()
+        f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(params.get(k, "")))}">'
+        for k in expected_params if k in params
     )
     escaped_client_id = html.escape(str(params.get('client_id', '')))
     page_html = f"""<!DOCTYPE html>
