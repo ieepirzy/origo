@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "origo"
-version = "0.1.5"
+version = "0.1.6"
 description = "Drop-in OAuth 2.1 provider for servers. Developed originally for custom/private MCP servers. Works with FastMCP, FastAPI, and the raw MCP SDK."
 authors = [
   { name = "ieepirzy", email = "nervy_colder_1m@icloud.com" }
@@ -30,7 +30,7 @@ classifiers = [
 [project.optional-dependencies]
 fastmcp = ["fastmcp>=2.0.0"]
 fastapi = ["fastapi>=0.100.0"]
-dev = ["pytest", "pytest-asyncio", "httpx"]
+dev = ["pytest", "pytest-asyncio", "httpx", "pytest-cov"]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/origo"

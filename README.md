@@ -36,13 +36,13 @@ mcp = FastMCP("my-server")
 
 # ... define tools ...
 
-app = mcp.streamable_http_app()
-app.add_middleware(OAuthMiddleware, provider=auth)
+mcp_app = mcp.streamable_http_app()
+mcp_app.add_middleware(OAuthMiddleware, provider=auth)
 
-# Mount OAuth endpoints at root
+# OAuth must be at root so /.well-known/ discovery works for MCP clients
 root = Starlette(routes=[
-    Mount("/oauth", app=auth.asgi_app()),
-    Mount("/", app=app),
+    Mount("/mcp", app=mcp_app),      # protected MCP endpoint
+    Mount("/", app=auth.asgi_app()), # /.well-known/, /authorize, /token, /register
 ])
 ```
 
@@ -51,6 +51,8 @@ root = Starlette(routes=[
 ```python
 from fastapi import FastAPI
 from origo import OAuthProvider, OAuthMiddleware
+from starlette.routing import Mount
+from starlette.applications import Starlette
 import os
 
 auth = OAuthProvider(
@@ -58,9 +60,15 @@ auth = OAuthProvider(
     clients={os.getenv("OAUTH_CLIENT_ID"): os.getenv("OAUTH_CLIENT_SECRET")},
 )
 
-app = FastAPI()
-app.add_middleware(OAuthMiddleware, provider=auth)
-app.mount("/oauth", auth.asgi_app())
+api = FastAPI()
+api.add_middleware(OAuthMiddleware, provider=auth)
+
+# ... define routes on api ...
+
+app = Starlette(routes=[
+    Mount("/api", app=api),          # protected API routes
+    Mount("/", app=auth.asgi_app()), # OAuth at root
+])
 ```
 
 ## How this differs from enterprise OAuth
@@ -107,6 +115,8 @@ auth = OAuthProvider(
 )
 ```
 
+Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) have no such restriction — any redirect URI is accepted, since the operator controls both sides.
+
 ## Options
 
 | Parameter | Type | Default | Description |
@@ -125,5 +135,6 @@ auth = OAuthProvider(
 | `GET /.well-known/oauth-authorization-server` | Discovery |
 | `GET /.well-known/oauth-protected-resource` | Resource metadata |
 | `POST /register` | Dynamic client registration (public mode only) |
-| `GET /authorize` | Authorization + consent |
+| `GET /authorize` | Show consent page (or redirect immediately if `auto_approve=True`) |
+| `POST /authorize` | Submit consent form |
 | `POST /token` | Token exchange |
