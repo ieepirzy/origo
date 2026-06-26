@@ -42,6 +42,11 @@ class OAuthStorage:
 
     # --- Auth codes ---
 
+    def _cleanup_expired(self) -> None:
+        now = _now()
+        self._codes = {k: v for k, v in self._codes.items() if v["expires_at"] > now}
+        self._tokens = {k: v for k, v in self._tokens.items() if v["expires_at"] > now}
+
     def store_code(
         self,
         client_id: str,
@@ -49,6 +54,7 @@ class OAuthStorage:
         code_challenge: str,
         code_challenge_method: str = "S256",
     ) -> str:
+        self._cleanup_expired()
         code = secrets.token_urlsafe(32)
         self._codes[code] = {
             "client_id": client_id,

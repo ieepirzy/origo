@@ -26,7 +26,17 @@ async def test_oauth_metadata(client_private):
     assert data["authorization_endpoint"] == "http://testserver/authorize"
     assert data["token_endpoint"] == "http://testserver/token"
     assert "authorization_code" in data["grant_types_supported"]
-    assert "S256" in data["code_challenge_methods_supported"]
+    assert data["code_challenge_methods_supported"] == ["S256"]
+    assert "plain" not in data["code_challenge_methods_supported"]
+    assert "registration_endpoint" not in data
+
+
+@pytest.mark.asyncio
+async def test_oauth_metadata_public_includes_registration_endpoint(client_public):
+    client, _ = client_public
+    resp = await client.get("/.well-known/oauth-authorization-server")
+    assert resp.status_code == 200
+    assert resp.json()["registration_endpoint"] == "http://testserver/register"
 
 
 @pytest.mark.asyncio
@@ -217,19 +227,17 @@ async def test_token_exchange_s256(client_private):
 
 
 @pytest.mark.asyncio
-async def test_token_exchange_plain(client_private):
-    client, provider = client_private
-    verifier = secrets.token_urlsafe(32)
-    code = provider.storage.store_code("test-client", "https://example.com/cb", verifier, "plain")
-    resp = await client.post("/token", data={
-        "grant_type": "authorization_code",
+async def test_plain_pkce_rejected_at_authorize(client_private):
+    client, _ = client_private
+    _, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
         "client_id": "test-client",
-        "client_secret": "test-secret",
-        "code": code,
-        "code_verifier": verifier,
         "redirect_uri": "https://example.com/cb",
-    })
-    assert resp.status_code == 200
+        "code_challenge": challenge,
+        "code_challenge_method": "plain",
+    }, follow_redirects=False)
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
 
 
 @pytest.mark.asyncio
@@ -385,3 +393,52 @@ def test_middleware_method():
     from origo import OAuthProvider, OAuthMiddleware
     p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
     assert p.middleware() is OAuthMiddleware
+
+
+@pytest.mark.asyncio
+async def test_authorize_unsupported_response_type(client_private):
+    client, _ = client_private
+    _, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
+        "client_id": "test-client",
+        "redirect_uri": "https://example.com/cb",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "response_type": "token",
+    }, follow_redirects=False)
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "unsupported_response_type"
+
+
+@pytest.mark.asyncio
+async def test_authorize_redirect_uri_with_existing_query_params(client_private):
+    client, _ = client_private
+    _, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
+        "client_id": "test-client",
+        "redirect_uri": "https://example.com/cb?existing=1",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    location = resp.headers["location"]
+    assert "existing=1" in location
+    assert "code=" in location
+    assert "?" in location
+    assert location.count("?") == 1
+
+
+def test_cleanup_expired_codes_and_tokens():
+    from unittest.mock import patch
+    from origo.storage import OAuthStorage
+    s = OAuthStorage()
+    s.seed_clients({"c": "s"})
+    code = s.store_code("c", "https://example.com", "challenge")
+    token = s.store_token("c")
+    assert code in s._codes
+    assert token in s._tokens
+    with patch("origo.storage._now", return_value=9999999999.0):
+        s.store_code("c", "https://example.com", "challenge2")
+    assert code not in s._codes
+    assert token not in s._tokens

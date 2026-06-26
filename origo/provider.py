@@ -2,7 +2,6 @@ import warnings
 from typing import Optional
 
 from starlette.applications import Starlette
-from starlette.middleware import Middleware
 from starlette.routing import Route
 
 from .endpoints import (

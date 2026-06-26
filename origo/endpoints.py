@@ -3,7 +3,7 @@ import hmac
 import html
 import json
 import secrets
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -18,25 +18,33 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
         digest = hashlib.sha256(code_verifier.encode()).digest()
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
         return hmac.compare_digest(expected, code_challenge)
-    elif method == "plain":
-        return hmac.compare_digest(code_verifier, code_challenge)
     return False
+
+
+def _build_redirect(uri: str, params: dict) -> str:
+    """Append params to uri, preserving any existing query string."""
+    parts = urlparse(uri)
+    qs = urlencode(parse_qsl(parts.query) + list(params.items()))
+    return urlunparse(parts._replace(query=qs))
 
 
 # --- Discovery ---
 
 async def oauth_metadata(request: Request) -> JSONResponse:
     base_url: str = request.app.state.base_url
-    return JSONResponse({
+    public_registration: bool = request.app.state.public_registration
+    data = {
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/authorize",
         "token_endpoint": f"{base_url}/token",
-        "registration_endpoint": f"{base_url}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "code_challenge_methods_supported": ["S256", "plain"],
+        "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
-    })
+    }
+    if public_registration:
+        data["registration_endpoint"] = f"{base_url}/register"
+    return JSONResponse(data)
 
 
 async def protected_resource_metadata(request: Request) -> JSONResponse:
@@ -143,9 +151,16 @@ async def authorize(request: Request) -> Response:
     code_challenge = params.get("code_challenge")
     code_challenge_method = params.get("code_challenge_method", "S256")
     state = params.get("state", "")
+    response_type = params.get("response_type")
 
     if not all([client_id, redirect_uri, code_challenge]):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    if response_type is not None and response_type != "code":
+        return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
+
+    if code_challenge_method != "S256":
+        return JSONResponse({"error": "invalid_request", "error_description": "Unsupported code_challenge_method."}, status_code=400)
 
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
@@ -161,12 +176,10 @@ async def authorize(request: Request) -> Response:
     if request.method == "POST":
         approved = params.get("approved", "true")
         if approved != "true":
-            qs = urlencode({"error": "access_denied", "state": state})
-            return RedirectResponse(f"{redirect_uri}?{qs}", status_code=302)
+            return RedirectResponse(_build_redirect(redirect_uri, {"error": "access_denied", "state": state}), status_code=302)
 
     code = storage.store_code(client_id, redirect_uri, code_challenge, code_challenge_method)
-    qs = urlencode({"code": code, "state": state})
-    return RedirectResponse(f"{redirect_uri}?{qs}", status_code=302)
+    return RedirectResponse(_build_redirect(redirect_uri, {"code": code, "state": state}), status_code=302)
 
 
 # --- Token ---

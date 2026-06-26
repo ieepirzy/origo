@@ -10,6 +10,7 @@ import anyio
 
 from origo import OAuthMiddleware, OAuthProvider
 from origo.middleware import _is_client_disconnect
+from tests.conftest import make_pkce_pair
 
 
 async def _protected(request: Request):
@@ -75,11 +76,12 @@ async def test_protected_path_with_valid_token_passes(provider):
 async def test_authorize_path_is_public(provider):
     app = _make_app(provider)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        _, challenge = make_pkce_pair()
         resp = await client.get("/authorize", params={
             "client_id": "c",
             "redirect_uri": "https://example.com/cb",
-            "code_challenge": "abc",
-            "code_challenge_method": "plain",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         }, follow_redirects=False)
         assert resp.status_code != 401
 
