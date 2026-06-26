@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import json
 import secrets
 from base64 import urlsafe_b64decode
@@ -96,11 +97,13 @@ async def register(request: Request) -> JSONResponse:
 # --- Authorize ---
 
 def _consent_page(params: dict) -> HTMLResponse:
+    expected_params = ["client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state"]
     hidden = "\n".join(
-        f'<input type="hidden" name="{k}" value="{v}">'
-        for k, v in params.items()
+        f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(params.get(k, "")))}">'
+        for k in expected_params if k in params
     )
-    html = f"""<!DOCTYPE html>
+    escaped_client_id = html.escape(str(params.get('client_id', '')))
+    page_html = f"""<!DOCTYPE html>
 <html>
 <head><title>Authorize Access</title>
 <style>
@@ -117,7 +120,7 @@ def _consent_page(params: dict) -> HTMLResponse:
 <body>
 <div class="card">
   <h2>Authorize Access</h2>
-  <p>Client <span class="client">{params.get('client_id', '')}</span> is requesting access to your MCP server.</p>
+  <p>Client <span class="client">{escaped_client_id}</span> is requesting access to your MCP server.</p>
   <form method="POST" action="/authorize">
     {hidden}
     <div class="actions">
@@ -128,7 +131,7 @@ def _consent_page(params: dict) -> HTMLResponse:
 </div>
 </body>
 </html>"""
-    return HTMLResponse(html)
+    return HTMLResponse(page_html)
 
 
 async def authorize(request: Request) -> Response:
