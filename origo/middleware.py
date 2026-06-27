@@ -14,12 +14,11 @@ def _is_client_disconnect(exc: BaseException) -> bool:
 
 
 # Paths that must be publicly accessible for the OAuth flow to work
-_PUBLIC_PREFIXES = (
-    "/.well-known/",
+_PUBLIC_PATHS = {
     "/register",
     "/authorize",
     "/token",
-)
+}
 
 
 async def _send_json(send: Send, body: dict, status: int, extra_headers: list[tuple[bytes, bytes]] = ()):
@@ -52,7 +51,7 @@ class OAuthMiddleware:
 
         path = scope.get("path", "")
 
-        if path.startswith(_PUBLIC_PREFIXES):
+        if path in _PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return
 
