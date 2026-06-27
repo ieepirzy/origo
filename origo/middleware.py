@@ -51,7 +51,7 @@ class OAuthMiddleware:
 
         path = scope.get("path", "")
 
-        if path in _PUBLIC_PATHS or path.startswith("/.well-known/"):
+        if path in _PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return
 
