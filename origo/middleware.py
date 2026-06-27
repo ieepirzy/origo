@@ -13,11 +13,16 @@ def _is_client_disconnect(exc: BaseException) -> bool:
     return False
 
 
-# Paths that must be publicly accessible for the OAuth flow to work
+# Paths that must be publicly accessible for the OAuth flow to work.
+# This is an exact-match set derived directly from the route table in OAuthProvider.
+# Using exact matching (not prefix/startswith) prevents prefix-confusion attacks
+# where a path like /token_info or /.well-known-decoy/x would bypass auth.
 _PUBLIC_PATHS = {
     "/register",
     "/authorize",
     "/token",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
 }
 
 
