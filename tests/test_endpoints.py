@@ -97,6 +97,7 @@ async def test_authorize_auto_approve_redirects(client_private):
         "redirect_uri": "https://example.com/cb",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "response_type": "code",
         "state": "mystate",
     }, follow_redirects=False)
     assert resp.status_code == 302
@@ -122,6 +123,7 @@ async def test_authorize_shows_consent_page(client_public):
             "redirect_uri": "https://example.com/cb",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
+            "response_type": "code",
         })
     assert resp.status_code == 200
     assert b"<form" in resp.content
@@ -136,6 +138,7 @@ async def test_authorize_unknown_client(client_private):
         "redirect_uri": "https://example.com/cb",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "response_type": "code",
     })
     assert resp.status_code == 401
     assert resp.json()["error"] == "unauthorized_client"
@@ -154,6 +157,7 @@ async def test_authorize_invalid_redirect_uri(client_public):
         "redirect_uri": "https://evil.com/steal",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "response_type": "code",
     }, follow_redirects=False)
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_request"
@@ -183,6 +187,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "redirect_uri": "https://example.com/cb",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
+            "response_type": "code",
             "state": "s1",
             "approved": "false",
         }, follow_redirects=False)
@@ -199,6 +204,7 @@ async def test_authorize_preserves_state(client_private):
         "redirect_uri": "https://example.com/cb",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "response_type": "code",
         "state": "unique-state-xyz",
     }, follow_redirects=False)
     assert "state=unique-state-xyz" in resp.headers["location"]
@@ -235,6 +241,7 @@ async def test_plain_pkce_rejected_at_authorize(client_private):
         "redirect_uri": "https://example.com/cb",
         "code_challenge": challenge,
         "code_challenge_method": "plain",
+        "response_type": "code",
     }, follow_redirects=False)
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_request"
@@ -390,9 +397,13 @@ def test_no_clients_warning():
 
 
 def test_middleware_method():
+    import functools
     from origo import OAuthProvider, OAuthMiddleware
     p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
-    assert p.middleware() is OAuthMiddleware
+    mw = p.middleware()
+    assert isinstance(mw, functools.partial)
+    assert mw.func is OAuthMiddleware
+    assert mw.keywords.get("provider") is p
 
 
 @pytest.mark.asyncio
@@ -419,6 +430,7 @@ async def test_authorize_redirect_uri_with_existing_query_params(client_private)
         "redirect_uri": "https://example.com/cb?existing=1",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "response_type": "code",
         "state": "s",
     }, follow_redirects=False)
     assert resp.status_code == 302

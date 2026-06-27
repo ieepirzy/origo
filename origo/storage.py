@@ -77,6 +77,7 @@ class OAuthStorage:
     # --- Tokens ---
 
     def store_token(self, client_id: str) -> str:
+        self._cleanup_expired()
         token = secrets.token_urlsafe(48)
         self._tokens[token] = {
             "client_id": client_id,

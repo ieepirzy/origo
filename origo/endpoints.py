@@ -156,7 +156,10 @@ async def authorize(request: Request) -> Response:
     if not all([client_id, redirect_uri, code_challenge]):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    if response_type is not None and response_type != "code":
+    if response_type is None:
+        return JSONResponse({"error": "invalid_request", "error_description": "response_type is required."}, status_code=400)
+
+    if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
     if code_challenge_method != "S256":

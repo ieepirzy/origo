@@ -1,3 +1,4 @@
+import functools
 import warnings
 from typing import Optional
 
@@ -84,6 +85,9 @@ class OAuthProvider:
         """Verify a bearer token. Returns metadata dict or None."""
         return self.storage.verify_token(token)
 
-    def middleware(self) -> OAuthMiddleware:
-        """Return configured OAuthMiddleware bound to this provider."""
-        return OAuthMiddleware
+    def middleware(self):
+        """Return a partial usable with Starlette's add_middleware.
+
+        Usage: app.add_middleware(provider.middleware())
+        """
+        return functools.partial(OAuthMiddleware, provider=self)

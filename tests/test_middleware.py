@@ -82,6 +82,7 @@ async def test_authorize_path_is_public(provider):
             "redirect_uri": "https://example.com/cb",
             "code_challenge": challenge,
             "code_challenge_method": "S256",
+            "response_type": "code",
         }, follow_redirects=False)
         assert resp.status_code != 401
 

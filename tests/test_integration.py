@@ -33,6 +33,7 @@ async def test_token_is_rejected_after_second_code_use(client_private):
         "redirect_uri": "https://example.com/cb",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "response_type": "code",
     }, follow_redirects=False)
     location = resp.headers["location"]
     code = dict(p.split("=") for p in location.split("?", 1)[1].split("&"))["code"]
