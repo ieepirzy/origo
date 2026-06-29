@@ -98,12 +98,13 @@ async def register(request: Request) -> JSONResponse:
 
 # --- Authorize ---
 
-def _consent_page(params: dict) -> HTMLResponse:
+def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     expected_params = ["client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state"]
     hidden = "\n".join(
         f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(params.get(k, "")))}">'
         for k in expected_params if k in params
     )
+    hidden += f'\n    <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">'
     escaped_client_id = html.escape(str(params.get('client_id', '')))
     page_html = f"""<!DOCTYPE html>
 <html>
@@ -133,7 +134,10 @@ def _consent_page(params: dict) -> HTMLResponse:
 </div>
 </body>
 </html>"""
-    return HTMLResponse(page_html)
+    response = HTMLResponse(page_html)
+    response.set_cookie("origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 
 async def authorize(request: Request) -> Response:
@@ -173,10 +177,16 @@ async def authorize(request: Request) -> Response:
 
     # Show consent page on GET unless auto_approve
     if request.method == "GET" and not auto_approve:
-        return _consent_page(params)
+        csrf_token = secrets.token_urlsafe(32)
+        return _consent_page(params, csrf_token)
 
     # Check approval from consent form
     if request.method == "POST":
+        cookie_csrf = request.cookies.get("origo_csrf")
+        form_csrf = params.get("csrf_token")
+        if not cookie_csrf or not form_csrf or not secrets.compare_digest(cookie_csrf, form_csrf):
+            return JSONResponse({"error": "invalid_request", "error_description": "CSRF token missing or invalid."}, status_code=400)
+
         approved = params.get("approved", "true")
         if approved != "true":
             return RedirectResponse(_build_redirect(redirect_uri, {"error": "access_denied", "state": state}), status_code=302)
