@@ -1,8 +1,5 @@
-## 2023-10-24 - [XSS Fix]
-**Vulnerability:** Cross-Site Scripting (XSS) in `_consent_page` HTML response.
-**Learning:** Python f-strings used for dynamic HTML generation require explicit HTML escaping for any variable data, as standard variables are not sanitized by default.
-**Prevention:** Always use `html.escape()` or a robust templating engine (like Jinja2) that handles auto-escaping when injecting user input into HTML structures.
-## 2024-05-18 - [Authorization Bypass via Prefix Matching]
-**Vulnerability:** Authorization bypass using path prefix matching. Protected endpoints that started with the same name as public OAuth endpoints (e.g., `/token_info` vs `/token`) were inadvertently exposed.
-**Learning:** Using `startswith` for path validation without trailing slashes in an API router/middleware is extremely dangerous, as it creates unintentional wildcard matching for any endpoint starting with those characters.
-**Prevention:** Always use exact path matching (`path in ALLOWED_PATHS`) for specific endpoints. If prefix matching is required (like for `/.well-known/`), ensure it includes necessary trailing slashes or path segment boundaries.
+## 2024-06-29 - Fixed CSRF Vulnerability in OAuth Consent Form
+
+**Vulnerability:** A CSRF (Cross-Site Request Forgery) vulnerability allowed any website to trigger the OAuth authorization consent form via a direct POST request without the user's authorization or intent, potentially leaking the authorization code or granting access.
+**Learning:** The absence of CSRF protection token validation, particularly using standard stateful or stateless paradigms like Double Submit Cookie, in endpoints that serve state-changing POST forms can lead to unintended approvals of authorization grants.
+**Prevention:** Ensured the consent GET form correctly embeds a stateless cryptographic CSRF token, and required its presence and validation against a secure `Lax` or `Strict` cookie upon the subsequent POST request. Also, set the `X-Frame-Options: DENY` header on the consent form page to prevent Clickjacking.

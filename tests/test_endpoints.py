@@ -182,6 +182,17 @@ async def test_authorize_post_denial_redirects_error(client_public):
     )
     verifier, challenge = make_pkce_pair()
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        # First GET to get CSRF token
+        get_resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+            "state": "s1",
+        })
+        csrf_token = get_resp.cookies.get("origo_csrf")
+
         resp = await c.post("/authorize", data={
             "client_id": "c",
             "redirect_uri": "https://example.com/cb",
@@ -190,7 +201,8 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "response_type": "code",
             "state": "s1",
             "approved": "false",
-        }, follow_redirects=False)
+            "csrf_token": csrf_token,
+        }, cookies={"origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
     assert "error=access_denied" in resp.headers["location"]
 
