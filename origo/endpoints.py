@@ -135,7 +135,7 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
 </body>
 </html>"""
     response = HTMLResponse(page_html)
-    response.set_cookie("origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300)
+    response.set_cookie("origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
