@@ -24,7 +24,7 @@ class OAuthStorage:
                 "OAuthProvider: clients seeded with no redirect_uris — "
                 "any redirect_uri will be accepted. Specify allowed URIs in production.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=3,
             )
         for client_id, secret in clients.items():
             self._clients[client_id] = {"secret": secret, "redirect_uris": []}
