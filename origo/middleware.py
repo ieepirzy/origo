@@ -61,9 +61,9 @@ class OAuthMiddleware:
             return
 
         headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
+        auth_bytes = headers.get(b"authorization", b"")
 
-        if not auth.startswith("Bearer "):
+        if not auth_bytes.startswith(b"Bearer "):
             await _send_json(
                 send,
                 {"error": "unauthorized", "error_description": "Bearer token required."},
@@ -72,8 +72,12 @@ class OAuthMiddleware:
             )
             return
 
-        token = auth[len("Bearer "):]
-        if self.provider.verify_token(token) is None:
+        try:
+            token = auth_bytes[len(b"Bearer "):].decode("ascii")
+        except UnicodeDecodeError:
+            token = ""
+
+        if not token or self.provider.verify_token(token) is None:
             await _send_json(
                 send,
                 {"error": "invalid_token", "error_description": "Token is invalid or expired."},
