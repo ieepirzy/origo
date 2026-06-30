@@ -19,14 +19,15 @@ class OAuthStorage:
 
     def seed_clients(self, clients: dict[str, str]) -> None:
         """Seed pre-registered clients. Empty redirect_uris means any URI is allowed."""
-        for client_id, secret in clients.items():
-            self._clients[client_id] = {"secret": secret, "redirect_uris": []}
+        if clients:
             warnings.warn(
-                f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
+                "OAuthProvider: clients seeded with no redirect_uris — "
                 "any redirect_uri will be accepted. Specify allowed URIs in production.",
                 UserWarning,
                 stacklevel=2,
             )
+        for client_id, secret in clients.items():
+            self._clients[client_id] = {"secret": secret, "redirect_uris": []}
 
     def register_client(self, client_id: str, client_secret: str, redirect_uris: list[str] = ()) -> None:
         """Dynamically register a new client (public mode)."""
