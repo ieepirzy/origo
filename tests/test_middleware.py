@@ -180,3 +180,59 @@ async def test_non_disconnect_exception_propagates(provider):
     }
     with pytest.raises(RuntimeError, match="boom"):
         await mw(scope, None, None)
+
+@pytest.mark.asyncio
+async def test_websocket_missing_token_returns_close(provider):
+    app = _make_app(provider)
+
+    passed_events = []
+
+    async def inner(scope, receive, send):
+        pass # we should never reach here
+
+    mw = OAuthMiddleware(inner, provider=provider)
+
+    scope = {
+        "type": "websocket",
+        "path": "/ws",
+        "headers": [],
+    }
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(msg):
+        passed_events.append(msg)
+
+    await mw(scope, receive, send)
+
+    assert len(passed_events) == 1
+    assert passed_events[0] == {"type": "websocket.close", "code": 1008}
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_token_returns_close(provider):
+    app = _make_app(provider)
+
+    passed_events = []
+
+    async def inner(scope, receive, send):
+        pass # we should never reach here
+
+    mw = OAuthMiddleware(inner, provider=provider)
+
+    scope = {
+        "type": "websocket",
+        "path": "/ws",
+        "headers": [(b"authorization", b"Bearer bogus-token")],
+    }
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(msg):
+        passed_events.append(msg)
+
+    await mw(scope, receive, send)
+
+    assert len(passed_events) == 1
+    assert passed_events[0] == {"type": "websocket.close", "code": 1008}
