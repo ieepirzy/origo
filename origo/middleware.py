@@ -64,12 +64,15 @@ class OAuthMiddleware:
         auth_bytes = headers.get(b"authorization", b"")
 
         if not auth_bytes.startswith(b"Bearer "):
-            await _send_json(
-                send,
-                {"error": "unauthorized", "error_description": "Bearer token required."},
-                401,
-                [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}"'.encode())],
-            )
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await _send_json(
+                    send,
+                    {"error": "unauthorized", "error_description": "Bearer token required."},
+                    401,
+                    [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}"'.encode())],
+                )
             return
 
         try:
@@ -78,12 +81,15 @@ class OAuthMiddleware:
             token = ""
 
         if not token or self.provider.verify_token(token) is None:
-            await _send_json(
-                send,
-                {"error": "invalid_token", "error_description": "Token is invalid or expired."},
-                401,
-                [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}" error="invalid_token"'.encode())],
-            )
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await _send_json(
+                    send,
+                    {"error": "invalid_token", "error_description": "Token is invalid or expired."},
+                    401,
+                    [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}" error="invalid_token"'.encode())],
+                )
             return
 
         try:
