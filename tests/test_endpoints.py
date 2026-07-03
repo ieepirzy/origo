@@ -630,6 +630,60 @@ async def test_authorize_accepts_cimd_client_metadata_document(monkeypatch):
     assert p.storage.get_client_auth_method(client_id) == "none"
 
 
+def test_is_public_host_rejects_private_and_loopback_targets():
+    from origo.endpoints import _is_public_host
+    assert _is_public_host("localhost") is False
+    assert _is_public_host("127.0.0.1") is False
+    assert _is_public_host("10.0.0.5") is False
+    assert _is_public_host("169.254.169.254") is False  # cloud metadata endpoint
+    assert _is_public_host("::1") is False
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_cimd_client_id_pointing_at_private_host():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://127.0.0.1/cimd.json"
+    verifier, challenge = make_pkce_pair()
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "unauthorized_client"
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_cimd_metadata_without_redirect_uris(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://chatgpt.com/oauth/empty-redirects.json"
+
+    def fake_fetch(url):
+        return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": []}
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    verifier, challenge = make_pkce_pair()
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "https://evil.example/anywhere",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "unauthorized_client"
+    # Must not have been registered with an "allow any redirect_uri" state.
+    assert not p.storage.client_exists(client_id) or not p.storage.is_redirect_uri_allowed(client_id, "https://evil.example/anywhere")
+
+
 @pytest.mark.asyncio
 async def test_openid_userinfo_and_id_token():
     from origo import OAuthProvider

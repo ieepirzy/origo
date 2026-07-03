@@ -1,8 +1,10 @@
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import secrets
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -35,19 +37,43 @@ def _build_redirect(uri: str, params: dict) -> str:
     return urlunparse(parts._replace(query=qs))
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so a CIMD host can't 302 the fetch to an internal target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _is_public_host(hostname: str) -> bool:
+    """Reject hostnames that resolve to loopback/private/link-local/reserved addresses."""
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return False
+    for *_rest, sockaddr in addrinfo:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return False
+    return True
+
+
 def _fetch_client_metadata_document(client_id: str) -> dict | None:
     """Fetch a Client ID Metadata Document (CIMD) for HTTPS URL client_ids."""
     parsed = urlparse(client_id)
-    if parsed.scheme != "https":
+    if parsed.scheme != "https" or not parsed.hostname:
         return None
 
+    if not _is_public_host(parsed.hostname):
+        return None
+
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     try:
         request = urllib.request.Request(
             client_id,
             headers={"Accept": "application/json"},
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with opener.open(request, timeout=5) as response:
             if response.status != 200:
                 return None
             content_type = response.headers.get("content-type", "")
@@ -277,7 +303,7 @@ async def authorize(request: Request) -> Response:
         redirect_uris = metadata.get("redirect_uris", [])
         auth_method = metadata.get("token_endpoint_auth_method", "none")
         if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
-            return JSONResponse({"error": "unauthorized_client"}, status_code=401)
+            return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD metadata must declare a non-empty redirect_uris list."}, status_code=401)
         storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
 
     if not storage.client_exists(client_id):
