@@ -276,7 +276,7 @@ async def authorize(request: Request) -> Response:
 
         redirect_uris = metadata.get("redirect_uris", [])
         auth_method = metadata.get("token_endpoint_auth_method", "none")
-        if not isinstance(redirect_uris, list) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
+        if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
             return JSONResponse({"error": "unauthorized_client"}, status_code=401)
         storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
 
