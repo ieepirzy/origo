@@ -11,15 +11,16 @@ def _now() -> float:
 class OAuthStorage:
     def __init__(self, token_ttl: int = 3600):
         self.token_ttl = token_ttl
-        self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris}
+        self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris, token_endpoint_auth_method}
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
 
     # --- Clients ---
 
-    def seed_clients(self, clients: dict[str, str]) -> None:
+    def seed_clients(self, clients: dict[str, str], redirect_uris: Optional[dict[str, list[str]]] = None) -> None:
         """Seed pre-registered clients. Empty redirect_uris means any URI is allowed."""
-        if clients:
+        redirect_uris = redirect_uris or {}
+        if clients and not any(redirect_uris.values()):
             warnings.warn(
                 "OAuthProvider: clients seeded with no redirect_uris — "
                 "any redirect_uri will be accepted. Specify allowed URIs in production.",
@@ -27,21 +28,48 @@ class OAuthStorage:
                 stacklevel=3,
             )
         for client_id, secret in clients.items():
-            self._clients[client_id] = {"secret": secret, "redirect_uris": []}
-            warnings.warn(
-                f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
-                "any redirect_uri will be accepted. Specify allowed URIs in production.",
-                UserWarning,
-                stacklevel=2,
-            )
+            allowed_redirect_uris = list(redirect_uris.get(client_id, []))
+            self._clients[client_id] = {
+                "secret": secret,
+                "redirect_uris": allowed_redirect_uris,
+                "token_endpoint_auth_method": "client_secret_post",
+                "client_metadata": {},
+            }
+            if not allowed_redirect_uris:
+                warnings.warn(
+                    f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
+                    "any redirect_uri will be accepted. Specify allowed URIs in production.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
-    def register_client(self, client_id: str, client_secret: str, redirect_uris: list[str] = ()) -> None:
+    def register_client(
+        self,
+        client_id: str,
+        client_secret: Optional[str],
+        redirect_uris: list[str] = (),
+        token_endpoint_auth_method: str = "client_secret_post",
+        client_metadata: Optional[dict] = None,
+    ) -> None:
         """Dynamically register a new client (public mode)."""
-        self._clients[client_id] = {"secret": client_secret, "redirect_uris": list(redirect_uris)}
+        self._clients[client_id] = {
+            "secret": client_secret,
+            "redirect_uris": list(redirect_uris),
+            "token_endpoint_auth_method": token_endpoint_auth_method,
+            "client_metadata": client_metadata or {},
+        }
 
     def get_client_secret(self, client_id: str) -> Optional[str]:
         entry = self._clients.get(client_id)
         return entry["secret"] if entry else None
+
+    def get_client_auth_method(self, client_id: str) -> Optional[str]:
+        entry = self._clients.get(client_id)
+        return entry.get("token_endpoint_auth_method", "client_secret_post") if entry else None
+
+    def get_client_metadata(self, client_id: str) -> Optional[dict]:
+        entry = self._clients.get(client_id)
+        return entry.get("client_metadata", {}) if entry else None
 
     def client_exists(self, client_id: str) -> bool:
         return client_id in self._clients
@@ -67,6 +95,8 @@ class OAuthStorage:
         redirect_uri: str,
         code_challenge: str,
         code_challenge_method: str = "S256",
+        resource: Optional[str] = None,
+        scope: str = "",
     ) -> str:
         self._cleanup_expired()
         code = secrets.token_urlsafe(32)
@@ -75,6 +105,8 @@ class OAuthStorage:
             "redirect_uri": redirect_uri,
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
+            "resource": resource,
+            "scope": scope,
             "expires_at": _now() + 60,  # codes expire in 60 seconds
         }
         return code
@@ -90,11 +122,13 @@ class OAuthStorage:
 
     # --- Tokens ---
 
-    def store_token(self, client_id: str) -> str:
+    def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "") -> str:
         self._cleanup_expired()
         token = secrets.token_urlsafe(48)
         self._tokens[token] = {
             "client_id": client_id,
+            "resource": resource,
+            "scope": scope,
             "expires_at": _now() + self.token_ttl,
         }
         return token

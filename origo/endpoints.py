@@ -3,6 +3,9 @@ import hmac
 import html
 import json
 import secrets
+import time
+import urllib.error
+import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from starlette.requests import Request
@@ -11,6 +14,10 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from .storage import OAuthStorage
 
 import base64
+
+
+_SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
+_SUPPORTED_CIMD_AUTH_METHODS = {"none"}
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
@@ -28,20 +35,86 @@ def _build_redirect(uri: str, params: dict) -> str:
     return urlunparse(parts._replace(query=qs))
 
 
+def _fetch_client_metadata_document(client_id: str) -> dict | None:
+    """Fetch a Client ID Metadata Document (CIMD) for HTTPS URL client_ids."""
+    parsed = urlparse(client_id)
+    if parsed.scheme != "https":
+        return None
+
+    try:
+        request = urllib.request.Request(
+            client_id,
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status != 200:
+                return None
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type:
+                return None
+            body = response.read(65536)
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    try:
+        metadata = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+    if metadata.get("client_id", client_id) != client_id:
+        return None
+    return metadata
+
+
+def _validate_scope(scope: str, scopes_supported: list[str]) -> bool:
+    if not scope or not scopes_supported:
+        return True
+    requested = set(scope.split())
+    return requested.issubset(set(scopes_supported))
+
+
+def _base64url_json(data: dict) -> str:
+    encoded = json.dumps(data, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode()
+
+
+def _unsigned_id_token(issuer: str, client_id: str, subject: str, email: str | None, scope: str, ttl: int) -> str:
+    now = int(time.time())
+    claims = {
+        "iss": issuer,
+        "sub": subject,
+        "aud": client_id,
+        "iat": now,
+        "exp": now + ttl,
+    }
+    if email and "email" in scope.split():
+        claims["email"] = email
+        claims["email_verified"] = True
+    return f"{_base64url_json({'alg': 'none', 'typ': 'JWT'})}.{_base64url_json(claims)}."
+
+
 # --- Discovery ---
 
 async def oauth_metadata(request: Request) -> JSONResponse:
     base_url: str = request.app.state.base_url
     public_registration: bool = request.app.state.public_registration
+    scopes_supported: list[str] = request.app.state.scopes_supported
     data = {
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/authorize",
         "token_endpoint": f"{base_url}/token",
+        "userinfo_endpoint": f"{base_url}/userinfo",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["none"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "client_id_metadata_document_supported": True,
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
     }
+    if scopes_supported:
+        data["scopes_supported"] = scopes_supported
     if public_registration:
         data["registration_endpoint"] = f"{base_url}/register"
     return JSONResponse(data)
@@ -50,11 +123,18 @@ async def oauth_metadata(request: Request) -> JSONResponse:
 async def protected_resource_metadata(request: Request) -> JSONResponse:
     base_url: str = request.app.state.base_url
     mcp_path: str = request.app.state.mcp_path
-    return JSONResponse({
+    scopes_supported: list[str] = request.app.state.scopes_supported
+    resource_documentation: str | None = request.app.state.resource_documentation
+    data = {
         "resource": f"{base_url}{mcp_path}",
         "authorization_servers": [base_url],
         "bearer_methods_supported": ["header"],
-    })
+    }
+    if scopes_supported:
+        data["scopes_supported"] = scopes_supported
+    if resource_documentation:
+        data["resource_documentation"] = resource_documentation
+    return JSONResponse(data)
 
 
 # --- Registration ---
@@ -82,19 +162,29 @@ async def register(request: Request) -> JSONResponse:
             status_code=400,
         )
 
+    token_endpoint_auth_method = body.get("token_endpoint_auth_method", "client_secret_post")
+    if token_endpoint_auth_method not in _SUPPORTED_AUTH_METHODS:
+        return JSONResponse(
+            {"error": "invalid_client_metadata", "error_description": "Unsupported token_endpoint_auth_method."},
+            status_code=400,
+        )
+
     client_id = secrets.token_urlsafe(16)
-    client_secret = secrets.token_urlsafe(32)
-    storage.register_client(client_id, client_secret, redirect_uris)
+    client_secret = None if token_endpoint_auth_method == "none" else secrets.token_urlsafe(32)
+    storage.register_client(client_id, client_secret, redirect_uris, token_endpoint_auth_method, body)
+
+    response_body = {
+        "client_id": client_id,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": token_endpoint_auth_method,
+    }
+    if client_secret is not None:
+        response_body["client_secret"] = client_secret
 
     return JSONResponse(
-        {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "client_secret_post",
-        },
+        response_body,
         status_code=201,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
     )
@@ -103,7 +193,7 @@ async def register(request: Request) -> JSONResponse:
 # --- Authorize ---
 
 def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
-    expected_params = ["client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state"]
+    expected_params = ["client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state", "resource", "scope"]
     hidden = "\n".join(
         f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(params.get(k, "")))}">'
         for k in expected_params if k in params
@@ -160,6 +250,9 @@ async def authorize(request: Request) -> Response:
     code_challenge_method = params.get("code_challenge_method", "S256")
     state = params.get("state", "")
     response_type = params.get("response_type")
+    resource = params.get("resource")
+    scope = params.get("scope", "")
+    scopes_supported: list[str] = request.app.state.scopes_supported
 
     if not all([client_id, redirect_uri, code_challenge]):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
@@ -172,6 +265,20 @@ async def authorize(request: Request) -> Response:
 
     if code_challenge_method != "S256":
         return JSONResponse({"error": "invalid_request", "error_description": "Unsupported code_challenge_method."}, status_code=400)
+
+    if not _validate_scope(scope, scopes_supported):
+        return JSONResponse({"error": "invalid_scope"}, status_code=400)
+
+    if not storage.client_exists(client_id) and urlparse(client_id).scheme == "https":
+        metadata = _fetch_client_metadata_document(client_id)
+        if metadata is None:
+            return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
+
+        redirect_uris = metadata.get("redirect_uris", [])
+        auth_method = metadata.get("token_endpoint_auth_method", "none")
+        if not isinstance(redirect_uris, list) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
+            return JSONResponse({"error": "unauthorized_client"}, status_code=401)
+        storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
 
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
@@ -195,7 +302,7 @@ async def authorize(request: Request) -> Response:
         if approved != "true":
             return RedirectResponse(_build_redirect(redirect_uri, {"error": "access_denied", "state": state}), status_code=302)
 
-    code = storage.store_code(client_id, redirect_uri, code_challenge, code_challenge_method)
+    code = storage.store_code(client_id, redirect_uri, code_challenge, code_challenge_method, resource=resource, scope=scope)
     return RedirectResponse(_build_redirect(redirect_uri, {"code": code, "state": state}), status_code=302)
 
 
@@ -229,13 +336,20 @@ async def token(request: Request) -> JSONResponse:
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    if not all([client_id, client_secret, code, code_verifier, redirect_uri]):
+    if not all([client_id, code, code_verifier, redirect_uri]):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    # Verify client credentials
-    stored_secret = storage.get_client_secret(client_id)
-    if stored_secret is None or not hmac.compare_digest(stored_secret, client_secret):
+    client_auth_method = storage.get_client_auth_method(client_id)
+    if client_auth_method is None:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    # Verify client credentials unless the client registered as a public PKCE client.
+    if client_auth_method != "none":
+        if not client_secret:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+        stored_secret = storage.get_client_secret(client_id)
+        if stored_secret is None or not hmac.compare_digest(stored_secret, client_secret):
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
 
     # Exchange code
     code_entry = storage.exchange_code(code)
@@ -248,17 +362,57 @@ async def token(request: Request) -> JSONResponse:
     if code_entry["redirect_uri"] != redirect_uri:
         return JSONResponse({"error": "invalid_grant"}, status_code=401)
 
+    resource = params.get("resource")
+    code_resource = code_entry.get("resource")
+    if code_resource != resource:
+        return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
+
     # Verify PKCE
     if not _verify_pkce(code_verifier, code_entry["code_challenge"], code_entry["code_challenge_method"]):
         return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=401)
 
-    access_token = storage.store_token(client_id)
+    scope = code_entry.get("scope", "")
+    access_token = storage.store_token(client_id, resource=resource, scope=scope)
+
+    response_body = {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": storage.token_ttl,
+    }
+    if scope:
+        response_body["scope"] = scope
+    if "openid" in scope.split():
+        response_body["id_token"] = _unsigned_id_token(
+            request.app.state.base_url,
+            client_id,
+            request.app.state.user_subject,
+            request.app.state.user_email,
+            scope,
+            storage.token_ttl,
+        )
 
     return JSONResponse(
-        {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": storage.token_ttl,
-        },
+        response_body,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
     )
+
+
+async def userinfo(request: Request) -> JSONResponse:
+    storage: OAuthStorage = request.app.state.storage
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return JSONResponse({"error": "invalid_token"}, status_code=401)
+
+    meta = storage.verify_token(auth[7:])
+    if meta is None:
+        return JSONResponse({"error": "invalid_token"}, status_code=401)
+
+    scope = set(meta.get("scope", "").split())
+    if "openid" not in scope:
+        return JSONResponse({"error": "insufficient_scope"}, status_code=403)
+
+    claims = {"sub": request.app.state.user_subject}
+    if request.app.state.user_email and "email" in scope:
+        claims["email"] = request.app.state.user_email
+        claims["email_verified"] = True
+    return JSONResponse(claims, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
