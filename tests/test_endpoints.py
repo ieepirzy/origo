@@ -57,6 +57,8 @@ async def test_register_public_mode(client_public):
     client, provider = client_public
     resp = await client.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
     assert resp.status_code == 201
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     data = resp.json()
     assert "client_id" in data
     assert "client_secret" in data
@@ -238,6 +240,8 @@ async def test_token_exchange_s256(client_private):
         "redirect_uri": "https://example.com/cb",
     })
     assert resp.status_code == 200
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     data = resp.json()
     assert "access_token" in data
     assert data["token_type"] == "bearer"
