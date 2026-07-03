@@ -236,3 +236,21 @@ async def test_websocket_invalid_token_returns_close(provider):
 
     assert len(passed_events) == 1
     assert passed_events[0] == {"type": "websocket.close", "code": 1008}
+
+@pytest.mark.asyncio
+async def test_www_authenticate_header_includes_resource_metadata(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp")
+    header = resp.headers.get("WWW-Authenticate", "")
+    assert 'resource_metadata="http://testserver/.well-known/oauth-protected-resource"' in header
+
+
+@pytest.mark.asyncio
+async def test_token_with_wrong_resource_is_rejected_by_middleware(provider):
+    token = provider.storage.store_token("c", resource="https://wrong.example/mcp")
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_token"

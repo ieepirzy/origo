@@ -470,3 +470,354 @@ def test_cleanup_expired_codes_and_tokens():
         s.store_code("c", "https://example.com", "challenge2")
     assert code not in s._codes
     assert token not in s._tokens
+
+@pytest.mark.asyncio
+async def test_register_public_client_with_none_auth_method(client_public):
+    client, provider = client_public
+    resp = await client.post("/register", json={
+        "redirect_uris": ["https://chatgpt.com/connector/oauth/callback-id"],
+        "token_endpoint_auth_method": "none",
+    })
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["token_endpoint_auth_method"] == "none"
+    assert "client_secret" not in data
+    assert provider.storage.get_client_auth_method(data["client_id"]) == "none"
+
+
+@pytest.mark.asyncio
+async def test_register_rejects_unsupported_auth_method(client_public):
+    client, _ = client_public
+    resp = await client.post("/register", json={
+        "redirect_uris": ["https://example.com/cb"],
+        "token_endpoint_auth_method": "client_secret_jwt",
+    })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_client_metadata"
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_public_pkce_client_with_resource(client_public):
+    client, provider = client_public
+    reg = await client.post("/register", json={
+        "redirect_uris": ["https://chatgpt.com/connector/oauth/callback-id"],
+        "token_endpoint_auth_method": "none",
+    })
+    client_id = reg.json()["client_id"]
+    verifier, challenge = make_pkce_pair()
+    resource = "http://testserver/mcp"
+
+    auth = await client.get("/authorize", params={
+        "client_id": client_id,
+        "redirect_uri": "https://chatgpt.com/connector/oauth/callback-id",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "response_type": "code",
+        "resource": resource,
+    }, follow_redirects=False)
+    assert auth.status_code == 302
+    code = dict(part.split("=", 1) for part in auth.headers["location"].split("?", 1)[1].split("&"))["code"]
+
+    token_resp = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://chatgpt.com/connector/oauth/callback-id",
+        "resource": resource,
+    })
+    assert token_resp.status_code == 200
+    meta = provider.verify_token(token_resp.json()["access_token"])
+    assert meta["resource"] == resource
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_rejects_resource_mismatch(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code(
+        "test-client",
+        "https://example.com/cb",
+        challenge,
+        "S256",
+        resource="http://testserver/mcp",
+    )
+    resp = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+        "resource": "https://other.example/mcp",
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+
+@pytest.mark.asyncio
+async def test_oauth_metadata_includes_cimd_and_oidc_fields():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        scopes_supported=["openid", "email", "files:read"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/openid-configuration")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["client_id_metadata_document_supported"] is True
+    assert "userinfo_endpoint" in data
+    assert data["scopes_supported"] == ["openid", "email", "files:read"]
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_includes_scopes_and_docs():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        scopes_supported=["files:read"],
+        resource_documentation="https://example.com/docs/mcp",
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/oauth-protected-resource")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["resource"] == "http://testserver/mcp"
+    assert data["scopes_supported"] == ["files:read"]
+    assert data["resource_documentation"] == "https://example.com/docs/mcp"
+
+
+@pytest.mark.asyncio
+async def test_authorize_accepts_cimd_client_metadata_document(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://chatgpt.com/oauth/test-client.json"
+    redirect_uri = "https://chatgpt.com/connector/oauth/callback-id"
+
+    def fake_fetch(url, allow_private_hosts=False):
+        assert url == client_id
+        return {
+            "client_id": client_id,
+            "redirect_uris": [redirect_uri],
+            "token_endpoint_auth_method": "none",
+        }
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True)
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        auth = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+        assert auth.status_code == 302
+        code = dict(part.split("=", 1) for part in auth.headers["location"].split("?", 1)[1].split("&"))["code"]
+        token_resp = await c.post("/token", data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+        })
+    assert token_resp.status_code == 200
+    assert p.storage.get_client_auth_method(client_id) == "none"
+
+
+@pytest.mark.asyncio
+async def test_openid_userinfo_and_id_token():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"},
+        auto_approve=True,
+        scopes_supported=["openid", "email"],
+        user_email="user@example.com",
+    )
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        auth = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+            "scope": "openid email",
+        }, follow_redirects=False)
+        assert auth.status_code == 302
+        code = dict(part.split("=", 1) for part in auth.headers["location"].split("?", 1)[1].split("&"))["code"]
+        token_resp = await c.post("/token", data={
+            "grant_type": "authorization_code",
+            "client_id": "c",
+            "client_secret": "s",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
+        })
+        assert token_resp.status_code == 200
+        token_data = token_resp.json()
+        assert token_data["scope"] == "openid email"
+        assert "id_token" in token_data
+        userinfo = await c.get("/userinfo", headers={"Authorization": f"Bearer {token_data['access_token']}"})
+    assert userinfo.status_code == 200
+    assert userinfo.json()["email"] == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_unsupported_scope():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"},
+        auto_approve=True,
+        scopes_supported=["files:read"],
+    )
+    _, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+            "scope": "files:write",
+        }, follow_redirects=False)
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_scope"
+
+@pytest.mark.asyncio
+async def test_preregistered_client_redirect_uri_allowlist():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"},
+        client_redirect_uris={"c": ["https://allowed.example/cb"]},
+        auto_approve=True,
+    )
+    _, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://blocked.example/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 400
+    assert resp.json()["error_description"] == "redirect_uri not allowed."
+
+@pytest.mark.asyncio
+async def test_authorize_does_not_fetch_cimd_when_private_registration(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    fetched = False
+
+    def fake_fetch(url, allow_private_hosts=False):
+        nonlocal fetched
+        fetched = True
+        return {
+            "client_id": url,
+            "redirect_uris": ["https://chatgpt.com/connector/oauth/callback-id"],
+            "token_endpoint_auth_method": "none",
+        }
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, auto_approve=True)
+    _, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": "https://chatgpt.com/oauth/test-client.json",
+            "redirect_uri": "https://chatgpt.com/connector/oauth/callback-id",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "unauthorized_client"
+    assert fetched is False
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_cimd_without_redirect_uris(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://chatgpt.com/oauth/no-redirects.json"
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", lambda url, allow_private_hosts=False: {
+        "client_id": url,
+        "redirect_uris": [],
+        "token_endpoint_auth_method": "none",
+    })
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True)
+    _, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "https://chatgpt.com/connector/oauth/callback-id",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "unauthorized_client"
+
+
+def test_fetch_client_metadata_document_rejects_private_hosts(monkeypatch):
+    import socket
+    from origo.endpoints import _fetch_client_metadata_document
+
+    def fake_getaddrinfo(hostname, port):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    def fail_urlopen(*args, **kwargs):
+        raise AssertionError("urlopen must not be called for private hosts")
+
+    monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("urllib.request.urlopen", fail_urlopen)
+
+    assert _fetch_client_metadata_document("https://localhost.example/client.json") is None
+
+
+def test_fetch_client_metadata_document_allows_private_hosts_when_opted_in(monkeypatch):
+    import json
+    import socket
+    from origo.endpoints import _fetch_client_metadata_document
+
+    class FakeResponse:
+        status = 200
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, limit):
+            return json.dumps({
+                "client_id": "https://localhost.example/client.json",
+                "redirect_uris": ["https://chatgpt.com/connector/oauth/callback-id"],
+                "token_endpoint_auth_method": "none",
+            }).encode()
+
+    def fake_getaddrinfo(hostname, port):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: FakeResponse())
+
+    metadata = _fetch_client_metadata_document(
+        "https://localhost.example/client.json",
+        allow_private_hosts=True,
+    )
+    assert metadata["token_endpoint_auth_method"] == "none"
