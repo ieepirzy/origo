@@ -86,14 +86,18 @@ async def register(request: Request) -> JSONResponse:
     client_secret = secrets.token_urlsafe(32)
     storage.register_client(client_id, client_secret, redirect_uris)
 
-    return JSONResponse({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uris": redirect_uris,
-        "grant_types": ["authorization_code"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "client_secret_post",
-    }, status_code=201)
+    return JSONResponse(
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uris": redirect_uris,
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "client_secret_post",
+        },
+        status_code=201,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
+    )
 
 
 # --- Authorize ---
@@ -250,8 +254,11 @@ async def token(request: Request) -> JSONResponse:
 
     access_token = storage.store_token(client_id)
 
-    return JSONResponse({
-        "access_token": access_token,
-        "token_type": "bearer",
-        "expires_in": storage.token_ttl,
-    })
+    return JSONResponse(
+        {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": storage.token_ttl,
+        },
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
+    )
