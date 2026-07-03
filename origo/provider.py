@@ -35,6 +35,12 @@ class OAuthProvider:
         scopes_supported:    OAuth scopes advertised to clients.
         resource_documentation: Optional protected resource documentation URL.
         user_email:          Optional static OIDC email claim for lightweight domain claiming.
+        allow_private_cimd:  Allow CIMD client_id documents to be fetched from
+                             private/loopback/link-local hosts. Off by default (SSRF
+                             hardening) since client_id is attacker-controlled input.
+                             Enable only when your CIMD documents are intentionally
+                             served from inside your own network (e.g. an agent
+                             deployment colocated with origo) — see README.
     """
 
     def __init__(
@@ -50,6 +56,7 @@ class OAuthProvider:
         resource_documentation: Optional[str] = None,
         user_email: Optional[str] = None,
         user_subject: Optional[str] = None,
+        allow_private_cimd: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -59,6 +66,7 @@ class OAuthProvider:
         self.resource_documentation = resource_documentation
         self.user_email = user_email
         self.user_subject = user_subject or user_email or "origo-user"
+        self.allow_private_cimd = allow_private_cimd
 
         self.storage = OAuthStorage(token_ttl=token_ttl)
 
@@ -95,6 +103,7 @@ class OAuthProvider:
         app.state.resource_documentation = self.resource_documentation
         app.state.user_email = self.user_email
         app.state.user_subject = self.user_subject
+        app.state.allow_private_cimd = self.allow_private_cimd
         return app
 
     def asgi_app(self) -> Starlette:

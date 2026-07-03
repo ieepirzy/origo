@@ -598,7 +598,7 @@ async def test_authorize_accepts_cimd_client_metadata_document(monkeypatch):
     client_id = "https://chatgpt.com/oauth/test-client.json"
     redirect_uri = "https://chatgpt.com/connector/oauth/callback-id"
 
-    def fake_fetch(url):
+    def fake_fetch(url, allow_private_hosts=False):
         assert url == client_id
         return {
             "client_id": client_id,
@@ -658,13 +658,75 @@ async def test_authorize_rejects_cimd_client_id_pointing_at_private_host():
     assert resp.json()["error"] == "unauthorized_client"
 
 
+def test_fetch_client_metadata_document_allow_private_hosts_skips_host_check(monkeypatch):
+    """allow_private_hosts=True is an explicit opt-in for colocated deployments
+    (e.g. an agent and origo sharing a private network) — it must bypass only the
+    host check, never the redirect protection."""
+    from origo import endpoints
+
+    class _FakeResponse:
+        status = 200
+        headers = {"content-type": "application/json"}
+
+        def read(self, _n):
+            return b'{"client_id": "https://10.0.0.5/cimd.json", "redirect_uris": ["https://10.0.0.5/cb"], "token_endpoint_auth_method": "none"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeOpener:
+        def open(self, request, timeout):
+            return _FakeResponse()
+
+    monkeypatch.setattr(endpoints.urllib.request, "build_opener", lambda *a: _FakeOpener())
+
+    # Default: private host rejected before any fetch attempt.
+    assert endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json") is None
+
+    # Opt-in: private host allowed through to the (still redirect-refusing) fetch.
+    metadata = endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json", allow_private_hosts=True)
+    assert metadata is not None
+    assert metadata["client_id"] == "https://10.0.0.5/cimd.json"
+
+
+@pytest.mark.asyncio
+async def test_authorize_allow_private_cimd_wires_through_from_provider(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    client_id = "https://10.0.0.5/cimd.json"
+    redirect_uri = "https://10.0.0.5/callback"
+    seen = {}
+
+    def fake_fetch(url, allow_private_hosts=False):
+        seen["allow_private_hosts"] = allow_private_hosts
+        return {"client_id": client_id, "redirect_uris": [redirect_uri], "token_endpoint_auth_method": "none"}
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    verifier, challenge = make_pkce_pair()
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True, allow_private_cimd=True)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 302
+    assert seen["allow_private_hosts"] is True
+
+
 @pytest.mark.asyncio
 async def test_authorize_rejects_cimd_metadata_without_redirect_uris(monkeypatch):
     from origo import OAuthProvider
     from httpx import ASGITransport, AsyncClient
     client_id = "https://chatgpt.com/oauth/empty-redirects.json"
 
-    def fake_fetch(url):
+    def fake_fetch(url, allow_private_hosts=False):
         return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": []}
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
