@@ -66,6 +66,7 @@ def test_public_paths_set_contents():
         "/authorize",
         "/token",
         "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
         "/.well-known/oauth-protected-resource",
     }
 
@@ -79,6 +80,7 @@ def test_public_paths_set_contents():
     "/authorize",
     "/token",
     "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
     "/.well-known/oauth-protected-resource",
 ])
 @pytest.mark.asyncio
@@ -173,8 +175,6 @@ async def test_case_variants_require_auth(provider, path):
     # (Note: with the old startswith("/.well-known/") bug this WOULD bypass auth.
     # With exact matching it does not, because "/.well-known/" != any member.)
     "/.well-known/",
-    # A plausible but unregistered OIDC discovery path
-    "/.well-known/openid-configuration",
     # Arbitrary unknown path under /.well-known/
     "/.well-known/anything",
     # Decoy: shares "/.well-known" as a substring but is a different prefix.
@@ -184,12 +184,12 @@ async def test_case_variants_require_auth(provider, path):
 ])
 @pytest.mark.asyncio
 async def test_well_known_non_public_paths_require_auth(provider, path):
-    """Only the two specific /.well-known/ OAuth paths are public; all others require auth."""
+    """Only registered /.well-known/ OAuth/OIDC paths are public; all others require auth."""
     app = _make_app(provider)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         resp = await client.get(path)
         assert resp.status_code == 401, (
-            f"Expected 401 for {path!r} — only specific /.well-known/ paths are in _PUBLIC_PATHS"
+            f"Expected 401 for {path!r} — only registered /.well-known/ paths are in _PUBLIC_PATHS"
         )
 
 

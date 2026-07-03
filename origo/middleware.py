@@ -22,6 +22,7 @@ _PUBLIC_PATHS = {
     "/authorize",
     "/token",
     "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
     "/.well-known/oauth-protected-resource",
 }
 
@@ -49,6 +50,15 @@ class OAuthMiddleware:
         self.app = app
         self.provider = provider
 
+    def _www_authenticate(self, error: str | None = None) -> bytes:
+        parts = [
+            f'realm="{self.provider.base_url}"',
+            f'resource_metadata="{self.provider.protected_resource_metadata_url}"',
+        ]
+        if error:
+            parts.append(f'error="{error}"')
+        return ("Bearer " + ", ".join(parts)).encode()
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
@@ -71,7 +81,7 @@ class OAuthMiddleware:
                     send,
                     {"error": "unauthorized", "error_description": "Bearer token required."},
                     401,
-                    [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}"'.encode())],
+                    [(b"www-authenticate", self._www_authenticate())],
                 )
             return
 
@@ -80,7 +90,7 @@ class OAuthMiddleware:
         except UnicodeDecodeError:
             token = ""
 
-        if not token or self.provider.verify_token(token) is None:
+        if not token or self.provider.verify_token(token, resource=self.provider.resource_identifier) is None:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             else:
@@ -88,7 +98,7 @@ class OAuthMiddleware:
                     send,
                     {"error": "invalid_token", "error_description": "Token is invalid or expired."},
                     401,
-                    [(b"www-authenticate", f'Bearer realm="{self.provider.base_url}" error="invalid_token"'.encode())],
+                    [(b"www-authenticate", self._www_authenticate("invalid_token"))],
                 )
             return
 
