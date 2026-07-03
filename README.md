@@ -164,6 +164,7 @@ Dynamically registered clients must supply `redirect_uris` at registration time.
 | `scopes_supported` | `list[str]` | `[]` | OAuth/OIDC scopes advertised in metadata |
 | `resource_documentation` | `str` | `None` | Optional URL added to protected resource metadata |
 | `user_email` | `str` | `None` | Optional static email claim returned by lightweight OIDC `/userinfo` |
+| `allow_private_cimd` | `bool` | `False` | Allow CIMD `client_id` documents to be fetched from private/loopback/link-local hosts (see [CIMD and SSRF hardening](#cimd-and-ssrf-hardening)) |
 
 ## OAuth Endpoints
 
@@ -192,6 +193,22 @@ Dynamically registered clients must supply `redirect_uris` at registration time.
 - Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an unsigned `id_token` for `openid` requests, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
 
 For ChatGPT connectors, register the redirect URI shown in ChatGPT (for example, `https://chatgpt.com/connector/oauth/{callback_id}`) and use your public MCP endpoint as the `resource` value, typically `https://your-domain.example/mcp`.
+
+### CIMD and SSRF hardening
+
+A CIMD `client_id` is a URL supplied by whoever is calling `/authorize` — it isn't something `origo` chose, so it's attacker-controlled input. By default `origo` refuses to fetch a CIMD document from a hostname that resolves to a private, loopback, link-local, reserved, or multicast address, and it never follows HTTP redirects when fetching one. Both protections close the same class of bug: a malicious `client_id` URL trying to make your server issue a request to something on its internal network (cloud metadata endpoints, internal admin panels, etc.) instead of a legitimate public client registry.
+
+Some deployments genuinely need to relax the host check — for example, an agent runtime and its `origo` instance colocated on the same private network or host, where the agent's CIMD document is intentionally served from an internal address rather than a public one. For that case, set `allow_private_cimd=True`:
+
+```python
+auth = OAuthProvider(
+    base_url="https://mcp.internal.example.com",
+    public_registration=True,
+    allow_private_cimd=True,  # only if your CIMD documents are meant to live on your private network
+)
+```
+
+`allow_private_cimd` only lifts the private-host restriction — the redirect-refusing fetch still applies unconditionally, so a CIMD host (private or public) still can't retarget the request via a 302 after the fact. Only enable it when you control, or otherwise trust, every host reachable from wherever `origo` runs; on a shared or multi-tenant network it reopens the SSRF surface the default configuration exists to close.
 
 ### Secure MCP tunnels
 

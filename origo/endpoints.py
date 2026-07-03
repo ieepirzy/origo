@@ -57,13 +57,13 @@ def _is_public_host(hostname: str) -> bool:
     return True
 
 
-def _fetch_client_metadata_document(client_id: str) -> dict | None:
+def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = False) -> dict | None:
     """Fetch a Client ID Metadata Document (CIMD) for HTTPS URL client_ids."""
     parsed = urlparse(client_id)
     if parsed.scheme != "https" or not parsed.hostname:
         return None
 
-    if not _is_public_host(parsed.hostname):
+    if not allow_private_hosts and not _is_public_host(parsed.hostname):
         return None
 
     opener = urllib.request.build_opener(_NoRedirectHandler)
@@ -263,6 +263,7 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
 async def authorize(request: Request) -> Response:
     storage: OAuthStorage = request.app.state.storage
     auto_approve: bool = request.app.state.auto_approve
+    allow_private_cimd: bool = request.app.state.allow_private_cimd
 
     if request.method == "GET":
         params = dict(request.query_params)
@@ -296,7 +297,7 @@ async def authorize(request: Request) -> Response:
         return JSONResponse({"error": "invalid_scope"}, status_code=400)
 
     if not storage.client_exists(client_id) and urlparse(client_id).scheme == "https":
-        metadata = _fetch_client_metadata_document(client_id)
+        metadata = _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
             return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
 
