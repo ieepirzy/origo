@@ -100,8 +100,10 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     loopback exemption used by native-app clients during development.
     """
     parsed = urlparse(uri)
+    if parsed.fragment or parsed.username is not None or parsed.password is not None:
+        return False
     if parsed.scheme == "https":
-        return bool(parsed.netloc)
+        return bool(parsed.hostname)
     if parsed.scheme == "http":
         return (parsed.hostname or "") in ("localhost", "127.0.0.1", "::1")
     return False
@@ -192,11 +194,11 @@ async def register(request: Request) -> JSONResponse:
     if not redirect_uris:
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uris required"}, status_code=400)
 
-    if not all(isinstance(u, str) and _is_valid_redirect_uri(u) for u in redirect_uris):
+    if not isinstance(redirect_uris, list) or not all(isinstance(u, str) and _is_valid_redirect_uri(u) for u in redirect_uris):
         return JSONResponse(
             {
                 "error": "invalid_redirect_uri",
-                "error_description": "redirect_uris must use https (or http://localhost for loopback).",
+                "error_description": "redirect_uris must be a list of valid URIs using https (or http://localhost for loopback).",
             },
             status_code=400,
         )

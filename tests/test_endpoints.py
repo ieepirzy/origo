@@ -94,6 +94,9 @@ async def test_register_invalid_json(client_public):
     "data:text/html,<script>alert(1)</script>",
     "http://example.com/cb",
     "http://evil.com/cb",
+    "https://example.com/cb#fragment",
+    "https://user:pass@example.com/cb",
+    "https://:8080/cb",
 ])
 async def test_register_rejects_unsafe_redirect_uri_scheme(client_public, bad_uri):
     client, _ = client_public
@@ -107,6 +110,15 @@ async def test_register_allows_http_loopback_redirect_uri(client_public):
     client, _ = client_public
     resp = await client.post("/register", json={"redirect_uris": ["http://127.0.0.1:8080/cb"]})
     assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_redirect_uris", [5, True, {"a": "https://example.com/cb"}, "https://example.com/cb"])
+async def test_register_rejects_non_list_redirect_uris(client_public, bad_redirect_uris):
+    client, _ = client_public
+    resp = await client.post("/register", json={"redirect_uris": bad_redirect_uris})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
 
 
 # --- Authorize ---
