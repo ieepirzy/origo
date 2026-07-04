@@ -88,6 +88,39 @@ async def test_register_invalid_json(client_public):
     assert resp.status_code == 400
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_uri", [
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "http://example.com/cb",
+    "http://evil.com/cb",
+    "https://example.com/cb#fragment",
+    "https://user:pass@example.com/cb",
+    "https://:8080/cb",
+])
+async def test_register_rejects_unsafe_redirect_uri_scheme(client_public, bad_uri):
+    client, _ = client_public
+    resp = await client.post("/register", json={"redirect_uris": [bad_uri]})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
+
+
+@pytest.mark.asyncio
+async def test_register_allows_http_loopback_redirect_uri(client_public):
+    client, _ = client_public
+    resp = await client.post("/register", json={"redirect_uris": ["http://127.0.0.1:8080/cb"]})
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_redirect_uris", [5, True, {"a": "https://example.com/cb"}, "https://example.com/cb"])
+async def test_register_rejects_non_list_redirect_uris(client_public, bad_redirect_uris):
+    client, _ = client_public
+    resp = await client.post("/register", json={"redirect_uris": bad_redirect_uris})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
+
+
 # --- Authorize ---
 
 @pytest.mark.asyncio
@@ -744,6 +777,31 @@ async def test_authorize_rejects_cimd_metadata_without_redirect_uris(monkeypatch
     assert resp.json()["error"] == "unauthorized_client"
     # Must not have been registered with an "allow any redirect_uri" state.
     assert not p.storage.client_exists(client_id) or not p.storage.is_redirect_uri_allowed(client_id, "https://evil.example/anywhere")
+
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_cimd_metadata_with_unsafe_redirect_uri_scheme(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://chatgpt.com/oauth/javascript-redirect.json"
+
+    def fake_fetch(url, allow_private_hosts=False):
+        return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": ["javascript:alert(1)"]}
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    verifier, challenge = make_pkce_pair()
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "javascript:alert(1)",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "unauthorized_client"
+    assert not p.storage.client_exists(client_id)
 
 
 @pytest.mark.asyncio
