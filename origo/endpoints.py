@@ -93,6 +93,20 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
     return metadata
 
 
+def _is_valid_redirect_uri(uri: str) -> bool:
+    """Reject redirect URIs whose scheme can't carry an auth code safely.
+
+    https is always allowed; http is allowed only for the RFC 8252 §7.3
+    loopback exemption used by native-app clients during development.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme == "https":
+        return bool(parsed.netloc)
+    if parsed.scheme == "http":
+        return (parsed.hostname or "") in ("localhost", "127.0.0.1", "::1")
+    return False
+
+
 def _validate_scope(scope: str, scopes_supported: list[str]) -> bool:
     if not scope or not scopes_supported:
         return True
@@ -177,6 +191,15 @@ async def register(request: Request) -> JSONResponse:
     redirect_uris = body.get("redirect_uris", [])
     if not redirect_uris:
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uris required"}, status_code=400)
+
+    if not all(isinstance(u, str) and _is_valid_redirect_uri(u) for u in redirect_uris):
+        return JSONResponse(
+            {
+                "error": "invalid_redirect_uri",
+                "error_description": "redirect_uris must use https (or http://localhost for loopback).",
+            },
+            status_code=400,
+        )
 
     if not public_registration:
         # In private mode, only pre-registered clients are allowed.
@@ -305,6 +328,8 @@ async def authorize(request: Request) -> Response:
         auth_method = metadata.get("token_endpoint_auth_method", "none")
         if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
             return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD metadata must declare a non-empty redirect_uris list."}, status_code=401)
+        if not all(_is_valid_redirect_uri(u) for u in redirect_uris):
+            return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD redirect_uris must use https (or http://localhost for loopback)."}, status_code=401)
         storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
 
     if not storage.client_exists(client_id):
