@@ -187,6 +187,8 @@ async def register(request: Request) -> JSONResponse:
 
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("JSON body must be an object")
     except Exception:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
