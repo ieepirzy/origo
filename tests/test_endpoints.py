@@ -530,6 +530,18 @@ async def test_register_rejects_unsupported_auth_method(client_public):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_auth_method", [["client_secret_post"], {"a": "b"}, 5, True])
+async def test_register_rejects_non_string_auth_method(client_public, bad_auth_method):
+    client, _ = client_public
+    resp = await client.post("/register", json={
+        "redirect_uris": ["https://example.com/cb"],
+        "token_endpoint_auth_method": bad_auth_method,
+    })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_client_metadata"
+
+
+@pytest.mark.asyncio
 async def test_token_exchange_public_pkce_client_with_resource(client_public):
     client, provider = client_public
     reg = await client.post("/register", json={
