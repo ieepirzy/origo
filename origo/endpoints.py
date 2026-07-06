@@ -216,7 +216,7 @@ async def register(request: Request) -> JSONResponse:
         )
 
     token_endpoint_auth_method = body.get("token_endpoint_auth_method", "client_secret_post")
-    if token_endpoint_auth_method not in _SUPPORTED_AUTH_METHODS:
+    if not isinstance(token_endpoint_auth_method, str) or token_endpoint_auth_method not in _SUPPORTED_AUTH_METHODS:
         return JSONResponse(
             {"error": "invalid_client_metadata", "error_description": "Unsupported token_endpoint_auth_method."},
             status_code=400,
