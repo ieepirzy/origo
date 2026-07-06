@@ -530,7 +530,7 @@ async def test_register_rejects_unsupported_auth_method(client_public):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_auth_method", [["client_secret_post"], {"a": "b"}, 5, True])
+@pytest.mark.parametrize("bad_auth_method", [["client_secret_post"], {"a": "b"}, 5, True, None])
 async def test_register_rejects_non_string_auth_method(client_public, bad_auth_method):
     client, _ = client_public
     resp = await client.post("/register", json={
