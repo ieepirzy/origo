@@ -323,7 +323,8 @@ async def authorize(request: Request) -> Response:
     if not _validate_scope(scope, scopes_supported):
         return JSONResponse({"error": "invalid_scope"}, status_code=400)
 
-    if not storage.client_exists(client_id) and urlparse(client_id).scheme == "https":
+    public_registration: bool = request.app.state.public_registration
+    if not storage.client_exists(client_id) and public_registration and urlparse(client_id).scheme == "https":
         metadata = _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
             return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
