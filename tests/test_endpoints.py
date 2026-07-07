@@ -900,3 +900,26 @@ async def test_preregistered_client_redirect_uri_allowlist():
         }, follow_redirects=False)
     assert resp.status_code == 400
     assert resp.json()["error_description"] == "redirect_uri not allowed."
+
+@pytest.mark.asyncio
+async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://chatgpt.com/oauth/test-client.json"
+
+    def fake_fetch(url, allow_private_hosts=False):
+        raise AssertionError("Should not be called when public_registration=False")
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", public_registration=False, auto_approve=True, clients={"existing": "secret"})
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "unauthorized_client"

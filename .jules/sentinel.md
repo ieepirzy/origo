@@ -19,3 +19,7 @@
 **Vulnerability:** A minor Denial of Service (DoS) vulnerability existed in the `/register` endpoint because `body = await request.json()` does not guarantee the parsed JSON is a dictionary. If a client sends a JSON array or string (e.g., `["foo"]`), the subsequent call to `body.get()` triggers an `AttributeError`, resulting in a 500 Internal Server Error crash.
 **Learning:** `request.json()` can return lists, strings, ints, or booleans depending on the client payload. Applications must actively type-check the returned parsed JSON before interacting with it to ensure stability.
 **Prevention:** Always use `isinstance(body, dict)` after parsing JSON to ensure it is the expected dictionary before performing `.get()` or dictionary lookups on the payload.
+## 2025-02-14 - SSRF/CIMD Bypass in Authorization Endpoint
+**Vulnerability:** The `/authorize` endpoint unconditionally fetched Client ID Metadata Documents (CIMD) for unknown HTTPS client IDs, even when `public_registration` was set to `False`. This bypassed the private registration mode and exposed the server to potential Server-Side Request Forgery (SSRF) and Denial of Service (DoS).
+**Learning:** External or remote fetches based on user-supplied input must be strictly gated by application configuration state, not just input validation.
+**Prevention:** Ensure feature flags (like `public_registration`) are validated *before* initiating any external network requests or dynamic registration workflows.
