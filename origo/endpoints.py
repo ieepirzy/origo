@@ -97,11 +97,16 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
     return metadata
 
 
-def _is_valid_redirect_uri(uri: str) -> bool:
+def _is_valid_redirect_uri(uri: str, allowed_custom_schemes: frozenset[str] = frozenset()) -> bool:
     """Reject redirect URIs whose scheme can't carry an auth code safely.
 
     https is always allowed; http is allowed only for the RFC 8252 §7.3
     loopback exemption used by native-app clients during development.
+    Private-use URI schemes (RFC 8252 §7.1, e.g. "myapp://callback") are
+    allowed only if the operator explicitly declared them via
+    OAuthProvider(custom_redirect_uri_schemes=[...]) — never by default,
+    since an unconfigured scheme could be claimed by another app on the
+    same device.
     """
     try:
         parsed = urlparse(uri)
@@ -114,7 +119,15 @@ def _is_valid_redirect_uri(uri: str) -> bool:
         return bool(parsed.hostname)
     if parsed.scheme == "http":
         return (parsed.hostname or "") in ("localhost", "127.0.0.1", "::1")
-    return False
+    return parsed.scheme in allowed_custom_schemes
+
+
+def _redirect_uri_error_description(allowed_custom_schemes: frozenset[str]) -> str:
+    description = "must be valid URIs using https (or http://localhost for loopback)"
+    if allowed_custom_schemes:
+        schemes = ", ".join(f"{s}:" for s in sorted(allowed_custom_schemes))
+        description += f", or one of these custom schemes: {schemes}"
+    return description + "."
 
 
 def _validate_scope(scope: str, scopes_supported: list[str]) -> bool:
@@ -192,6 +205,7 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
 async def register(request: Request) -> JSONResponse:
     storage: OAuthStorage = request.app.state.storage
     public_registration: bool = request.app.state.public_registration
+    custom_redirect_uri_schemes: frozenset[str] = request.app.state.custom_redirect_uri_schemes
 
     try:
         body = await request.json()
@@ -204,11 +218,13 @@ async def register(request: Request) -> JSONResponse:
     if not redirect_uris:
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uris required"}, status_code=400)
 
-    if not isinstance(redirect_uris, list) or not all(isinstance(u, str) and _is_valid_redirect_uri(u) for u in redirect_uris):
+    if not isinstance(redirect_uris, list) or not all(
+        isinstance(u, str) and _is_valid_redirect_uri(u, custom_redirect_uri_schemes) for u in redirect_uris
+    ):
         return JSONResponse(
             {
                 "error": "invalid_redirect_uri",
-                "error_description": "redirect_uris must be a list of valid URIs using https (or http://localhost for loopback).",
+                "error_description": "redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes),
             },
             status_code=400,
         )
@@ -332,6 +348,7 @@ async def authorize(request: Request) -> Response:
         return JSONResponse({"error": "invalid_scope"}, status_code=400)
 
     public_registration: bool = request.app.state.public_registration
+    custom_redirect_uri_schemes: frozenset[str] = request.app.state.custom_redirect_uri_schemes
     client_is_https = False
     try:
         client_is_https = urlparse(client_id).scheme == "https"
@@ -347,8 +364,11 @@ async def authorize(request: Request) -> Response:
         auth_method = metadata.get("token_endpoint_auth_method", "none")
         if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
             return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD metadata must declare a non-empty redirect_uris list."}, status_code=401)
-        if not all(_is_valid_redirect_uri(u) for u in redirect_uris):
-            return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD redirect_uris must use https (or http://localhost for loopback)."}, status_code=401)
+        if not all(_is_valid_redirect_uri(u, custom_redirect_uri_schemes) for u in redirect_uris):
+            return JSONResponse(
+                {"error": "unauthorized_client", "error_description": "CIMD redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes)},
+                status_code=401,
+            )
         storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
 
     if not storage.client_exists(client_id):

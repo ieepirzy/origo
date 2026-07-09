@@ -150,6 +150,18 @@ auth = OAuthProvider(
 
 Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) have no such restriction — any redirect URI is accepted, since the operator controls both sides.
 
+By default, dynamically registered `redirect_uris` must use `https` (or `http://localhost`/`127.0.0.1`/`::1` for the RFC 8252 §7.3 native-app loopback exemption). Native/mobile app clients that use a private-use URI scheme instead (RFC 8252 §7.1, e.g. `myapp://callback`) are rejected unless the operator explicitly opts in:
+
+```python
+auth = OAuthProvider(
+    base_url="https://mcp.yourdomain.com",
+    public_registration=True,
+    custom_redirect_uri_schemes=["myapp"],
+)
+```
+
+Only schemes listed here are accepted — arbitrary `foo://` schemes are always rejected, since an unclaimed scheme could be registered by another app on the same device.
+
 ## Options
 
 | Parameter | Type | Default | Description |
@@ -165,6 +177,7 @@ Dynamically registered clients must supply `redirect_uris` at registration time.
 | `resource_documentation` | `str` | `None` | Optional URL added to protected resource metadata |
 | `user_email` | `str` | `None` | Optional static email claim returned by lightweight OIDC `/userinfo` |
 | `allow_private_cimd` | `bool` | `False` | Allow CIMD `client_id` documents to be fetched from private/loopback/link-local hosts (see [CIMD and SSRF hardening](#cimd-and-ssrf-hardening)) |
+| `custom_redirect_uri_schemes` | `list[str]` | `None` | Private-use URI schemes (RFC 8252 §7.1, e.g. `["myapp"]`) accepted as `redirect_uris` during dynamic registration, for native app clients |
 
 ## OAuth Endpoints
 

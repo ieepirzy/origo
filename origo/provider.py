@@ -41,6 +41,12 @@ class OAuthProvider:
                              Enable only when your CIMD documents are intentionally
                              served from inside your own network (e.g. an agent
                              deployment colocated with origo) — see README.
+        custom_redirect_uri_schemes: Optional list of private-use URI schemes (RFC 8252
+                             §7.1, e.g. ["myapp"]) to accept as redirect_uris during
+                             dynamic (DCR/CIMD) client registration, for native/mobile
+                             app clients. Off by default — an unconfigured scheme could
+                             be claimed by another app on the same device, so schemes
+                             must be declared explicitly by the operator.
     """
 
     def __init__(
@@ -57,6 +63,7 @@ class OAuthProvider:
         user_email: Optional[str] = None,
         user_subject: Optional[str] = None,
         allow_private_cimd: bool = False,
+        custom_redirect_uri_schemes: Optional[list[str]] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -67,6 +74,17 @@ class OAuthProvider:
         self.user_email = user_email
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
+
+        if isinstance(custom_redirect_uri_schemes, str):
+            raise TypeError("custom_redirect_uri_schemes must be a list of strings, not a single string")
+        schemes = []
+        for scheme in custom_redirect_uri_schemes or []:
+            if not isinstance(scheme, str):
+                raise TypeError("custom_redirect_uri_schemes must contain only strings")
+            sanitized = scheme.rstrip(":/").lower()
+            if sanitized:
+                schemes.append(sanitized)
+        self.custom_redirect_uri_schemes = frozenset(schemes)
 
         self.storage = OAuthStorage(token_ttl=token_ttl)
 
@@ -104,6 +122,7 @@ class OAuthProvider:
         app.state.user_email = self.user_email
         app.state.user_subject = self.user_subject
         app.state.allow_private_cimd = self.allow_private_cimd
+        app.state.custom_redirect_uri_schemes = self.custom_redirect_uri_schemes
         return app
 
     def asgi_app(self) -> Starlette:

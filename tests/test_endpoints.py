@@ -121,6 +121,140 @@ async def test_register_rejects_non_list_redirect_uris(client_public, bad_redire
     assert resp.json()["error"] == "invalid_redirect_uri"
 
 
+@pytest.mark.asyncio
+async def test_register_rejects_custom_scheme_by_default(client_public):
+    client, _ = client_public
+    resp = await client.post("/register", json={"redirect_uris": ["myapp://callback"]})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
+
+
+@pytest.mark.asyncio
+async def test_register_allows_custom_scheme_when_configured():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["myapp"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/register", json={"redirect_uris": ["myapp://callback"]})
+    assert resp.status_code == 201
+    assert resp.json()["redirect_uris"] == ["myapp://callback"]
+
+
+@pytest.mark.asyncio
+async def test_register_custom_scheme_matching_is_case_insensitive():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["MyApp"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/register", json={"redirect_uris": ["myapp://callback"]})
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_register_custom_scheme_sanitizes_trailing_colon_and_slashes():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["myapp://", "otherapp:"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp1 = await c.post("/register", json={"redirect_uris": ["myapp://callback"]})
+        resp2 = await c.post("/register", json={"redirect_uris": ["otherapp://callback"]})
+    assert resp1.status_code == 201
+    assert resp2.status_code == 201
+
+
+def test_custom_redirect_uri_schemes_rejects_bare_string():
+    from origo import OAuthProvider
+    with pytest.raises(TypeError):
+        OAuthProvider(
+            base_url="http://testserver",
+            public_registration=True,
+            custom_redirect_uri_schemes="myapp",
+        )
+
+
+def test_custom_redirect_uri_schemes_rejects_non_string_elements():
+    from origo import OAuthProvider
+    with pytest.raises(TypeError):
+        OAuthProvider(
+            base_url="http://testserver",
+            public_registration=True,
+            custom_redirect_uri_schemes=["myapp", 5],
+        )
+
+
+@pytest.mark.asyncio
+async def test_register_only_declared_custom_scheme_allowed():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["myapp"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/register", json={"redirect_uris": ["otherapp://callback"]})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
+
+
+@pytest.mark.asyncio
+async def test_full_flow_with_custom_scheme_redirect_uri():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    provider = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["myapp"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver") as c:
+        reg = await c.post("/register", json={"redirect_uris": ["myapp://callback"]})
+        assert reg.status_code == 201
+        cid = reg.json()["client_id"]
+        csecret = reg.json()["client_secret"]
+
+        verifier, challenge = make_pkce_pair()
+        resp = await c.get("/authorize", params={
+            "client_id": cid,
+            "redirect_uri": "myapp://callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+            "state": "xyz",
+        }, follow_redirects=False)
+        assert resp.status_code == 302
+        location = resp.headers["location"]
+        assert location.startswith("myapp://callback")
+        code = dict(p.split("=") for p in location.split("?", 1)[1].split("&"))["code"]
+
+        resp = await c.post("/token", data={
+            "grant_type": "authorization_code",
+            "client_id": cid,
+            "client_secret": csecret,
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": "myapp://callback",
+        })
+        assert resp.status_code == 200
+        assert "access_token" in resp.json()
+
+
 # --- Authorize ---
 
 @pytest.mark.asyncio
@@ -814,6 +948,35 @@ async def test_authorize_rejects_cimd_metadata_with_unsafe_redirect_uri_scheme(m
     assert resp.status_code == 401
     assert resp.json()["error"] == "unauthorized_client"
     assert not p.storage.client_exists(client_id)
+
+
+@pytest.mark.asyncio
+async def test_authorize_allows_cimd_custom_scheme_when_configured(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    client_id = "https://chatgpt.com/oauth/native-redirect.json"
+
+    def fake_fetch(url, allow_private_hosts=False):
+        return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": ["myapp://callback"]}
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    verifier, challenge = make_pkce_pair()
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["myapp"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "myapp://callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+    assert resp.status_code == 302
+    assert p.storage.client_exists(client_id)
 
 
 @pytest.mark.asyncio
