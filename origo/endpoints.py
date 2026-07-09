@@ -59,7 +59,11 @@ def _is_public_host(hostname: str) -> bool:
 
 def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = False) -> dict | None:
     """Fetch a Client ID Metadata Document (CIMD) for HTTPS URL client_ids."""
-    parsed = urlparse(client_id)
+    try:
+        parsed = urlparse(client_id)
+    except ValueError:
+        return None
+
     if parsed.scheme != "https" or not parsed.hostname:
         return None
 
@@ -99,7 +103,11 @@ def _is_valid_redirect_uri(uri: str) -> bool:
     https is always allowed; http is allowed only for the RFC 8252 §7.3
     loopback exemption used by native-app clients during development.
     """
-    parsed = urlparse(uri)
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return False
+
     if parsed.fragment or parsed.username is not None or parsed.password is not None:
         return False
     if parsed.scheme == "https":
@@ -324,7 +332,13 @@ async def authorize(request: Request) -> Response:
         return JSONResponse({"error": "invalid_scope"}, status_code=400)
 
     public_registration: bool = request.app.state.public_registration
-    if not storage.client_exists(client_id) and public_registration and urlparse(client_id).scheme == "https":
+    client_is_https = False
+    try:
+        client_is_https = urlparse(client_id).scheme == "https"
+    except ValueError:
+        pass
+
+    if not storage.client_exists(client_id) and public_registration and client_is_https:
         metadata = _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
             return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
