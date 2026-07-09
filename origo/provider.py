@@ -74,7 +74,17 @@ class OAuthProvider:
         self.user_email = user_email
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
-        self.custom_redirect_uri_schemes = frozenset(s.lower() for s in (custom_redirect_uri_schemes or []))
+
+        if isinstance(custom_redirect_uri_schemes, str):
+            raise TypeError("custom_redirect_uri_schemes must be a list of strings, not a single string")
+        schemes = []
+        for scheme in custom_redirect_uri_schemes or []:
+            if not isinstance(scheme, str):
+                raise TypeError("custom_redirect_uri_schemes must contain only strings")
+            sanitized = scheme.rstrip(":/").lower()
+            if sanitized:
+                schemes.append(sanitized)
+        self.custom_redirect_uri_schemes = frozenset(schemes)
 
         self.storage = OAuthStorage(token_ttl=token_ttl)
 

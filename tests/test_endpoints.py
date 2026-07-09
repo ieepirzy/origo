@@ -161,6 +161,43 @@ async def test_register_custom_scheme_matching_is_case_insensitive():
 
 
 @pytest.mark.asyncio
+async def test_register_custom_scheme_sanitizes_trailing_colon_and_slashes():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        auto_approve=True,
+        custom_redirect_uri_schemes=["myapp://", "otherapp:"],
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp1 = await c.post("/register", json={"redirect_uris": ["myapp://callback"]})
+        resp2 = await c.post("/register", json={"redirect_uris": ["otherapp://callback"]})
+    assert resp1.status_code == 201
+    assert resp2.status_code == 201
+
+
+def test_custom_redirect_uri_schemes_rejects_bare_string():
+    from origo import OAuthProvider
+    with pytest.raises(TypeError):
+        OAuthProvider(
+            base_url="http://testserver",
+            public_registration=True,
+            custom_redirect_uri_schemes="myapp",
+        )
+
+
+def test_custom_redirect_uri_schemes_rejects_non_string_elements():
+    from origo import OAuthProvider
+    with pytest.raises(TypeError):
+        OAuthProvider(
+            base_url="http://testserver",
+            public_registration=True,
+            custom_redirect_uri_schemes=["myapp", 5],
+        )
+
+
+@pytest.mark.asyncio
 async def test_register_only_declared_custom_scheme_allowed():
     from origo import OAuthProvider
     from httpx import ASGITransport, AsyncClient
