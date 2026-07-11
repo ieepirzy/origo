@@ -32,7 +32,10 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
 
 def _build_redirect(uri: str, params: dict) -> str:
     """Append params to uri, preserving any existing query string."""
-    parts = urlparse(uri)
+    try:
+        parts = urlparse(uri)
+    except ValueError as e:
+        raise ValueError(f"Invalid redirect URI: {e}") from e
     qs = urlencode(parse_qsl(parts.query) + list(params.items()))
     return urlunparse(parts._replace(query=qs))
 
@@ -396,10 +399,18 @@ async def authorize(request: Request) -> Response:
 
         approved = params.get("approved", "true")
         if approved != "true":
-            return RedirectResponse(_build_redirect(redirect_uri, {"error": "access_denied", "state": state}), status_code=302)
+            try:
+                redirect_url = _build_redirect(redirect_uri, {"error": "access_denied", "state": state})
+            except ValueError:
+                return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
+            return RedirectResponse(redirect_url, status_code=302)
 
     code = storage.store_code(client_id, redirect_uri, code_challenge, code_challenge_method, resource=resource, scope=scope)
-    return RedirectResponse(_build_redirect(redirect_uri, {"code": code, "state": state}), status_code=302)
+    try:
+        redirect_url = _build_redirect(redirect_uri, {"code": code, "state": state})
+    except ValueError:
+        return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
+    return RedirectResponse(redirect_url, status_code=302)
 
 
 # --- Token ---
