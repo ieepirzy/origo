@@ -26,6 +26,7 @@ async def test_oauth_metadata(client_private):
     assert data["authorization_endpoint"] == "http://testserver/authorize"
     assert data["token_endpoint"] == "http://testserver/token"
     assert "authorization_code" in data["grant_types_supported"]
+    assert "refresh_token" in data["grant_types_supported"]
     assert data["code_challenge_methods_supported"] == ["S256"]
     assert "plain" not in data["code_challenge_methods_supported"]
     assert "registration_endpoint" not in data
@@ -413,6 +414,7 @@ async def test_token_exchange_s256(client_private):
     assert "access_token" in data
     assert data["token_type"] == "bearer"
     assert "expires_in" in data
+    assert "refresh_token" in data
 
 
 @pytest.mark.asyncio
@@ -732,6 +734,146 @@ async def test_token_exchange_rejects_resource_mismatch(client_private):
     })
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_grant"
+
+
+# --- Refresh token ---
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_issues_new_access_token(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+    })
+    assert first.status_code == 200
+    refresh_token = first.json()["refresh_token"]
+
+    second = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert second.status_code == 200
+    data = second.json()
+    assert "access_token" in data
+    assert data["access_token"] != first.json()["access_token"]
+    assert provider.verify_token(data["access_token"]) is not None
+    # Rotated: a new refresh token is issued and the old one is single-use.
+    assert data["refresh_token"] != refresh_token
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_preserves_resource(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    resource = "http://testserver/mcp"
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256", resource=resource)
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+        "resource": resource,
+    })
+    assert first.status_code == 200
+    refresh_token = first.json()["refresh_token"]
+
+    # Refresh without passing the resource parameter explicitly
+    second = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert second.status_code == 200
+    data = second.json()
+    assert "access_token" in data
+    meta = provider.verify_token(data["access_token"])
+    assert meta is not None
+    assert meta["resource"] == resource
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_rotates_and_invalidates_old_token(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+    })
+    refresh_token = first.json()["refresh_token"]
+
+    reused = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert reused.status_code == 200
+
+    reused_again = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert reused_again.status_code == 401
+    assert reused_again.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_wrong_client(client_private):
+    client, provider = client_private
+    refresh_token = provider.storage.store_refresh_token("test-client")
+    provider.storage.seed_clients({"other-client": "other-secret"})
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "other-client",
+        "client_secret": "other-secret",
+        "refresh_token": refresh_token,
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_missing_token(client_private):
+    client, _ = client_private
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+    })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_invalid_token(client_private):
+    client, _ = client_private
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": "bogus",
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+
 
 @pytest.mark.asyncio
 async def test_oauth_metadata_includes_cimd_and_oidc_fields():

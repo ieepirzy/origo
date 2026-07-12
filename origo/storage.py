@@ -9,11 +9,13 @@ def _now() -> float:
 
 
 class OAuthStorage:
-    def __init__(self, token_ttl: int = 3600):
+    def __init__(self, token_ttl: int = 3600, refresh_token_ttl: int = 30 * 24 * 3600):
         self.token_ttl = token_ttl
+        self.refresh_token_ttl = refresh_token_ttl
         self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris, token_endpoint_auth_method}
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
+        self._refresh_tokens: dict[str, dict] = {}  # refresh_token -> metadata
 
     # --- Clients ---
 
@@ -88,6 +90,7 @@ class OAuthStorage:
         now = _now()
         self._codes = {k: v for k, v in self._codes.items() if v["expires_at"] > now}
         self._tokens = {k: v for k, v in self._tokens.items() if v["expires_at"] > now}
+        self._refresh_tokens = {k: v for k, v in self._refresh_tokens.items() if v["expires_at"] > now}
 
     def store_code(
         self,
@@ -140,5 +143,27 @@ class OAuthStorage:
             return None
         if _now() > entry["expires_at"]:
             self._tokens.pop(token, None)
+            return None
+        return entry
+
+    # --- Refresh tokens ---
+
+    def store_refresh_token(self, client_id: str, resource: Optional[str] = None, scope: str = "") -> str:
+        self._cleanup_expired()
+        token = secrets.token_urlsafe(48)
+        self._refresh_tokens[token] = {
+            "client_id": client_id,
+            "resource": resource,
+            "scope": scope,
+            "expires_at": _now() + self.refresh_token_ttl,
+        }
+        return token
+
+    def exchange_refresh_token(self, refresh_token: str) -> Optional[dict]:
+        """Return and consume a refresh token (rotation). None if missing or expired."""
+        entry = self._refresh_tokens.pop(refresh_token, None)
+        if entry is None:
+            return None
+        if _now() > entry["expires_at"]:
             return None
         return entry

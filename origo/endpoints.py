@@ -174,7 +174,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "token_endpoint": f"{base_url}/token",
         "userinfo_endpoint": f"{base_url}/userinfo",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["none"],
         "code_challenge_methods_supported": ["S256"],
@@ -437,16 +437,20 @@ async def token(request: Request) -> JSONResponse:
             except Exception:
                 return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    code = params.get("code")
-    code_verifier = params.get("code_verifier")
     grant_type = params.get("grant_type")
     redirect_uri = params.get("redirect_uri")
+    code = params.get("code")
+    code_verifier = params.get("code_verifier")
+    refresh_token = params.get("refresh_token")
 
-    if grant_type != "authorization_code":
+    if grant_type == "authorization_code":
+        if not all([client_id, code, code_verifier, redirect_uri]):
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+    elif grant_type == "refresh_token":
+        if not all([client_id, refresh_token]):
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+    else:
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-
-    if not all([client_id, code, code_verifier, redirect_uri]):
-        return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     client_auth_method = storage.get_client_auth_method(client_id)
     if client_auth_method is None:
@@ -460,33 +464,53 @@ async def token(request: Request) -> JSONResponse:
         if stored_secret is None or not hmac.compare_digest(stored_secret, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-    # Exchange code
-    code_entry = storage.exchange_code(code)
-    if code_entry is None:
-        return JSONResponse({"error": "invalid_grant", "error_description": "Code expired or invalid."}, status_code=401)
+    if grant_type == "authorization_code":
+        # Exchange code
+        code_entry = storage.exchange_code(code)
+        if code_entry is None:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Code expired or invalid."}, status_code=401)
 
-    if code_entry["client_id"] != client_id:
-        return JSONResponse({"error": "invalid_grant"}, status_code=401)
+        if code_entry["client_id"] != client_id:
+            return JSONResponse({"error": "invalid_grant"}, status_code=401)
 
-    if code_entry["redirect_uri"] != redirect_uri:
-        return JSONResponse({"error": "invalid_grant"}, status_code=401)
+        if code_entry["redirect_uri"] != redirect_uri:
+            return JSONResponse({"error": "invalid_grant"}, status_code=401)
 
-    resource = params.get("resource")
-    code_resource = code_entry.get("resource")
-    if code_resource != resource:
-        return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
+        resource = params.get("resource")
+        code_resource = code_entry.get("resource")
+        if code_resource != resource:
+            return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
 
-    # Verify PKCE
-    if not _verify_pkce(code_verifier, code_entry["code_challenge"], code_entry["code_challenge_method"]):
-        return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=401)
+        # Verify PKCE
+        if not _verify_pkce(code_verifier, code_entry["code_challenge"], code_entry["code_challenge_method"]):
+            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=401)
 
-    scope = code_entry.get("scope", "")
+        scope = code_entry.get("scope", "")
+    else:
+        # Exchange (and rotate) refresh token
+        refresh_entry = storage.exchange_refresh_token(refresh_token)
+        if refresh_entry is None:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Refresh token expired or invalid."}, status_code=401)
+
+        if refresh_entry["client_id"] != client_id:
+            return JSONResponse({"error": "invalid_grant"}, status_code=401)
+
+        resource = params.get("resource")
+        if resource is None:
+            resource = refresh_entry.get("resource")
+        elif refresh_entry.get("resource") != resource:
+            return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
+
+        scope = refresh_entry.get("scope", "")
+
     access_token = storage.store_token(client_id, resource=resource, scope=scope)
+    new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope)
 
     response_body = {
         "access_token": access_token,
         "token_type": "bearer",
         "expires_in": storage.token_ttl,
+        "refresh_token": new_refresh_token,
     }
     if scope:
         response_body["scope"] = scope
