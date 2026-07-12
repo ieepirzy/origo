@@ -86,3 +86,35 @@ def test_token_ttl_respected(storage):
 
 def test_is_redirect_uri_allowed_unknown_client(storage):
     assert storage.is_redirect_uri_allowed("nonexistent", "https://example.com") is False
+
+
+def test_store_and_exchange_refresh_token(storage):
+    token = storage.store_refresh_token("my-client", resource="https://example.com/mcp", scope="a b")
+    entry = storage.exchange_refresh_token(token)
+    assert entry is not None
+    assert entry["client_id"] == "my-client"
+    assert entry["resource"] == "https://example.com/mcp"
+    assert entry["scope"] == "a b"
+
+
+def test_exchange_refresh_token_consumed_only_once(storage):
+    token = storage.store_refresh_token("my-client")
+    assert storage.exchange_refresh_token(token) is not None
+    assert storage.exchange_refresh_token(token) is None
+
+
+def test_exchange_unknown_refresh_token(storage):
+    assert storage.exchange_refresh_token("nonexistent") is None
+
+
+def test_exchange_expired_refresh_token(storage):
+    token = storage.store_refresh_token("my-client")
+    with patch("origo.storage._now", return_value=9999999999.0):
+        assert storage.exchange_refresh_token(token) is None
+
+
+def test_refresh_token_ttl_respected():
+    short_storage = OAuthStorage(refresh_token_ttl=1)
+    token = short_storage.store_refresh_token("c")
+    with patch("origo.storage._now", return_value=9999999999.0):
+        assert short_storage.exchange_refresh_token(token) is None

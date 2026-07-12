@@ -31,6 +31,9 @@ class OAuthProvider:
         auto_approve:        Skip consent page, approve all valid clients.
                              Default False.
         token_ttl:           Access token lifetime in seconds. Default 3600.
+        refresh_token_ttl:   Refresh token lifetime in seconds. Default 30 days.
+                             Refresh tokens are single-use and rotated on every
+                             /token request (a new one is issued each time).
         mcp_path:            Path where MCP endpoint is mounted. Default "/mcp".
         scopes_supported:    OAuth scopes advertised to clients.
         resource_documentation: Optional protected resource documentation URL.
@@ -57,6 +60,7 @@ class OAuthProvider:
         public_registration: bool = False,
         auto_approve: bool = False,
         token_ttl: int = 3600,
+        refresh_token_ttl: int = 30 * 24 * 3600,
         mcp_path: str = "/mcp",
         scopes_supported: Optional[list[str]] = None,
         resource_documentation: Optional[str] = None,
@@ -86,7 +90,7 @@ class OAuthProvider:
                 schemes.append(sanitized)
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
-        self.storage = OAuthStorage(token_ttl=token_ttl)
+        self.storage = OAuthStorage(token_ttl=token_ttl, refresh_token_ttl=refresh_token_ttl)
 
         if clients:
             self.storage.seed_clients(clients, client_redirect_uris)
