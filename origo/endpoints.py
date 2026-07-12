@@ -496,7 +496,9 @@ async def token(request: Request) -> JSONResponse:
             return JSONResponse({"error": "invalid_grant"}, status_code=401)
 
         resource = params.get("resource")
-        if refresh_entry.get("resource") != resource:
+        if resource is None:
+            resource = refresh_entry.get("resource")
+        elif refresh_entry.get("resource") != resource:
             return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
 
         scope = refresh_entry.get("scope", "")

@@ -770,6 +770,39 @@ async def test_token_refresh_grant_issues_new_access_token(client_private):
 
 
 @pytest.mark.asyncio
+async def test_token_refresh_grant_preserves_resource(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    resource = "http://testserver/mcp"
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256", resource=resource)
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+        "resource": resource,
+    })
+    assert first.status_code == 200
+    refresh_token = first.json()["refresh_token"]
+
+    # Refresh without passing the resource parameter explicitly
+    second = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert second.status_code == 200
+    data = second.json()
+    assert "access_token" in data
+    meta = provider.verify_token(data["access_token"])
+    assert meta is not None
+    assert meta["resource"] == resource
+
+
+@pytest.mark.asyncio
 async def test_token_refresh_grant_rotates_and_invalidates_old_token(client_private):
     client, provider = client_private
     verifier, challenge = make_pkce_pair()
