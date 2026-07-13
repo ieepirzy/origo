@@ -94,7 +94,10 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
 
     try:
         metadata = json.loads(body)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(metadata, dict):
         return None
 
     if metadata.get("client_id", client_id) != client_id:
