@@ -106,6 +106,16 @@ class OAuthProvider:
                 Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
                 Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
                 Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
+                # RFC 9728 builds the metadata URL by INSERTING the well-known
+                # segment into the resource path: a resource at https://host/mcp
+                # is described at https://host/.well-known/oauth-protected-resource/mcp.
+                # Clients (Claude among them) try this form first, so serve it as
+                # well as the bare path.
+                Route(
+                    f"/.well-known/oauth-protected-resource{self.mcp_path}",
+                    protected_resource_metadata,
+                    methods=["GET"],
+                ),
                 Route("/register", register, methods=["POST"]),
                 Route("/authorize", authorize, methods=["GET", "POST"]),
                 Route("/token", token, methods=["POST"]),

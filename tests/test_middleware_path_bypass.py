@@ -278,3 +278,64 @@ async def test_invalid_token_returns_401_with_www_authenticate(provider):
         assert resp.status_code == 401
         assert resp.json()["error"] == "invalid_token"
         assert "WWW-Authenticate" in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# RFC 9728: the path-suffixed protected-resource metadata URL
+#
+# RFC 9728 builds the metadata URL by INSERTING the well-known segment into the
+# resource path: a resource at https://host/mcp is described at
+# https://host/.well-known/oauth-protected-resource/mcp. Clients try that form
+# first (Claude does), and origo used to 401 it, because _PUBLIC_PATHS is an
+# exact-match set and only held the bare path.
+#
+# The suffix depends on mcp_path, so it cannot be a static member of the set. It
+# is matched exactly all the same -- these tests pin that the fix did NOT
+# reintroduce prefix matching.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rfc9728_suffixed_metadata_path_is_public(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get(f"/.well-known/oauth-protected-resource{provider.mcp_path}")
+        assert resp.status_code == 200  # 200 = middleware passed it through
+
+
+@pytest.mark.asyncio
+async def test_bare_metadata_path_still_public(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get("/.well-known/oauth-protected-resource")).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/.well-known/oauth-protected-resource/evil",
+        "/.well-known/oauth-protected-resource/mcp/evil",
+        "/.well-known/oauth-protected-resource-decoy",
+        "/.well-known/oauth-protected-resourcex",
+    ],
+)
+async def test_only_the_exact_suffix_is_public(provider, path):
+    """Anything other than the exact mcp_path suffix must still require a token."""
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get(path)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_suffixed_path_follows_a_custom_mcp_path():
+    """An SSE deployment advertises /sse, so that is the path that must be public."""
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"cid": "secret"},
+        mcp_path="/sse",
+    )
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get("/.well-known/oauth-protected-resource/sse")).status_code == 200
+        # ...and the /mcp form is NOT public for this provider.
+        assert (await client.get("/.well-known/oauth-protected-resource/mcp")).status_code == 401

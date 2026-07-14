@@ -50,6 +50,21 @@ async def test_protected_resource_metadata(client_private):
     assert data["bearer_methods_supported"] == ["header"]
 
 
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_at_the_rfc9728_suffixed_path(client_private):
+    """RFC 9728 inserts the well-known segment into the resource path.
+
+    A resource at https://host/mcp is described at
+    https://host/.well-known/oauth-protected-resource/mcp. Clients try this form
+    before the bare one, so it must serve the same document.
+    """
+    client, provider = client_private
+    resp = await client.get(f"/.well-known/oauth-protected-resource{provider.mcp_path}")
+    assert resp.status_code == 200
+    assert resp.json() == (await client.get("/.well-known/oauth-protected-resource")).json()
+    assert resp.json()["resource"] == provider.resource_identifier
+
+
 # --- Registration ---
 
 @pytest.mark.asyncio

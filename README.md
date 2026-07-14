@@ -241,6 +241,12 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 
 ## OAuth Endpoints
 
+`/.well-known/oauth-protected-resource` is served at **two** paths: the bare one,
+and the RFC 9728 form that inserts the well-known segment into the resource path
+(`/.well-known/oauth-protected-resource/mcp` when `mcp_path="/mcp"`). Clients try
+the suffixed form first. Both return the same document.
+
+
 | Endpoint | Description |
 | --- | --- |
 | `GET /.well-known/oauth-authorization-server` | OAuth discovery |
