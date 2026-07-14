@@ -14,6 +14,11 @@ def test_verify_pkce_unsupported_method():
     assert _verify_pkce("test-verifier", "test-challenge", "unsupported") is False
 
 
+def test_verify_pkce_invalid_utf8_verifier():
+    """Test that _verify_pkce handles UnicodeEncodeError and returns False."""
+    assert _verify_pkce("\ud800", "some-challenge", "S256") is False
+
+
 # --- Discovery ---
 
 @pytest.mark.asyncio

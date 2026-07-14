@@ -24,7 +24,10 @@ _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     if method == "S256":
-        digest = hashlib.sha256(code_verifier.encode()).digest()
+        try:
+            digest = hashlib.sha256(code_verifier.encode()).digest()
+        except UnicodeEncodeError:
+            return False
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
         return hmac.compare_digest(expected, code_challenge)
     return False
