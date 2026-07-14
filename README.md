@@ -46,6 +46,39 @@ root = Starlette(routes=[
 ])
 ```
 
+### Single-app deployments (one router)
+
+Mounting works when OAuth and your app can be separate ASGI apps. Some setups
+instead need everything on **one** router — a FastMCP `http_app()` owns the
+lifespan, so it is easier to add OAuth to it than to nest it. In that case, take
+origo's routes **and its state** from `auth.asgi_app()`:
+
+```python
+mcp_app = mcp.http_app(path="/mcp", transport="http", stateless_http=True)
+
+oauth_app = auth.asgi_app()
+for route in reversed(oauth_app.routes):
+    mcp_app.router.routes.insert(0, route)   # OAuth routes must match first
+
+mcp_app.add_middleware(OAuthMiddleware, provider=auth)
+
+# Adopt origo's state. Do not hand-write this.
+for key, value in vars(oauth_app.state)["_state"].items():
+    setattr(mcp_app.state, key, value)
+
+app = mcp_app
+```
+
+> **Do not re-declare origo's routes and copy a few `app.state` attributes by
+> hand.** origo's endpoints read state off `request.app.state`, that set is
+> internal, and it **grows between releases** — 0.1.9 added `allow_private_cimd`
+> with the CGNAT/IPv4-mapped-IPv6 SSRF fix. A hand-written subset imports and
+> starts cleanly, then raises `AttributeError` and returns **HTTP 500 from
+> `/authorize` at request time** — so the build and the deploy look perfectly
+> healthy until the first client tries to authorise. Sourcing routes and state
+> from `auth.asgi_app()` keeps that contract origo's problem, not yours, and also
+> gives you `/userinfo` and `/.well-known/openid-configuration` for free.
+
 ### FastAPI
 
 ```python
@@ -91,18 +124,45 @@ auth = OAuthProvider(
 
 mcp = FastMCP("my-server")
 
-# Use your MCP framework's SSE ASGI app here. The exact constructor varies by
-# framework/version; for FastMCP this may be `sse_app()` in SSE deployments.
-sse_app = mcp.sse_app()
+# On FastMCP 3.x, both transports come from http_app():
+#   mcp.http_app(path="/sse", transport="sse")
+sse_app = mcp.http_app(path="/sse", transport="sse")
 sse_app.add_middleware(OAuthMiddleware, provider=auth)
 
 app = Starlette(routes=[
-    Mount("/sse", app=sse_app),       # protected SSE MCP endpoint
+    Mount("/sse", app=sse_app),      # protected SSE MCP endpoint
     Mount("/", app=auth.asgi_app()), # OAuth and /.well-known/ discovery
 ])
 ```
 
-If your server exposes both `/mcp` and `/sse`, create the protected-resource metadata for the endpoint your connector is configured to call. For multiple public MCP resources on one host, use separate `OAuthProvider` instances or deploy separate base URLs so each provider advertises one canonical `resource` value.
+#### Serving `/mcp` and `/sse` together
+
+One `OAuthProvider` can protect both transports. Build both apps from the same
+`FastMCP`, put their routes on one router, and apply the middleware once — the
+single-app recipe above, with the SSE routes appended:
+
+```python
+app = mcp.http_app(path="/mcp", transport="http", stateless_http=True)
+sse_app = mcp.http_app(path="/sse", transport="sse")
+
+for route in sse_app.routes:          # /sse plus its /messages endpoint
+    app.router.routes.append(route)
+
+# ... then insert origo's routes, add OAuthMiddleware, adopt state (as above).
+```
+
+`OAuthMiddleware` protects every path except origo's own public ones, so `/mcp`,
+`/sse` and `/messages` are all covered by that single `add_middleware` call. Both
+transports need their lifespans run — the streamable-HTTP and SSE apps each carry
+a session manager — so chain them if you take this route.
+
+A token is verified against the provider's single `resource_identifier`
+(`base_url + mcp_path`), so **discovery advertises one canonical resource and a
+token minted for it works on both endpoints.** The one thing to watch: a client
+that derives its own `resource` from the URL it happens to call, rather than
+reading `/.well-known/oauth-protected-resource`, will present a `resource` that
+does not match and get a 401. If you need each transport to advertise its own
+resource, run separate `OAuthProvider` instances on separate base URLs.
 
 ## How this differs from enterprise OAuth
 
