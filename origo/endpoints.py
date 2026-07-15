@@ -22,6 +22,13 @@ _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
 _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
 
 
+def _safe_compare_digest(a: str, b: str) -> bool:
+    try:
+        return hmac.compare_digest(a, b)
+    except TypeError:
+        return False
+
+
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     if method == "S256":
         try:
@@ -29,7 +36,7 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
         except UnicodeEncodeError:
             return False
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-        return hmac.compare_digest(expected, code_challenge)
+        return _safe_compare_digest(expected, code_challenge)
     return False
 
 
@@ -402,7 +409,7 @@ async def authorize(request: Request) -> Response:
     if request.method == "POST":
         cookie_csrf = request.cookies.get("origo_csrf")
         form_csrf = params.get("csrf_token")
-        if not cookie_csrf or not form_csrf or not secrets.compare_digest(cookie_csrf, form_csrf):
+        if not cookie_csrf or not form_csrf or not _safe_compare_digest(cookie_csrf, form_csrf):
             return JSONResponse({"error": "invalid_request", "error_description": "CSRF token missing or invalid."}, status_code=400)
 
         approved = params.get("approved", "true")
@@ -467,7 +474,7 @@ async def token(request: Request) -> JSONResponse:
         if not client_secret:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         stored_secret = storage.get_client_secret(client_id)
-        if stored_secret is None or not hmac.compare_digest(stored_secret, client_secret):
+        if stored_secret is None or not _safe_compare_digest(stored_secret, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
     if grant_type == "authorization_code":
