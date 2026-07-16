@@ -254,3 +254,18 @@ async def test_token_with_wrong_resource_is_rejected_by_middleware(provider):
         resp = await client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_token"
+
+
+@pytest.mark.asyncio
+async def test_security_multiple_auth_headers_smuggling(provider):
+    token = provider.storage.store_token("c")
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        # Client sends multiple Authorization headers to attempt bypassing auth/smuggling
+        resp = await client.get("/mcp", headers=[
+            ("Authorization", "Bearer ADMIN_FORGED_TOKEN_123"),
+            ("Authorization", f"Bearer {token}")
+        ])
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    assert "Multiple Authorization headers" in resp.json()["error_description"]
