@@ -441,7 +441,10 @@ async def token(request: Request) -> JSONResponse:
     client_secret = params.get("client_secret")
 
     if not client_id:
-        auth = request.headers.get("Authorization", "")
+        auth_list = request.headers.getlist("Authorization")
+        if len(auth_list) > 1:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+        auth = auth_list[0] if auth_list else ""
         if auth.startswith("Basic "):
             try:
                 decoded = base64.b64decode(auth[6:]).decode()
@@ -545,7 +548,10 @@ async def token(request: Request) -> JSONResponse:
 
 async def userinfo(request: Request) -> JSONResponse:
     storage: OAuthStorage = request.app.state.storage
-    auth = request.headers.get("Authorization", "")
+    auth_list = request.headers.getlist("Authorization")
+    if len(auth_list) > 1:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    auth = auth_list[0] if auth_list else ""
     if not auth.startswith("Bearer "):
         return JSONResponse({"error": "invalid_token"}, status_code=401)
 
