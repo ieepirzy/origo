@@ -118,3 +118,75 @@ def test_refresh_token_ttl_respected():
     token = short_storage.store_refresh_token("c")
     with patch("origo.storage._now", return_value=9999999999.0):
         assert short_storage.exchange_refresh_token(token) is None
+
+
+# --- Dynamic client registration bound/TTL (DCR + CIMD both go through register_client) ---
+
+
+def test_register_client_evicts_oldest_past_cap():
+    bounded_storage = OAuthStorage(max_dynamic_clients=2)
+    bounded_storage.register_client("client-1", "s1")
+    bounded_storage.register_client("client-2", "s2")
+    bounded_storage.register_client("client-3", "s3")
+
+    assert not bounded_storage.client_exists("client-1")
+    assert bounded_storage.client_exists("client-2")
+    assert bounded_storage.client_exists("client-3")
+
+
+def test_register_client_cap_does_not_evict_when_re_registering_same_id():
+    bounded_storage = OAuthStorage(max_dynamic_clients=2)
+    bounded_storage.register_client("client-1", "s1")
+    bounded_storage.register_client("client-2", "s2")
+    # Re-registering an existing client_id should not count as a new entry against the cap.
+    bounded_storage.register_client("client-1", "s1-updated")
+
+    assert bounded_storage.client_exists("client-1")
+    assert bounded_storage.client_exists("client-2")
+    assert bounded_storage.get_client_secret("client-1") == "s1-updated"
+
+
+def test_register_client_ttl_expires_dynamic_client():
+    storage = OAuthStorage(client_ttl=1)
+    storage.register_client("dynamic-client", "secret")
+    assert storage.client_exists("dynamic-client")
+    with patch("origo.storage._now", return_value=9999999999.0):
+        assert storage.client_exists("dynamic-client") is False
+        assert storage.get_client_secret("dynamic-client") is None
+
+
+def test_register_client_no_ttl_by_default(storage):
+    storage.register_client("dynamic-client", "secret")
+    with patch("origo.storage._now", return_value=9999999999.0):
+        assert storage.client_exists("dynamic-client")
+
+
+def test_seeded_clients_survive_dynamic_client_ttl_expiry():
+    storage = OAuthStorage(client_ttl=1)
+    storage.seed_clients({"permanent-client": "s"})
+    storage.register_client("dynamic-client", "secret")
+    with patch("origo.storage._now", return_value=9999999999.0):
+        assert storage.client_exists("permanent-client")
+        assert storage.get_client_secret("permanent-client") == "s"
+        assert storage.client_exists("dynamic-client") is False
+
+
+def test_seeded_clients_do_not_count_against_dynamic_cap():
+    bounded_storage = OAuthStorage(max_dynamic_clients=1)
+    bounded_storage.seed_clients({"permanent-1": "s1", "permanent-2": "s2"})
+    bounded_storage.register_client("dynamic-1", "s3")
+    bounded_storage.register_client("dynamic-2", "s4")
+
+    assert bounded_storage.client_exists("permanent-1")
+    assert bounded_storage.client_exists("permanent-2")
+    assert not bounded_storage.client_exists("dynamic-1")
+    assert bounded_storage.client_exists("dynamic-2")
+
+
+def test_seeded_clients_are_never_evicted_by_cap_overflow():
+    bounded_storage = OAuthStorage(max_dynamic_clients=0)
+    bounded_storage.seed_clients({"permanent-client": "s"})
+    for i in range(5):
+        bounded_storage.register_client(f"dynamic-{i}", "secret")
+
+    assert bounded_storage.client_exists("permanent-client")
