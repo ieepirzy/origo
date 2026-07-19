@@ -72,6 +72,40 @@ async def test_register_public_mode(client_public):
 
 
 @pytest.mark.asyncio
+async def test_register_respects_max_dynamic_clients_cap():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, max_dynamic_clients=2)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        client_ids = []
+        for _ in range(3):
+            resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+            assert resp.status_code == 201
+            client_ids.append(resp.json()["client_id"])
+
+    # Oldest registration should have been evicted to stay within the cap.
+    assert not p.storage.client_exists(client_ids[0])
+    assert p.storage.client_exists(client_ids[1])
+    assert p.storage.client_exists(client_ids[2])
+
+
+@pytest.mark.asyncio
+async def test_register_dynamic_client_expires_after_ttl(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, client_ttl=1)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        client_id = resp.json()["client_id"]
+
+    assert p.storage.client_exists(client_id)
+    monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
+    assert p.storage.client_exists(client_id) is False
+
+
+@pytest.mark.asyncio
 async def test_register_private_mode_rejected(client_private):
     client, provider = client_private
     resp = await client.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
@@ -954,6 +988,92 @@ async def test_authorize_accepts_cimd_client_metadata_document(monkeypatch):
         })
     assert token_resp.status_code == 200
     assert p.storage.get_client_auth_method(client_id) == "none"
+
+
+@pytest.mark.asyncio
+async def test_authorize_cimd_registration_respects_max_dynamic_clients_cap(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    def fake_fetch(url, allow_private_hosts=False):
+        return {
+            "client_id": url,
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "none",
+        }
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True, max_dynamic_clients=2)
+    verifier, challenge = make_pkce_pair()
+    client_ids = [f"https://cimd.example.com/doc-{i}.json" for i in range(3)]
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        for cid in client_ids:
+            await c.get("/authorize", params={
+                "client_id": cid,
+                "redirect_uri": "https://example.com/callback",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "response_type": "code",
+            }, follow_redirects=False)
+
+    # Oldest CIMD-registered client should have been evicted to stay within the cap.
+    assert not p.storage.client_exists(client_ids[0])
+    assert p.storage.client_exists(client_ids[1])
+    assert p.storage.client_exists(client_ids[2])
+
+
+@pytest.mark.asyncio
+async def test_authorize_cimd_registration_expires_after_ttl(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    client_id = "https://cimd.example.com/doc.json"
+
+    def fake_fetch(url, allow_private_hosts=False):
+        return {
+            "client_id": client_id,
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "none",
+        }
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True, client_ttl=1)
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+
+    assert p.storage.client_exists(client_id)
+    monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
+    assert p.storage.client_exists(client_id) is False
+
+
+@pytest.mark.asyncio
+async def test_preregistered_clients_not_evicted_by_dynamic_registration_cap_or_ttl(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"preseeded-client": "preseeded-secret"},
+        public_registration=True,
+        max_dynamic_clients=1,
+        client_ttl=1,
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        for _ in range(3):
+            resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+            assert resp.status_code == 201
+
+    assert p.storage.client_exists("preseeded-client")
+    monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
+    assert p.storage.client_exists("preseeded-client")
+    assert p.storage.get_client_secret("preseeded-client") == "preseeded-secret"
 
 
 def test_is_public_host_rejects_private_and_loopback_targets():

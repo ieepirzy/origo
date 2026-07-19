@@ -173,6 +173,8 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
 | `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request |
+| `client_ttl` | `int` | `None` | Lifetime in seconds for dynamically-registered clients (DCR `/register` or CIMD). `None` means no expiration. Pre-registered `clients=` are always permanent |
+| `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept in memory; oldest is evicted on overflow. Pre-registered `clients=` don't count against this cap |
 | `mcp_path` | `str` | `"/mcp"` | Path where MCP endpoint is mounted |
 | `scopes_supported` | `list[str]` | `[]` | OAuth/OIDC scopes advertised in metadata |
 | `resource_documentation` | `str` | `None` | Optional URL added to protected resource metadata |

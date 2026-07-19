@@ -9,9 +9,17 @@ def _now() -> float:
 
 
 class OAuthStorage:
-    def __init__(self, token_ttl: int = 3600, refresh_token_ttl: int = 30 * 24 * 3600):
+    def __init__(
+        self,
+        token_ttl: int = 3600,
+        refresh_token_ttl: int = 30 * 24 * 3600,
+        client_ttl: Optional[int] = None,
+        max_dynamic_clients: int = 1000,
+    ):
         self.token_ttl = token_ttl
         self.refresh_token_ttl = refresh_token_ttl
+        self.client_ttl = client_ttl
+        self.max_dynamic_clients = max_dynamic_clients
         self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris, token_endpoint_auth_method}
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
@@ -36,6 +44,7 @@ class OAuthStorage:
                 "redirect_uris": allowed_redirect_uris,
                 "token_endpoint_auth_method": "client_secret_post",
                 "client_metadata": {},
+                "registered_at": None,  # pre-seeded clients are permanent, not subject to eviction/TTL
             }
             if not allowed_redirect_uris:
                 warnings.warn(
@@ -53,32 +62,55 @@ class OAuthStorage:
         token_endpoint_auth_method: str = "client_secret_post",
         client_metadata: Optional[dict] = None,
     ) -> None:
-        """Dynamically register a new client (public mode)."""
+        """Dynamically register a new client (public mode, DCR or CIMD)."""
+        self._cleanup_expired()
+        dynamic_client_ids = [
+            cid for cid, entry in self._clients.items()
+            if entry.get("registered_at") is not None and cid != client_id
+        ]
+        if dynamic_client_ids and len(dynamic_client_ids) >= self.max_dynamic_clients:
+            oldest_client_id = min(dynamic_client_ids, key=lambda cid: self._clients[cid]["registered_at"])
+            del self._clients[oldest_client_id]
         self._clients[client_id] = {
             "secret": client_secret,
             "redirect_uris": list(redirect_uris),
             "token_endpoint_auth_method": token_endpoint_auth_method,
             "client_metadata": client_metadata or {},
+            "registered_at": _now(),
         }
 
-    def get_client_secret(self, client_id: str) -> Optional[str]:
+    def _get_client(self, client_id: str) -> Optional[dict]:
+        """Return client entry if present and unexpired, evicting it (and returning None) if its TTL has elapsed."""
         entry = self._clients.get(client_id)
+        if entry is None:
+            return None
+        if (
+            self.client_ttl is not None
+            and entry["registered_at"] is not None
+            and _now() - entry["registered_at"] > self.client_ttl
+        ):
+            self._clients.pop(client_id, None)
+            return None
+        return entry
+
+    def get_client_secret(self, client_id: str) -> Optional[str]:
+        entry = self._get_client(client_id)
         return entry["secret"] if entry else None
 
     def get_client_auth_method(self, client_id: str) -> Optional[str]:
-        entry = self._clients.get(client_id)
+        entry = self._get_client(client_id)
         return entry.get("token_endpoint_auth_method", "client_secret_post") if entry else None
 
     def get_client_metadata(self, client_id: str) -> Optional[dict]:
-        entry = self._clients.get(client_id)
+        entry = self._get_client(client_id)
         return entry.get("client_metadata", {}) if entry else None
 
     def client_exists(self, client_id: str) -> bool:
-        return client_id in self._clients
+        return self._get_client(client_id) is not None
 
     def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
         """Return True if redirect_uri is allowed for the client. No stored URIs means any is allowed."""
-        entry = self._clients.get(client_id)
+        entry = self._get_client(client_id)
         if entry is None:
             return False
         allowed = entry["redirect_uris"]
@@ -91,6 +123,11 @@ class OAuthStorage:
         self._codes = {k: v for k, v in self._codes.items() if v["expires_at"] > now}
         self._tokens = {k: v for k, v in self._tokens.items() if v["expires_at"] > now}
         self._refresh_tokens = {k: v for k, v in self._refresh_tokens.items() if v["expires_at"] > now}
+        if self.client_ttl is not None:
+            self._clients = {
+                k: v for k, v in self._clients.items()
+                if v["registered_at"] is None or now - v["registered_at"] <= self.client_ttl
+            }
 
     def store_code(
         self,
