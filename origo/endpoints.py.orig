@@ -264,10 +264,6 @@ async def register(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    dynamic_client_ids = [cid for cid, entry in storage._clients.items() if entry.get("registered_at") is not None]
-    if len(dynamic_client_ids) >= storage.max_dynamic_clients:
-        return JSONResponse({"error": "invalid_request", "error_description": "Maximum number of clients reached."}, status_code=400)
-
     client_id = secrets.token_urlsafe(16)
     client_secret = None if token_endpoint_auth_method == "none" else secrets.token_urlsafe(32)
     storage.register_client(client_id, client_secret, redirect_uris, token_endpoint_auth_method, body)
@@ -396,11 +392,6 @@ async def authorize(request: Request) -> Response:
                 {"error": "unauthorized_client", "error_description": "CIMD redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes)},
                 status_code=401,
             )
-
-        dynamic_client_ids = [cid for cid, entry in storage._clients.items() if entry.get("registered_at") is not None]
-        if len(dynamic_client_ids) >= storage.max_dynamic_clients:
-            return JSONResponse({"error": "invalid_request", "error_description": "Maximum number of clients reached."}, status_code=400)
-
         storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
 
     if not storage.client_exists(client_id):
