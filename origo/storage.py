@@ -28,12 +28,12 @@ class OAuthStorage:
     # --- Clients ---
 
     def seed_clients(self, clients: dict[str, str], redirect_uris: Optional[dict[str, list[str]]] = None) -> None:
-        """Seed pre-registered clients. Empty redirect_uris means any URI is allowed."""
+        """Seed pre-registered clients."""
         redirect_uris = redirect_uris or {}
         if clients and not any(redirect_uris.values()):
             warnings.warn(
                 "OAuthProvider: clients seeded with no redirect_uris — "
-                "any redirect_uri will be accepted. Specify allowed URIs in production.",
+                "clients will not be able to authenticate. Specify allowed URIs.",
                 UserWarning,
                 stacklevel=3,
             )
@@ -49,7 +49,7 @@ class OAuthStorage:
             if not allowed_redirect_uris:
                 warnings.warn(
                     f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
-                    "any redirect_uri will be accepted. Specify allowed URIs in production.",
+                    "client will not be able to authenticate. Specify allowed URIs.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -109,12 +109,12 @@ class OAuthStorage:
         return self._get_client(client_id) is not None
 
     def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
-        """Return True if redirect_uri is allowed for the client. No stored URIs means any is allowed."""
+        """Return True if redirect_uri is allowed for the client."""
         entry = self._get_client(client_id)
         if entry is None:
             return False
         allowed = entry["redirect_uris"]
-        return not allowed or redirect_uri in allowed
+        return redirect_uri in allowed
 
     # --- Auth codes ---
 

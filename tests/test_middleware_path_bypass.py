@@ -44,7 +44,7 @@ async def _always_200(scope, receive, send):
 def provider():
     return OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb"]},
         auto_approve=True,
     )
 

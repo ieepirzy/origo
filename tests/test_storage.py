@@ -11,7 +11,7 @@ def storage():
 
 
 def test_seed_clients(storage):
-    storage.seed_clients({"alice": "secret1", "bob": "secret2"})
+    storage.seed_clients({"alice": "secret1", "bob": "secret2"}, {"alice": ["https://example.com"], "bob": ["https://example.com/cb"]})
     assert storage.client_exists("alice")
     assert storage.client_exists("bob")
     assert not storage.client_exists("charlie")
@@ -28,7 +28,7 @@ def test_get_client_secret_unknown(storage):
 
 
 def test_store_and_exchange_code(storage):
-    storage.seed_clients({"c": "s"})
+    storage.seed_clients({"c": "s"}, {"c": ["https://example.com/cb"]})
     code = storage.store_code("c", "https://example.com/cb", "challenge123")
     entry = storage.exchange_code(code)
     assert entry is not None
@@ -39,7 +39,7 @@ def test_store_and_exchange_code(storage):
 
 
 def test_exchange_code_consumed_only_once(storage):
-    storage.seed_clients({"c": "s"})
+    storage.seed_clients({"c": "s"}, {"c": ["https://example.com/cb"]})
     code = storage.store_code("c", "https://example.com/cb", "challenge123")
     assert storage.exchange_code(code) is not None
     assert storage.exchange_code(code) is None
@@ -50,7 +50,7 @@ def test_exchange_unknown_code(storage):
 
 
 def test_exchange_expired_code(storage):
-    storage.seed_clients({"c": "s"})
+    storage.seed_clients({"c": "s"}, {"c": ["https://example.com/cb"]})
     code = storage.store_code("c", "https://example.com/cb", "challenge")
     # Simulate expiry by patching _now to return a future time
     with patch("origo.storage._now", return_value=9999999999.0):
@@ -163,7 +163,7 @@ def test_register_client_no_ttl_by_default(storage):
 
 def test_seeded_clients_survive_dynamic_client_ttl_expiry():
     storage = OAuthStorage(client_ttl=1)
-    storage.seed_clients({"permanent-client": "s"})
+    storage.seed_clients({"permanent-client": "s"}, {"permanent-client": ["https://example.com/cb"]})
     storage.register_client("dynamic-client", "secret")
     with patch("origo.storage._now", return_value=9999999999.0):
         assert storage.client_exists("permanent-client")
@@ -173,7 +173,7 @@ def test_seeded_clients_survive_dynamic_client_ttl_expiry():
 
 def test_seeded_clients_do_not_count_against_dynamic_cap():
     bounded_storage = OAuthStorage(max_dynamic_clients=1)
-    bounded_storage.seed_clients({"permanent-1": "s1", "permanent-2": "s2"})
+    bounded_storage.seed_clients({"permanent-1": "s1", "permanent-2": "s2"}, {"permanent-1": ["https://example.com/cb"], "permanent-2": ["https://example.com/cb"]})
     bounded_storage.register_client("dynamic-1", "s3")
     bounded_storage.register_client("dynamic-2", "s4")
 
@@ -185,7 +185,7 @@ def test_seeded_clients_do_not_count_against_dynamic_cap():
 
 def test_seeded_clients_are_never_evicted_by_cap_overflow():
     bounded_storage = OAuthStorage(max_dynamic_clients=0)
-    bounded_storage.seed_clients({"permanent-client": "s"})
+    bounded_storage.seed_clients({"permanent-client": "s"}, {"permanent-client": ["https://example.com/cb"]})
     for i in range(5):
         bounded_storage.register_client(f"dynamic-{i}", "secret")
 
