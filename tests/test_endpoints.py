@@ -7,7 +7,13 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce
+from origo.endpoints import _verify_pkce, _build_redirect
+
+def test_build_redirect_invalid_url():
+    """Test that _build_redirect raises ValueError on invalid URL."""
+    with pytest.raises(ValueError, match="Invalid redirect URI:"):
+        _build_redirect("http://]/", {"param": "value"})
+
 
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
