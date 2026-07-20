@@ -16,6 +16,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from .storage import OAuthStorage
 
 import base64
+import asyncio
 
 
 _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
@@ -379,7 +380,7 @@ async def authorize(request: Request) -> Response:
         pass
 
     if not storage.client_exists(client_id) and public_registration and client_is_https:
-        metadata = _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
+        metadata = await asyncio.to_thread(_fetch_client_metadata_document, client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
             return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
 
