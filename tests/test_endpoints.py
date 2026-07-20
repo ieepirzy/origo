@@ -3,11 +3,13 @@ import hashlib
 import secrets
 import warnings
 
+import json
+import time
 import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce
+from origo.endpoints import _verify_pkce, _unsigned_id_token
 
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
@@ -1353,3 +1355,85 @@ async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch
         }, follow_redirects=False)
     assert resp.status_code == 401
     assert resp.json()["error"] == "unauthorized_client"
+
+def _decode_jwt_part(part: str) -> dict:
+    import base64
+    import json
+    # Add padding if necessary
+    part += "=" * ((4 - len(part) % 4) % 4)
+    return json.loads(base64.urlsafe_b64decode(part).decode('utf-8'))
+
+def test_unsigned_id_token_standard_claims(monkeypatch):
+    import time
+    mock_time = 1600000000
+    monkeypatch.setattr(time, "time", lambda: mock_time)
+
+    token = _unsigned_id_token(
+        issuer="test-issuer",
+        client_id="test-client",
+        subject="test-subject",
+        email=None,
+        scope="openid",
+        ttl=3600
+    )
+
+    parts = token.split(".")
+    assert len(parts) == 3
+    assert parts[2] == "" # Unsigned
+
+    header = _decode_jwt_part(parts[0])
+    assert header == {"alg": "none", "typ": "JWT"}
+
+    claims = _decode_jwt_part(parts[1])
+    assert claims == {
+        "iss": "test-issuer",
+        "sub": "test-subject",
+        "aud": "test-client",
+        "iat": mock_time,
+        "exp": mock_time + 3600,
+    }
+
+def test_unsigned_id_token_with_email_scope(monkeypatch):
+    token = _unsigned_id_token(
+        issuer="test-issuer",
+        client_id="test-client",
+        subject="test-subject",
+        email="test@example.com",
+        scope="openid email",
+        ttl=3600
+    )
+
+    parts = token.split(".")
+    claims = _decode_jwt_part(parts[1])
+    assert claims["email"] == "test@example.com"
+    assert claims["email_verified"] is True
+
+def test_unsigned_id_token_without_email_scope(monkeypatch):
+    token = _unsigned_id_token(
+        issuer="test-issuer",
+        client_id="test-client",
+        subject="test-subject",
+        email="test@example.com",
+        scope="openid profile",
+        ttl=3600
+    )
+
+    parts = token.split(".")
+    claims = _decode_jwt_part(parts[1])
+    assert "email" not in claims
+    assert "email_verified" not in claims
+
+def test_unsigned_id_token_with_none_email(monkeypatch):
+    token = _unsigned_id_token(
+        issuer="test-issuer",
+        client_id="test-client",
+        subject="test-subject",
+        email=None,
+        scope="openid email",
+        ttl=3600
+    )
+
+    parts = token.split(".")
+    claims = _decode_jwt_part(parts[1])
+    assert "email" not in claims
+    assert "email_verified" not in claims
