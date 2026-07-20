@@ -2,6 +2,7 @@ import secrets
 import time
 import warnings
 from typing import Optional
+from collections import deque
 
 
 def _now() -> float:
@@ -24,6 +25,10 @@ class OAuthStorage:
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
         self._refresh_tokens: dict[str, dict] = {}  # refresh_token -> metadata
+        self._clients_expiry: deque = deque()
+        self._codes_expiry: deque = deque()
+        self._tokens_expiry: deque = deque()
+        self._refresh_tokens_expiry: deque = deque()
 
     # --- Clients ---
 
@@ -71,13 +76,16 @@ class OAuthStorage:
         if dynamic_client_ids and len(dynamic_client_ids) >= self.max_dynamic_clients:
             oldest_client_id = min(dynamic_client_ids, key=lambda cid: self._clients[cid]["registered_at"])
             del self._clients[oldest_client_id]
+        registered_at = _now()
         self._clients[client_id] = {
             "secret": client_secret,
             "redirect_uris": list(redirect_uris),
             "token_endpoint_auth_method": token_endpoint_auth_method,
             "client_metadata": client_metadata or {},
-            "registered_at": _now(),
+            "registered_at": registered_at,
         }
+        if self.client_ttl is not None:
+            self._clients_expiry.append((client_id, registered_at + self.client_ttl))
 
     def _get_client(self, client_id: str) -> Optional[dict]:
         """Return client entry if present and unexpired, evicting it (and returning None) if its TTL has elapsed."""
@@ -120,14 +128,34 @@ class OAuthStorage:
 
     def _cleanup_expired(self) -> None:
         now = _now()
-        self._codes = {k: v for k, v in self._codes.items() if v["expires_at"] > now}
-        self._tokens = {k: v for k, v in self._tokens.items() if v["expires_at"] > now}
-        self._refresh_tokens = {k: v for k, v in self._refresh_tokens.items() if v["expires_at"] > now}
+
+        # Clean up codes
+        while self._codes_expiry and self._codes_expiry[0][1] <= now:
+            k, exp = self._codes_expiry.popleft()
+            if k in self._codes and self._codes[k]["expires_at"] == exp:
+                del self._codes[k]
+
+        # Clean up tokens
+        while self._tokens_expiry and self._tokens_expiry[0][1] <= now:
+            k, exp = self._tokens_expiry.popleft()
+            if k in self._tokens and self._tokens[k]["expires_at"] == exp:
+                del self._tokens[k]
+
+        # Clean up refresh tokens
+        while self._refresh_tokens_expiry and self._refresh_tokens_expiry[0][1] <= now:
+            k, exp = self._refresh_tokens_expiry.popleft()
+            if k in self._refresh_tokens and self._refresh_tokens[k]["expires_at"] == exp:
+                del self._refresh_tokens[k]
+
+        # Clean up clients
         if self.client_ttl is not None:
-            self._clients = {
-                k: v for k, v in self._clients.items()
-                if v["registered_at"] is None or now - v["registered_at"] <= self.client_ttl
-            }
+            while self._clients_expiry and self._clients_expiry[0][1] <= now:
+                k, exp = self._clients_expiry.popleft()
+                if k in self._clients and self._clients[k]["registered_at"] is not None:
+                    # Expected expiration based on the current registration time
+                    current_exp = self._clients[k]["registered_at"] + self.client_ttl
+                    if current_exp == exp:
+                        del self._clients[k]
 
     def store_code(
         self,
@@ -140,6 +168,7 @@ class OAuthStorage:
     ) -> str:
         self._cleanup_expired()
         code = secrets.token_urlsafe(32)
+        expires_at = _now() + 60
         self._codes[code] = {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
@@ -147,8 +176,9 @@ class OAuthStorage:
             "code_challenge_method": code_challenge_method,
             "resource": resource,
             "scope": scope,
-            "expires_at": _now() + 60,  # codes expire in 60 seconds
+            "expires_at": expires_at,  # codes expire in 60 seconds
         }
+        self._codes_expiry.append((code, expires_at))
         return code
 
     def exchange_code(self, code: str) -> Optional[dict]:
@@ -165,12 +195,14 @@ class OAuthStorage:
     def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "") -> str:
         self._cleanup_expired()
         token = secrets.token_urlsafe(48)
+        expires_at = _now() + self.token_ttl
         self._tokens[token] = {
             "client_id": client_id,
             "resource": resource,
             "scope": scope,
-            "expires_at": _now() + self.token_ttl,
+            "expires_at": expires_at,
         }
+        self._tokens_expiry.append((token, expires_at))
         return token
 
     def verify_token(self, token: str) -> Optional[dict]:
@@ -188,12 +220,14 @@ class OAuthStorage:
     def store_refresh_token(self, client_id: str, resource: Optional[str] = None, scope: str = "") -> str:
         self._cleanup_expired()
         token = secrets.token_urlsafe(48)
+        expires_at = _now() + self.refresh_token_ttl
         self._refresh_tokens[token] = {
             "client_id": client_id,
             "resource": resource,
             "scope": scope,
-            "expires_at": _now() + self.refresh_token_ttl,
+            "expires_at": expires_at,
         }
+        self._refresh_tokens_expiry.append((token, expires_at))
         return token
 
     def exchange_refresh_token(self, refresh_token: str) -> Optional[dict]:
