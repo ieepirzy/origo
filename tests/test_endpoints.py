@@ -7,7 +7,25 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce
+from origo.endpoints import _verify_pkce, _redirect_uri_error_description
+
+def test_redirect_uri_error_description_empty():
+    """Test that _redirect_uri_error_description works with an empty set."""
+    res = _redirect_uri_error_description(frozenset())
+    assert res == "must be valid URIs using https (or http://localhost for loopback)."
+
+
+def test_redirect_uri_error_description_single():
+    """Test that _redirect_uri_error_description works with a single custom scheme."""
+    res = _redirect_uri_error_description(frozenset(["myapp"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:."
+
+
+def test_redirect_uri_error_description_multiple():
+    """Test that _redirect_uri_error_description works with multiple custom schemes."""
+    res = _redirect_uri_error_description(frozenset(["myapp", "zapp", "other"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:, other:, zapp:."
+
 
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
