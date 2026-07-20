@@ -1,0 +1,49 @@
+--- origo/storage.py
++++ origo/storage.py
+@@ -29,29 +29,29 @@
+     # --- Clients ---
+
+     def seed_clients(self, clients: dict[str, str], redirect_uris: Optional[dict[str, list[str]]] = None) -> None:
+-        """Seed pre-registered clients. Empty redirect_uris means any URI is allowed."""
++        """Seed pre-registered clients."""
+         redirect_uris = redirect_uris or {}
+         if clients and not any(redirect_uris.values()):
+             warnings.warn(
+                 "OAuthProvider: clients seeded with no redirect_uris — "
+-                "any redirect_uri will be accepted. Specify allowed URIs in production.",
++                "clients will not be able to authenticate. Specify allowed URIs.",
+                 UserWarning,
+                 stacklevel=3,
+             )
+         for client_id, secret in clients.items():
+             allowed_redirect_uris = list(redirect_uris.get(client_id, []))
+             self._clients[client_id] = {
+                 "secret": secret,
+                 "redirect_uris": allowed_redirect_uris,
+                 "token_endpoint_auth_method": "client_secret_post",
+                 "client_metadata": {},
+                 "registered_at": None,  # pre-seeded clients are permanent, not subject to eviction/TTL
+             }
+             if not allowed_redirect_uris:
+                 warnings.warn(
+                     f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
+-                    "any redirect_uri will be accepted. Specify allowed URIs in production.",
++                    "client will not be able to authenticate. Specify allowed URIs.",
+                     UserWarning,
+                     stacklevel=2,
+                 )
+
+@@ -109,12 +109,12 @@
+         return self._get_client(client_id) is not None
+
+     def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
+-        """Return True if redirect_uri is allowed for the client. No stored URIs means any is allowed."""
++        """Return True if redirect_uri is allowed for the client."""
+         entry = self._get_client(client_id)
+         if entry is None:
+             return False
+         allowed = entry["redirect_uris"]
+-        return not allowed or redirect_uri in allowed
++        return redirect_uri in allowed
+
+     # --- Auth codes ---

@@ -1,0 +1,18 @@
+--- tests/conftest.py
++++ tests/conftest.py
+@@ -14,6 +14,7 @@
+     return OAuthProvider(
+         base_url="http://testserver",
+         clients={"test-client": "test-secret"},
++        client_redirect_uris={"test-client": ["https://example.com/cb"]},
+         auto_approve=True,
+     )
+
+--- origo/storage.py
++++ origo/storage.py
+@@ -114,7 +114,7 @@
+         if entry is None:
+             return False
+         allowed = entry["redirect_uris"]
+-        return not allowed or redirect_uri in allowed
++        return bool(allowed and redirect_uri in allowed)
