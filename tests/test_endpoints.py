@@ -9,7 +9,25 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce, _unsigned_id_token
+from origo.endpoints import _verify_pkce, _redirect_uri_error_description, _unsigned_id_token
+
+def test_redirect_uri_error_description_empty():
+    """Test that _redirect_uri_error_description works with an empty set."""
+    res = _redirect_uri_error_description(frozenset())
+    assert res == "must be valid URIs using https (or http://localhost for loopback)."
+
+
+def test_redirect_uri_error_description_single():
+    """Test that _redirect_uri_error_description works with a single custom scheme."""
+    res = _redirect_uri_error_description(frozenset(["myapp"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:."
+
+
+def test_redirect_uri_error_description_multiple():
+    """Test that _redirect_uri_error_description works with multiple custom schemes."""
+    res = _redirect_uri_error_description(frozenset(["myapp", "zapp", "other"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:, other:, zapp:."
+
 
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
@@ -19,6 +37,17 @@ def test_verify_pkce_unsupported_method():
 def test_verify_pkce_invalid_utf8_verifier():
     """Test that _verify_pkce handles UnicodeEncodeError and returns False."""
     assert _verify_pkce("\ud800", "some-challenge", "S256") is False
+
+
+def test_base64url_json():
+    """Test that _base64url_json correctly encodes a dict to a base64url string without padding."""
+    from origo.endpoints import _base64url_json
+
+    data = {"alg": "none", "typ": "JWT"}
+    expected = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+    assert _base64url_json(data) == expected
+
+    assert _base64url_json({}) == "e30"
 
 
 # --- Discovery ---
@@ -402,7 +431,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "response_type": "code",
             "state": "s1",
         })
-        csrf_token = get_resp.cookies.get("origo_csrf")
+        csrf_token = get_resp.cookies.get("__Host-origo_csrf")
 
         resp = await c.post("/authorize", data={
             "client_id": "c",
@@ -413,7 +442,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "state": "s1",
             "approved": "false",
             "csrf_token": csrf_token,
-        }, cookies={"origo_csrf": csrf_token}, follow_redirects=False)
+        }, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
     assert "error=access_denied" in resp.headers["location"]
 
