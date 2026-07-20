@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import html
@@ -57,10 +58,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _is_public_host(hostname: str) -> bool:
+async def _is_public_host(hostname: str) -> bool:
     """Reject hostnames that resolve to loopback/private/link-local/reserved addresses."""
     try:
-        addrinfo = socket.getaddrinfo(hostname, None)
+        addrinfo = await asyncio.get_running_loop().getaddrinfo(hostname, None)
     except OSError:
         return False
     for *_rest, sockaddr in addrinfo:
@@ -72,7 +73,7 @@ def _is_public_host(hostname: str) -> bool:
     return True
 
 
-def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = False) -> dict | None:
+async def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = False) -> dict | None:
     """Fetch a Client ID Metadata Document (CIMD) for HTTPS URL client_ids."""
     try:
         parsed = urlparse(client_id)
@@ -82,7 +83,7 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
     if parsed.scheme != "https" or not parsed.hostname:
         return None
 
-    if not allow_private_hosts and not _is_public_host(parsed.hostname):
+    if not allow_private_hosts and not await _is_public_host(parsed.hostname):
         return None
 
     opener = urllib.request.build_opener(_NoRedirectHandler)
@@ -92,13 +93,19 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
             headers={"Accept": "application/json"},
             method="GET",
         )
-        with opener.open(request, timeout=5) as response:
-            if response.status != 200:
-                return None
-            content_type = response.headers.get("content-type", "")
-            if "json" not in content_type:
-                return None
-            body = response.read(65536)
+
+        def _do_fetch():
+            with opener.open(request, timeout=5) as response:
+                if response.status != 200:
+                    return None
+                content_type = response.headers.get("content-type", "")
+                if "json" not in content_type:
+                    return None
+                return response.read(65536)
+
+        body = await asyncio.to_thread(_do_fetch)
+        if body is None:
+            return None
     except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         return None
 
@@ -379,7 +386,7 @@ async def authorize(request: Request) -> Response:
         pass
 
     if not storage.client_exists(client_id) and public_registration and client_is_https:
-        metadata = _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
+        metadata = await _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
             return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
 

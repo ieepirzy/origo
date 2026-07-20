@@ -958,7 +958,7 @@ async def test_authorize_accepts_cimd_client_metadata_document(monkeypatch):
     client_id = "https://chatgpt.com/oauth/test-client.json"
     redirect_uri = "https://chatgpt.com/connector/oauth/callback-id"
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         assert url == client_id
         return {
             "client_id": client_id,
@@ -995,7 +995,7 @@ async def test_authorize_cimd_registration_respects_max_dynamic_clients_cap(monk
     from origo import OAuthProvider
     from httpx import ASGITransport, AsyncClient
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         return {
             "client_id": url,
             "redirect_uris": ["https://example.com/callback"],
@@ -1029,7 +1029,7 @@ async def test_authorize_cimd_registration_expires_after_ttl(monkeypatch):
 
     client_id = "https://cimd.example.com/doc.json"
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         return {
             "client_id": client_id,
             "redirect_uris": ["https://example.com/callback"],
@@ -1076,13 +1076,14 @@ async def test_preregistered_clients_not_evicted_by_dynamic_registration_cap_or_
     assert p.storage.get_client_secret("preseeded-client") == "preseeded-secret"
 
 
-def test_is_public_host_rejects_private_and_loopback_targets():
+@pytest.mark.asyncio
+async def test_is_public_host_rejects_private_and_loopback_targets():
     from origo.endpoints import _is_public_host
-    assert _is_public_host("localhost") is False
-    assert _is_public_host("127.0.0.1") is False
-    assert _is_public_host("10.0.0.5") is False
-    assert _is_public_host("169.254.169.254") is False  # cloud metadata endpoint
-    assert _is_public_host("::1") is False
+    assert await _is_public_host("localhost") is False
+    assert await _is_public_host("127.0.0.1") is False
+    assert await _is_public_host("10.0.0.5") is False
+    assert await _is_public_host("169.254.169.254") is False  # cloud metadata endpoint
+    assert await _is_public_host("::1") is False
 
 
 @pytest.mark.asyncio
@@ -1104,7 +1105,8 @@ async def test_authorize_rejects_cimd_client_id_pointing_at_private_host():
     assert resp.json()["error"] == "unauthorized_client"
 
 
-def test_fetch_client_metadata_document_allow_private_hosts_skips_host_check(monkeypatch):
+@pytest.mark.asyncio
+async def test_fetch_client_metadata_document_allow_private_hosts_skips_host_check(monkeypatch):
     """allow_private_hosts=True is an explicit opt-in for colocated deployments
     (e.g. an agent and origo sharing a private network) — it must bypass only the
     host check, never the redirect protection."""
@@ -1130,10 +1132,10 @@ def test_fetch_client_metadata_document_allow_private_hosts_skips_host_check(mon
     monkeypatch.setattr(endpoints.urllib.request, "build_opener", lambda *a: _FakeOpener())
 
     # Default: private host rejected before any fetch attempt.
-    assert endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json") is None
+    assert await endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json") is None
 
     # Opt-in: private host allowed through to the (still redirect-refusing) fetch.
-    metadata = endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json", allow_private_hosts=True)
+    metadata = await endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json", allow_private_hosts=True)
     assert metadata is not None
     assert metadata["client_id"] == "https://10.0.0.5/cimd.json"
 
@@ -1147,7 +1149,7 @@ async def test_authorize_allow_private_cimd_wires_through_from_provider(monkeypa
     redirect_uri = "https://10.0.0.5/callback"
     seen = {}
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         seen["allow_private_hosts"] = allow_private_hosts
         return {"client_id": client_id, "redirect_uris": [redirect_uri], "token_endpoint_auth_method": "none"}
 
@@ -1172,7 +1174,7 @@ async def test_authorize_rejects_cimd_metadata_without_redirect_uris(monkeypatch
     from httpx import ASGITransport, AsyncClient
     client_id = "https://chatgpt.com/oauth/empty-redirects.json"
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": []}
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
@@ -1198,7 +1200,7 @@ async def test_authorize_rejects_cimd_metadata_with_unsafe_redirect_uri_scheme(m
     from httpx import ASGITransport, AsyncClient
     client_id = "https://chatgpt.com/oauth/javascript-redirect.json"
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": ["javascript:alert(1)"]}
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
@@ -1223,7 +1225,7 @@ async def test_authorize_allows_cimd_custom_scheme_when_configured(monkeypatch):
     from httpx import ASGITransport, AsyncClient
     client_id = "https://chatgpt.com/oauth/native-redirect.json"
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         return {"client_id": client_id, "token_endpoint_auth_method": "none", "redirect_uris": ["myapp://callback"]}
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
@@ -1337,7 +1339,7 @@ async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch
     from httpx import ASGITransport, AsyncClient
     client_id = "https://chatgpt.com/oauth/test-client.json"
 
-    def fake_fetch(url, allow_private_hosts=False):
+    async def fake_fetch(url, allow_private_hosts=False):
         raise AssertionError("Should not be called when public_registration=False")
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
