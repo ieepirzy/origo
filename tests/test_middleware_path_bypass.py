@@ -1,7 +1,7 @@
 """
-Regression tests for the path-prefix authorization bypass bug.
+Regression tests for the path-prefix authorization bypass vulnerability.
 
-Bug class: CWE-863 / authorization bypass via naive startswith() matching.
+Vulnerability class: CWE-863 / authorization bypass via naive startswith() matching.
 
 OAuthMiddleware previously used path.startswith(tuple_of_prefixes) to decide
 which requests skip Bearer-token auth. Any path that merely began with a public
@@ -13,7 +13,7 @@ derived directly from the route table in OAuthProvider. No prefix matching.
 
 These tests pin the correct behavior so a future "simplification" of the matching
 logic (e.g. switching back to startswith, glob matching, or a regex) cannot
-silently reintroduce the bug.
+silently reintroduce the vulnerability.
 """
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -172,13 +172,13 @@ async def test_case_variants_require_auth(provider, path):
     # No trailing slash — not a member of _PUBLIC_PATHS
     "/.well-known",
     # Trailing slash only — also not a member
-    # (Note: with the old startswith("/.well-known/") bug this WOULD bypass auth.
+    # (Note: with the old startswith("/.well-known/") vulnerability this WOULD bypass auth.
     # With exact matching it does not, because "/.well-known/" != any member.)
     "/.well-known/",
     # Arbitrary unknown path under /.well-known/
     "/.well-known/anything",
     # Decoy: shares "/.well-known" as a substring but is a different prefix.
-    # The old prefix bug would NOT have exposed this (since the prefix was
+    # The old prefix vulnerability would NOT have exposed this (since the prefix was
     # "/.well-known/" with slash), but it verifies exact matching is anchored.
     "/.well-known-but-not-really/whatever",
 ])
