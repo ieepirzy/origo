@@ -120,14 +120,29 @@ class OAuthStorage:
 
     def _cleanup_expired(self) -> None:
         now = _now()
-        self._codes = {k: v for k, v in self._codes.items() if v["expires_at"] > now}
-        self._tokens = {k: v for k, v in self._tokens.items() if v["expires_at"] > now}
-        self._refresh_tokens = {k: v for k, v in self._refresh_tokens.items() if v["expires_at"] > now}
+
+        def bounded_clean(d: dict, limit: int = 1000) -> None:
+            expired = []
+            for i, (k, v) in enumerate(d.items()):
+                if i >= limit or v["expires_at"] > now:
+                    break
+                expired.append(k)
+            for k in expired:
+                del d[k]
+
+        bounded_clean(self._codes)
+        bounded_clean(self._tokens)
+        bounded_clean(self._refresh_tokens)
+
         if self.client_ttl is not None:
-            self._clients = {
-                k: v for k, v in self._clients.items()
-                if v["registered_at"] is None or now - v["registered_at"] <= self.client_ttl
-            }
+            expired_clients = []
+            for i, (k, v) in enumerate(self._clients.items()):
+                if i >= 1000:
+                    break
+                if v["registered_at"] is not None and now - v["registered_at"] > self.client_ttl:
+                    expired_clients.append(k)
+            for k in expired_clients:
+                del self._clients[k]
 
     def store_code(
         self,
