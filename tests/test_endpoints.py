@@ -19,6 +19,17 @@ def test_verify_pkce_invalid_utf8_verifier():
     assert _verify_pkce("\ud800", "some-challenge", "S256") is False
 
 
+def test_base64url_json():
+    """Test that _base64url_json correctly encodes a dict to a base64url string without padding."""
+    from origo.endpoints import _base64url_json
+
+    data = {"alg": "none", "typ": "JWT"}
+    expected = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+    assert _base64url_json(data) == expected
+
+    assert _base64url_json({}) == "e30"
+
+
 # --- Discovery ---
 
 @pytest.mark.asyncio
