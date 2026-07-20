@@ -429,7 +429,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "response_type": "code",
             "state": "s1",
         })
-        csrf_token = get_resp.cookies.get("origo_csrf")
+        csrf_token = get_resp.cookies.get("__Host-origo_csrf")
 
         resp = await c.post("/authorize", data={
             "client_id": "c",
@@ -440,7 +440,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "state": "s1",
             "approved": "false",
             "csrf_token": csrf_token,
-        }, cookies={"origo_csrf": csrf_token}, follow_redirects=False)
+        }, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
     assert "error=access_denied" in resp.headers["location"]
 

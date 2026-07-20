@@ -324,7 +324,7 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
 </body>
 </html>"""
     response = HTMLResponse(page_html)
-    response.set_cookie("origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
+    response.set_cookie("__Host-origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
@@ -407,7 +407,7 @@ async def authorize(request: Request) -> Response:
 
     # Check approval from consent form
     if request.method == "POST":
-        cookie_csrf = request.cookies.get("origo_csrf")
+        cookie_csrf = request.cookies.get("__Host-origo_csrf")
         form_csrf = params.get("csrf_token")
         if not cookie_csrf or not form_csrf or not _safe_compare_digest(cookie_csrf, form_csrf):
             return JSONResponse({"error": "invalid_request", "error_description": "CSRF token missing or invalid."}, status_code=400)
