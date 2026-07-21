@@ -108,15 +108,18 @@ async def test_register_respects_max_dynamic_clients_cap():
     p = OAuthProvider(base_url="http://testserver", public_registration=True, max_dynamic_clients=2)
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
         client_ids = []
-        for _ in range(3):
+        for _ in range(2):
             resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
             assert resp.status_code == 201
             client_ids.append(resp.json()["client_id"])
 
-    # Oldest registration should have been evicted to stay within the cap.
-    assert not p.storage.client_exists(client_ids[0])
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        assert resp.status_code == 429
+        assert resp.json()["error"] == "server_error"
+
+    # Should reject when cap reached, keeping original items
+    assert p.storage.client_exists(client_ids[0])
     assert p.storage.client_exists(client_ids[1])
-    assert p.storage.client_exists(client_ids[2])
 
 
 @pytest.mark.asyncio
@@ -1036,19 +1039,29 @@ async def test_authorize_cimd_registration_respects_max_dynamic_clients_cap(monk
     verifier, challenge = make_pkce_pair()
     client_ids = [f"https://cimd.example.com/doc-{i}.json" for i in range(3)]
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
-        for cid in client_ids:
-            await c.get("/authorize", params={
+        for cid in client_ids[:2]:
+            resp = await c.get("/authorize", params={
                 "client_id": cid,
                 "redirect_uri": "https://example.com/callback",
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
                 "response_type": "code",
             }, follow_redirects=False)
+            assert resp.status_code == 302
 
-    # Oldest CIMD-registered client should have been evicted to stay within the cap.
-    assert not p.storage.client_exists(client_ids[0])
+        resp = await c.get("/authorize", params={
+            "client_id": client_ids[2],
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+        assert resp.status_code == 429
+        assert resp.json()["error"] == "server_error"
+
+    # Should reject when cap reached, keeping original items
+    assert p.storage.client_exists(client_ids[0])
     assert p.storage.client_exists(client_ids[1])
-    assert p.storage.client_exists(client_ids[2])
 
 
 @pytest.mark.asyncio
@@ -1095,9 +1108,12 @@ async def test_preregistered_clients_not_evicted_by_dynamic_registration_cap_or_
         client_ttl=1,
     )
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
-        for _ in range(3):
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        assert resp.status_code == 201
+
+        for _ in range(2):
             resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
-            assert resp.status_code == 201
+            assert resp.status_code == 429
 
     assert p.storage.client_exists("preseeded-client")
     monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)

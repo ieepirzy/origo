@@ -267,7 +267,10 @@ async def register(request: Request) -> JSONResponse:
 
     client_id = secrets.token_urlsafe(16)
     client_secret = None if token_endpoint_auth_method == "none" else secrets.token_urlsafe(32)
-    storage.register_client(client_id, client_secret, redirect_uris, token_endpoint_auth_method, body)
+    try:
+        storage.register_client(client_id, client_secret, redirect_uris, token_endpoint_auth_method, body)
+    except ValueError as e:
+        return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=429)
 
     response_body = {
         "client_id": client_id,
@@ -393,7 +396,10 @@ async def authorize(request: Request) -> Response:
                 {"error": "unauthorized_client", "error_description": "CIMD redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes)},
                 status_code=401,
             )
-        storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
+        try:
+            storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
+        except ValueError as e:
+            return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=429)
 
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
