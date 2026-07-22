@@ -7,7 +7,7 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce, _build_redirect, _redirect_uri_error_description
+from origo.endpoints import _verify_pkce, _is_valid_redirect_uri, _build_redirect, _redirect_uri_error_description
 
 def test_build_redirect_invalid_url():
     """Test that _build_redirect raises ValueError on invalid URL."""
@@ -32,7 +32,6 @@ def test_redirect_uri_error_description_multiple():
     res = _redirect_uri_error_description(frozenset(["myapp", "zapp", "other"]))
     assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:, other:, zapp:."
 
-
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
     assert _verify_pkce("test-verifier", "test-challenge", "unsupported") is False
@@ -41,6 +40,46 @@ def test_verify_pkce_unsupported_method():
 def test_verify_pkce_invalid_utf8_verifier():
     """Test that _verify_pkce handles UnicodeEncodeError and returns False."""
     assert _verify_pkce("\ud800", "some-challenge", "S256") is False
+
+
+# --- Validation ---
+
+def test_is_valid_redirect_uri_https():
+    assert _is_valid_redirect_uri("https://example.com/callback") is True
+    assert _is_valid_redirect_uri("https://example.com") is True
+    assert _is_valid_redirect_uri("https://127.0.0.1/callback") is True
+
+def test_is_valid_redirect_uri_https_missing_hostname():
+    assert _is_valid_redirect_uri("https:///callback") is False
+    assert _is_valid_redirect_uri("https://") is False
+
+def test_is_valid_redirect_uri_http_loopback():
+    assert _is_valid_redirect_uri("http://localhost/callback") is True
+    assert _is_valid_redirect_uri("http://127.0.0.1/callback") is True
+    assert _is_valid_redirect_uri("http://[::1]/callback") is True
+    assert _is_valid_redirect_uri("http://localhost:8080/callback") is True
+
+def test_is_valid_redirect_uri_http_non_loopback():
+    assert _is_valid_redirect_uri("http://example.com/callback") is False
+    assert _is_valid_redirect_uri("http://10.0.0.1/callback") is False
+    assert _is_valid_redirect_uri("http:///callback") is False
+
+def test_is_valid_redirect_uri_rejects_fragments():
+    assert _is_valid_redirect_uri("https://example.com/callback#fragment") is False
+
+def test_is_valid_redirect_uri_rejects_credentials():
+    assert _is_valid_redirect_uri("https://user:pass@example.com/callback") is False
+    assert _is_valid_redirect_uri("https://user@example.com/callback") is False
+
+def test_is_valid_redirect_uri_custom_schemes():
+    assert _is_valid_redirect_uri("myapp://callback", frozenset(["myapp"])) is True
+    assert _is_valid_redirect_uri("myapp://callback") is False
+    assert _is_valid_redirect_uri("otherapp://callback", frozenset(["myapp"])) is False
+    assert _is_valid_redirect_uri("myapp:/callback", frozenset(["myapp"])) is True
+
+def test_is_valid_redirect_uri_unparseable():
+    # Example of a URL that urlparse rejects with ValueError in Python 3.12+ (invalid IPv6)
+    assert _is_valid_redirect_uri("https://]/") is False
 
 
 def test_base64url_json():
