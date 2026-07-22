@@ -4,9 +4,11 @@ from typing import Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from .endpoints import (
     authorize,
+    jwks,
     oauth_metadata,
     protected_resource_metadata,
     register,
@@ -90,6 +92,8 @@ class OAuthProvider:
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
 
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
         if isinstance(custom_redirect_uri_schemes, str):
             raise TypeError("custom_redirect_uri_schemes must be a list of strings, not a single string")
         schemes = []
@@ -126,6 +130,7 @@ class OAuthProvider:
                 Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
                 Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
                 Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
+                Route("/.well-known/jwks.json", jwks, methods=["GET"]),
                 Route("/register", register, methods=["POST"]),
                 Route("/authorize", authorize, methods=["GET", "POST"]),
                 Route("/token", token, methods=["POST"]),
@@ -143,6 +148,7 @@ class OAuthProvider:
         app.state.user_subject = self.user_subject
         app.state.allow_private_cimd = self.allow_private_cimd
         app.state.custom_redirect_uri_schemes = self.custom_redirect_uri_schemes
+        app.state.private_key = self.private_key
         return app
 
     def asgi_app(self) -> Starlette:

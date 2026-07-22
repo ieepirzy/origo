@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import html
+import http.client
 import ipaddress
 import json
 import secrets
@@ -12,10 +13,14 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 from .storage import OAuthStorage
 
 import base64
+import asyncio
 
 
 _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
@@ -57,6 +62,19 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _is_public_ip(ip_str: str) -> bool:
+    """Reject IP addresses that are loopback/private/link-local/reserved."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if getattr(ip, 'ipv4_mapped', None):
+        ip = ip.ipv4_mapped
+    if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        return False
+    return True
+
+
 def _is_public_host(hostname: str) -> bool:
     """Reject hostnames that resolve to loopback/private/link-local/reserved addresses."""
     try:
@@ -64,12 +82,60 @@ def _is_public_host(hostname: str) -> bool:
     except OSError:
         return False
     for *_rest, sockaddr in addrinfo:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if getattr(ip, 'ipv4_mapped', None):
-            ip = ip.ipv4_mapped
-        if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        if not _is_public_ip(sockaddr[0]):
             return False
     return True
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    """An HTTPSConnection that verifies IP addresses at connection time to prevent DNS rebinding SSRF."""
+    allow_private_hosts = False
+
+    def connect(self):
+        addrinfo = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
+        for family, type, proto, canonname, sockaddr in addrinfo:
+            if not self.allow_private_hosts and not _is_public_ip(sockaddr[0]):
+                raise OSError(f"Private IP detected: {sockaddr[0]}")
+
+            try:
+                self.sock = socket.socket(family, type, proto)
+                self.sock.settimeout(self.timeout)
+                if self.source_address:
+                    self.sock.bind(self.source_address)
+                self.sock.connect(sockaddr)
+                break
+            except OSError:
+                if self.sock is not None:
+                    self.sock.close()
+                    self.sock = None
+                continue
+        else:
+            raise OSError("Could not connect to any address")
+
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+        if self._tunnel_host:
+            self._tunnel()
+
+        server_hostname = self._tunnel_host if self._tunnel_host else self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler that uses _SafeHTTPSConnection."""
+    def __init__(self, allow_private_hosts=False, **kwargs):
+        super().__init__(**kwargs)
+        self._allow_private_hosts = allow_private_hosts
+
+    def https_open(self, req):
+        def build_conn(host, **kwargs):
+            conn = _SafeHTTPSConnection(host, **kwargs)
+            conn.allow_private_hosts = self._allow_private_hosts
+            return conn
+        return self.do_open(build_conn, req, context=self._context)
 
 
 def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = False) -> dict | None:
@@ -85,7 +151,7 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
     if not allow_private_hosts and not _is_public_host(parsed.hostname):
         return None
 
-    opener = urllib.request.build_opener(_NoRedirectHandler)
+    opener = urllib.request.build_opener(_NoRedirectHandler, _SafeHTTPSHandler(allow_private_hosts=allow_private_hosts))
     try:
         request = urllib.request.Request(
             client_id,
@@ -160,7 +226,7 @@ def _base64url_json(data: dict) -> str:
     return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode()
 
 
-def _unsigned_id_token(issuer: str, client_id: str, subject: str, email: str | None, scope: str, ttl: int) -> str:
+def _signed_id_token(issuer: str, client_id: str, subject: str, email: str | None, scope: str, ttl: int, private_key: RSAPrivateKey) -> str:
     now = int(time.time())
     claims = {
         "iss": issuer,
@@ -172,7 +238,14 @@ def _unsigned_id_token(issuer: str, client_id: str, subject: str, email: str | N
     if email and "email" in scope.split():
         claims["email"] = email
         claims["email_verified"] = True
-    return f"{_base64url_json({'alg': 'none', 'typ': 'JWT'})}.{_base64url_json(claims)}."
+
+    header = {"alg": "RS256", "typ": "JWT", "kid": "origo-1"}
+    msg = f"{_base64url_json(header)}.{_base64url_json(claims)}"
+
+    sig = private_key.sign(msg.encode(), padding.PKCS1v15(), hashes.SHA256())
+    sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode('ascii')
+
+    return f"{msg}.{sig_b64}"
 
 
 # --- Discovery ---
@@ -189,7 +262,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "subject_types_supported": ["public"],
-        "id_token_signing_alg_values_supported": ["none"],
+        "id_token_signing_alg_values_supported": ["RS256"],
         "code_challenge_methods_supported": ["S256"],
         "client_id_metadata_document_supported": True,
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
@@ -198,7 +271,30 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         data["scopes_supported"] = scopes_supported
     if public_registration:
         data["registration_endpoint"] = f"{base_url}/register"
+    data["jwks_uri"] = f"{base_url}/.well-known/jwks.json"
     return JSONResponse(data)
+
+
+def _int_to_base64url(val: int) -> str:
+    b = val.to_bytes((val.bit_length() + 7) // 8, byteorder='big')
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode('ascii')
+
+
+async def jwks(request: Request) -> JSONResponse:
+    private_key: RSAPrivateKey = request.app.state.private_key
+    pub = private_key.public_key().public_numbers()
+
+    return JSONResponse({
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": "origo-1",
+                "use": "sig",
+                "n": _int_to_base64url(pub.n),
+                "e": _int_to_base64url(pub.e)
+            }
+        ]
+    })
 
 
 async def protected_resource_metadata(request: Request) -> JSONResponse:
@@ -266,7 +362,10 @@ async def register(request: Request) -> JSONResponse:
 
     client_id = secrets.token_urlsafe(16)
     client_secret = None if token_endpoint_auth_method == "none" else secrets.token_urlsafe(32)
-    storage.register_client(client_id, client_secret, redirect_uris, token_endpoint_auth_method, body)
+    try:
+        storage.register_client(client_id, client_secret, redirect_uris, token_endpoint_auth_method, body)
+    except ValueError as e:
+        return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=429)
 
     response_body = {
         "client_id": client_id,
@@ -324,7 +423,7 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
 </body>
 </html>"""
     response = HTMLResponse(page_html)
-    response.set_cookie("origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
+    response.set_cookie("__Host-origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
@@ -379,7 +478,7 @@ async def authorize(request: Request) -> Response:
         pass
 
     if not storage.client_exists(client_id) and public_registration and client_is_https:
-        metadata = _fetch_client_metadata_document(client_id, allow_private_hosts=allow_private_cimd)
+        metadata = await asyncio.to_thread(_fetch_client_metadata_document, client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
             return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
 
@@ -392,7 +491,10 @@ async def authorize(request: Request) -> Response:
                 {"error": "unauthorized_client", "error_description": "CIMD redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes)},
                 status_code=401,
             )
-        storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
+        try:
+            storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
+        except ValueError as e:
+            return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=429)
 
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
@@ -407,7 +509,7 @@ async def authorize(request: Request) -> Response:
 
     # Check approval from consent form
     if request.method == "POST":
-        cookie_csrf = request.cookies.get("origo_csrf")
+        cookie_csrf = request.cookies.get("__Host-origo_csrf")
         form_csrf = params.get("csrf_token")
         if not cookie_csrf or not form_csrf or not _safe_compare_digest(cookie_csrf, form_csrf):
             return JSONResponse({"error": "invalid_request", "error_description": "CSRF token missing or invalid."}, status_code=400)
@@ -531,13 +633,14 @@ async def token(request: Request) -> JSONResponse:
     if scope:
         response_body["scope"] = scope
     if "openid" in scope.split():
-        response_body["id_token"] = _unsigned_id_token(
+        response_body["id_token"] = _signed_id_token(
             request.app.state.base_url,
             client_id,
             request.app.state.user_subject,
             request.app.state.user_email,
             scope,
             storage.token_ttl,
+            request.app.state.private_key,
         )
 
     return JSONResponse(

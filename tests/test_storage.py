@@ -123,15 +123,17 @@ def test_refresh_token_ttl_respected():
 # --- Dynamic client registration bound/TTL (DCR + CIMD both go through register_client) ---
 
 
-def test_register_client_evicts_oldest_past_cap():
+def test_register_client_rejects_past_cap():
     bounded_storage = OAuthStorage(max_dynamic_clients=2)
     bounded_storage.register_client("client-1", "s1")
     bounded_storage.register_client("client-2", "s2")
-    bounded_storage.register_client("client-3", "s3")
 
-    assert not bounded_storage.client_exists("client-1")
+    with pytest.raises(ValueError, match="Maximum number of dynamic clients reached"):
+        bounded_storage.register_client("client-3", "s3")
+
+    assert bounded_storage.client_exists("client-1")
     assert bounded_storage.client_exists("client-2")
-    assert bounded_storage.client_exists("client-3")
+    assert not bounded_storage.client_exists("client-3")
 
 
 def test_register_client_cap_does_not_evict_when_re_registering_same_id():
@@ -175,18 +177,20 @@ def test_seeded_clients_do_not_count_against_dynamic_cap():
     bounded_storage = OAuthStorage(max_dynamic_clients=1)
     bounded_storage.seed_clients({"permanent-1": "s1", "permanent-2": "s2"})
     bounded_storage.register_client("dynamic-1", "s3")
-    bounded_storage.register_client("dynamic-2", "s4")
+    with pytest.raises(ValueError, match="Maximum number of dynamic clients reached"):
+        bounded_storage.register_client("dynamic-2", "s4")
 
     assert bounded_storage.client_exists("permanent-1")
     assert bounded_storage.client_exists("permanent-2")
-    assert not bounded_storage.client_exists("dynamic-1")
-    assert bounded_storage.client_exists("dynamic-2")
+    assert bounded_storage.client_exists("dynamic-1")
+    assert not bounded_storage.client_exists("dynamic-2")
 
 
 def test_seeded_clients_are_never_evicted_by_cap_overflow():
     bounded_storage = OAuthStorage(max_dynamic_clients=0)
     bounded_storage.seed_clients({"permanent-client": "s"})
     for i in range(5):
-        bounded_storage.register_client(f"dynamic-{i}", "secret")
+        with pytest.raises(ValueError, match="Maximum number of dynamic clients reached"):
+            bounded_storage.register_client(f"dynamic-{i}", "secret")
 
     assert bounded_storage.client_exists("permanent-client")

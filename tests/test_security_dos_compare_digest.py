@@ -12,7 +12,7 @@ def test_compare_digest_dos_csrf():
         "code_challenge": "any",
         "response_type": "code",
         "csrf_token": "äbc"  # non-ascii
-    }, cookies={"origo_csrf": "abc"})
+    }, cookies={"__Host-origo_csrf": "abc"})
     assert response.status_code == 400
     assert "CSRF token missing or invalid" in response.text
 

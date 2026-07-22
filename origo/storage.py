@@ -68,9 +68,8 @@ class OAuthStorage:
             cid for cid, entry in self._clients.items()
             if entry.get("registered_at") is not None and cid != client_id
         ]
-        if dynamic_client_ids and len(dynamic_client_ids) >= self.max_dynamic_clients:
-            oldest_client_id = min(dynamic_client_ids, key=lambda cid: self._clients[cid]["registered_at"])
-            del self._clients[oldest_client_id]
+        if len(dynamic_client_ids) >= self.max_dynamic_clients:
+            raise ValueError("Maximum number of dynamic clients reached")
         self._clients[client_id] = {
             "secret": client_secret,
             "redirect_uris": list(redirect_uris),

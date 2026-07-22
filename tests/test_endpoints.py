@@ -7,7 +7,24 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce, _is_valid_redirect_uri
+from origo.endpoints import _verify_pkce, _is_valid_redirect_uri, _redirect_uri_error_description
+
+def test_redirect_uri_error_description_empty():
+    """Test that _redirect_uri_error_description works with an empty set."""
+    res = _redirect_uri_error_description(frozenset())
+    assert res == "must be valid URIs using https (or http://localhost for loopback)."
+
+
+def test_redirect_uri_error_description_single():
+    """Test that _redirect_uri_error_description works with a single custom scheme."""
+    res = _redirect_uri_error_description(frozenset(["myapp"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:."
+
+
+def test_redirect_uri_error_description_multiple():
+    """Test that _redirect_uri_error_description works with multiple custom schemes."""
+    res = _redirect_uri_error_description(frozenset(["myapp", "zapp", "other"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:, other:, zapp:."
 
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
@@ -59,6 +76,17 @@ def test_is_valid_redirect_uri_unparseable():
     assert _is_valid_redirect_uri("https://]/") is False
 
 
+def test_base64url_json():
+    """Test that _base64url_json correctly encodes a dict to a base64url string without padding."""
+    from origo.endpoints import _base64url_json
+
+    data = {"alg": "none", "typ": "JWT"}
+    expected = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+    assert _base64url_json(data) == expected
+
+    assert _base64url_json({}) == "e30"
+
+
 # --- Discovery ---
 
 @pytest.mark.asyncio
@@ -72,6 +100,9 @@ async def test_oauth_metadata(client_private):
     assert data["token_endpoint"] == "http://testserver/token"
     assert "authorization_code" in data["grant_types_supported"]
     assert "refresh_token" in data["grant_types_supported"]
+    assert "jwks_uri" in data
+    assert data["jwks_uri"] == "http://testserver/.well-known/jwks.json"
+    assert data["id_token_signing_alg_values_supported"] == ["RS256"]
     assert data["code_challenge_methods_supported"] == ["S256"]
     assert "plain" not in data["code_challenge_methods_supported"]
     assert "registration_endpoint" not in data
@@ -119,15 +150,18 @@ async def test_register_respects_max_dynamic_clients_cap():
     p = OAuthProvider(base_url="http://testserver", public_registration=True, max_dynamic_clients=2)
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
         client_ids = []
-        for _ in range(3):
+        for _ in range(2):
             resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
             assert resp.status_code == 201
             client_ids.append(resp.json()["client_id"])
 
-    # Oldest registration should have been evicted to stay within the cap.
-    assert not p.storage.client_exists(client_ids[0])
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        assert resp.status_code == 429
+        assert resp.json()["error"] == "server_error"
+
+    # Should reject when cap reached, keeping original items
+    assert p.storage.client_exists(client_ids[0])
     assert p.storage.client_exists(client_ids[1])
-    assert p.storage.client_exists(client_ids[2])
 
 
 @pytest.mark.asyncio
@@ -440,7 +474,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "response_type": "code",
             "state": "s1",
         })
-        csrf_token = get_resp.cookies.get("origo_csrf")
+        csrf_token = get_resp.cookies.get("__Host-origo_csrf")
 
         resp = await c.post("/authorize", data={
             "client_id": "c",
@@ -451,7 +485,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "state": "s1",
             "approved": "false",
             "csrf_token": csrf_token,
-        }, cookies={"origo_csrf": csrf_token}, follow_redirects=False)
+        }, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
     assert "error=access_denied" in resp.headers["location"]
 
@@ -1047,19 +1081,29 @@ async def test_authorize_cimd_registration_respects_max_dynamic_clients_cap(monk
     verifier, challenge = make_pkce_pair()
     client_ids = [f"https://cimd.example.com/doc-{i}.json" for i in range(3)]
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
-        for cid in client_ids:
-            await c.get("/authorize", params={
+        for cid in client_ids[:2]:
+            resp = await c.get("/authorize", params={
                 "client_id": cid,
                 "redirect_uri": "https://example.com/callback",
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
                 "response_type": "code",
             }, follow_redirects=False)
+            assert resp.status_code == 302
 
-    # Oldest CIMD-registered client should have been evicted to stay within the cap.
-    assert not p.storage.client_exists(client_ids[0])
+        resp = await c.get("/authorize", params={
+            "client_id": client_ids[2],
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+        assert resp.status_code == 429
+        assert resp.json()["error"] == "server_error"
+
+    # Should reject when cap reached, keeping original items
+    assert p.storage.client_exists(client_ids[0])
     assert p.storage.client_exists(client_ids[1])
-    assert p.storage.client_exists(client_ids[2])
 
 
 @pytest.mark.asyncio
@@ -1106,9 +1150,12 @@ async def test_preregistered_clients_not_evicted_by_dynamic_registration_cap_or_
         client_ttl=1,
     )
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
-        for _ in range(3):
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        assert resp.status_code == 201
+
+        for _ in range(2):
             resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
-            assert resp.status_code == 201
+            assert resp.status_code == 429
 
     assert p.storage.client_exists("preseeded-client")
     monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
@@ -1321,6 +1368,18 @@ async def test_openid_userinfo_and_id_token():
         token_data = token_resp.json()
         assert token_data["scope"] == "openid email"
         assert "id_token" in token_data
+
+        parts = token_data["id_token"].split(".")
+        assert len(parts) == 3
+
+        jwks_resp = await c.get("/.well-known/jwks.json")
+        assert jwks_resp.status_code == 200
+        jwks_data = jwks_resp.json()
+        assert "keys" in jwks_data
+        assert len(jwks_data["keys"]) == 1
+        assert jwks_data["keys"][0]["kty"] == "RSA"
+        assert jwks_data["keys"][0]["kid"] == "origo-1"
+
         userinfo = await c.get("/userinfo", headers={"Authorization": f"Bearer {token_data['access_token']}"})
     assert userinfo.status_code == 200
     assert userinfo.json()["email"] == "user@example.com"
