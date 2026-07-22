@@ -14,6 +14,7 @@ def provider_private():
     return OAuthProvider(
         base_url="http://testserver",
         clients={"test-client": "test-secret"},
+        client_redirect_uris={"test-client": ["https://example.com/cb", "https://example.com/cb?existing=1"]},
         auto_approve=True,
     )
 

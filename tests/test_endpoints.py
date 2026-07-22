@@ -357,7 +357,7 @@ async def test_authorize_shows_consent_page(client_public):
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=False,
     )
     verifier, challenge = make_pkce_pair()
@@ -421,7 +421,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=False,
     )
     verifier, challenge = make_pkce_pair()
@@ -627,7 +627,7 @@ async def test_token_client_id_mismatch():
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"client-a": "secret-a", "client-b": "secret-b"},
+        clients={"client-a": "secret-a", "client-b": "secret-b"}, client_redirect_uris={"client-a": ["https://example.com/cb"], "client-b": ["https://example.com/cb"]},
         auto_approve=True,
     )
     verifier, challenge = make_pkce_pair()
@@ -658,7 +658,7 @@ def test_no_clients_warning():
 def test_middleware_method():
     import functools
     from origo import OAuthProvider, OAuthMiddleware
-    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]})
     mw = p.middleware()
     assert isinstance(mw, functools.partial)
     assert mw.func is OAuthMiddleware
@@ -704,7 +704,7 @@ def test_cleanup_expired_codes_and_tokens():
     from unittest.mock import patch
     from origo.storage import OAuthStorage
     s = OAuthStorage()
-    s.seed_clients({"c": "s"})
+    s.seed_clients({"c": "s"}, {"c": ["https://example.com/cb"]})
     code = s.store_code("c", "https://example.com", "challenge")
     token = s.store_token("c")
     assert code in s._codes
@@ -913,7 +913,7 @@ async def test_token_refresh_grant_rotates_and_invalidates_old_token(client_priv
 async def test_token_refresh_grant_wrong_client(client_private):
     client, provider = client_private
     refresh_token = provider.storage.store_refresh_token("test-client")
-    provider.storage.seed_clients({"other-client": "other-secret"})
+    provider.storage.seed_clients({"other-client": "other-secret"}, {"other-client": ["https://example.com/cb"]})
     resp = await client.post("/token", data={
         "grant_type": "refresh_token",
         "client_id": "other-client",
@@ -1105,7 +1105,7 @@ async def test_preregistered_clients_not_evicted_by_dynamic_registration_cap_or_
 
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"preseeded-client": "preseeded-secret"},
+        clients={"preseeded-client": "preseeded-secret"}, client_redirect_uris={"preseeded-client": ["https://example.com/callback"]},
         public_registration=True,
         max_dynamic_clients=1,
         client_ttl=1,
@@ -1300,7 +1300,7 @@ async def test_openid_userinfo_and_id_token():
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=True,
         scopes_supported=["openid", "email"],
         user_email="user@example.com",
@@ -1352,7 +1352,7 @@ async def test_authorize_rejects_unsupported_scope():
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=True,
         scopes_supported=["files:read"],
     )
@@ -1401,7 +1401,7 @@ async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch
         raise AssertionError("Should not be called when public_registration=False")
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
-    p = OAuthProvider(base_url="http://testserver", public_registration=False, auto_approve=True, clients={"existing": "secret"})
+    p = OAuthProvider(base_url="http://testserver", public_registration=False, auto_approve=True, clients={"existing": "secret"}, client_redirect_uris={"existing": ["https://example.com/cb"]})
     verifier, challenge = make_pkce_pair()
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
         resp = await c.get("/authorize", params={
