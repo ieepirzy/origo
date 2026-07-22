@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import html
+import http.client
 import ipaddress
 import json
 import secrets
@@ -61,6 +62,19 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _is_public_ip(ip_str: str) -> bool:
+    """Reject IP addresses that are loopback/private/link-local/reserved."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if getattr(ip, 'ipv4_mapped', None):
+        ip = ip.ipv4_mapped
+    if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        return False
+    return True
+
+
 def _is_public_host(hostname: str) -> bool:
     """Reject hostnames that resolve to loopback/private/link-local/reserved addresses."""
     try:
@@ -68,12 +82,60 @@ def _is_public_host(hostname: str) -> bool:
     except OSError:
         return False
     for *_rest, sockaddr in addrinfo:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if getattr(ip, 'ipv4_mapped', None):
-            ip = ip.ipv4_mapped
-        if not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        if not _is_public_ip(sockaddr[0]):
             return False
     return True
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    """An HTTPSConnection that verifies IP addresses at connection time to prevent DNS rebinding SSRF."""
+    allow_private_hosts = False
+
+    def connect(self):
+        addrinfo = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
+        for family, type, proto, canonname, sockaddr in addrinfo:
+            if not self.allow_private_hosts and not _is_public_ip(sockaddr[0]):
+                raise OSError(f"Private IP detected: {sockaddr[0]}")
+
+            try:
+                self.sock = socket.socket(family, type, proto)
+                self.sock.settimeout(self.timeout)
+                if self.source_address:
+                    self.sock.bind(self.source_address)
+                self.sock.connect(sockaddr)
+                break
+            except OSError:
+                if self.sock is not None:
+                    self.sock.close()
+                    self.sock = None
+                continue
+        else:
+            raise OSError("Could not connect to any address")
+
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+        if self._tunnel_host:
+            self._tunnel()
+
+        server_hostname = self._tunnel_host if self._tunnel_host else self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler that uses _SafeHTTPSConnection."""
+    def __init__(self, allow_private_hosts=False, **kwargs):
+        super().__init__(**kwargs)
+        self._allow_private_hosts = allow_private_hosts
+
+    def https_open(self, req):
+        def build_conn(host, **kwargs):
+            conn = _SafeHTTPSConnection(host, **kwargs)
+            conn.allow_private_hosts = self._allow_private_hosts
+            return conn
+        return self.do_open(build_conn, req, context=self._context)
 
 
 def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = False) -> dict | None:
@@ -89,7 +151,7 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
     if not allow_private_hosts and not _is_public_host(parsed.hostname):
         return None
 
-    opener = urllib.request.build_opener(_NoRedirectHandler)
+    opener = urllib.request.build_opener(_NoRedirectHandler, _SafeHTTPSHandler(allow_private_hosts=allow_private_hosts))
     try:
         request = urllib.request.Request(
             client_id,
