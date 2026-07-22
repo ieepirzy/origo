@@ -7,7 +7,13 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce, _redirect_uri_error_description
+from origo.endpoints import _verify_pkce, _build_redirect, _redirect_uri_error_description
+
+def test_build_redirect_invalid_url():
+    """Test that _build_redirect raises ValueError on invalid URL."""
+    with pytest.raises(ValueError, match="Invalid redirect URI:"):
+        _build_redirect("http://]/", {"param": "value"})
+
 
 def test_redirect_uri_error_description_empty():
     """Test that _redirect_uri_error_description works with an empty set."""
