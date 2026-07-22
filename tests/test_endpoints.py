@@ -61,6 +61,9 @@ async def test_oauth_metadata(client_private):
     assert data["token_endpoint"] == "http://testserver/token"
     assert "authorization_code" in data["grant_types_supported"]
     assert "refresh_token" in data["grant_types_supported"]
+    assert "jwks_uri" in data
+    assert data["jwks_uri"] == "http://testserver/.well-known/jwks.json"
+    assert data["id_token_signing_alg_values_supported"] == ["RS256"]
     assert data["code_challenge_methods_supported"] == ["S256"]
     assert "plain" not in data["code_challenge_methods_supported"]
     assert "registration_endpoint" not in data
@@ -1310,6 +1313,18 @@ async def test_openid_userinfo_and_id_token():
         token_data = token_resp.json()
         assert token_data["scope"] == "openid email"
         assert "id_token" in token_data
+
+        parts = token_data["id_token"].split(".")
+        assert len(parts) == 3
+
+        jwks_resp = await c.get("/.well-known/jwks.json")
+        assert jwks_resp.status_code == 200
+        jwks_data = jwks_resp.json()
+        assert "keys" in jwks_data
+        assert len(jwks_data["keys"]) == 1
+        assert jwks_data["keys"][0]["kty"] == "RSA"
+        assert jwks_data["keys"][0]["kid"] == "origo-1"
+
         userinfo = await c.get("/userinfo", headers={"Authorization": f"Bearer {token_data['access_token']}"})
     assert userinfo.status_code == 200
     assert userinfo.json()["email"] == "user@example.com"
