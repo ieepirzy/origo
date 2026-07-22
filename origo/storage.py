@@ -108,12 +108,12 @@ class OAuthStorage:
         return self._get_client(client_id) is not None
 
     def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
-        """Return True if redirect_uri is allowed for the client. No stored URIs means any is allowed."""
+        """Return True if redirect_uri is allowed for the client."""
         entry = self._get_client(client_id)
         if entry is None:
             return False
         allowed = entry["redirect_uris"]
-        return not allowed or redirect_uri in allowed
+        return bool(allowed and redirect_uri in allowed)
 
     # --- Auth codes ---
 
