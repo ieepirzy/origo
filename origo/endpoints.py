@@ -81,8 +81,13 @@ def _is_public_host(hostname: str) -> bool:
         addrinfo = socket.getaddrinfo(hostname, None)
     except OSError:
         return False
+    seen_ips = set()
     for *_rest, sockaddr in addrinfo:
-        if not _is_public_ip(sockaddr[0]):
+        ip = sockaddr[0]
+        if ip in seen_ips:
+            continue
+        seen_ips.add(ip)
+        if not _is_public_ip(ip):
             return False
     return True
 
