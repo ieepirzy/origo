@@ -7,7 +7,19 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce, _is_valid_redirect_uri, _build_redirect, _redirect_uri_error_description
+from origo.endpoints import _verify_pkce, _is_valid_redirect_uri, _build_redirect, _redirect_uri_error_description, _safe_compare_digest
+
+def test_safe_compare_digest_type_error():
+    """Test that _safe_compare_digest safely handles TypeError."""
+    # Test valid comparisons
+    assert _safe_compare_digest("abc", "abc") is True
+    assert _safe_compare_digest("abc", "def") is False
+
+    # Test invalid types that would normally raise TypeError
+    assert _safe_compare_digest("abc", 123) is False
+    assert _safe_compare_digest(123, "abc") is False
+    assert _safe_compare_digest(None, "abc") is False
+    assert _safe_compare_digest("abc", None) is False
 
 def test_build_redirect_invalid_url():
     """Test that _build_redirect raises ValueError on invalid URL."""
