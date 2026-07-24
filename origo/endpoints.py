@@ -30,8 +30,10 @@ _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
 
 def _safe_compare_digest(a: str, b: str) -> bool:
     try:
-        return hmac.compare_digest(a, b)
-    except TypeError:
+        if not isinstance(a, str) or not isinstance(b, str):
+            return False
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except Exception:
         return False
 
 
