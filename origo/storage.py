@@ -43,7 +43,7 @@ class OAuthStorage:
                 stacklevel=3,
             )
         for client_id, secret in clients.items():
-            allowed_redirect_uris = list(redirect_uris.get(client_id, []))
+            allowed_redirect_uris = set(redirect_uris.get(client_id, []))
             self._clients[client_id] = {
                 "secret": secret,
                 "redirect_uris": allowed_redirect_uris,
@@ -78,7 +78,7 @@ class OAuthStorage:
         registered_at = _now()
         self._clients[client_id] = {
             "secret": client_secret,
-            "redirect_uris": list(redirect_uris),
+            "redirect_uris": set(redirect_uris),
             "token_endpoint_auth_method": token_endpoint_auth_method,
             "client_metadata": client_metadata or {},
             "registered_at": registered_at,
