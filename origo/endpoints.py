@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import html
 import http.client
+import functools
 import ipaddress
 import json
 import secrets
@@ -62,6 +63,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+@functools.lru_cache(maxsize=4096)
 def _is_public_ip(ip_str: str) -> bool:
     """Reject IP addresses that are loopback/private/link-local/reserved."""
     try:
