@@ -21,6 +21,7 @@ class OAuthStorage:
         self.refresh_token_ttl = refresh_token_ttl
         self.client_ttl = client_ttl
         self.max_dynamic_clients = max_dynamic_clients
+        self._dynamic_clients_count = 0
         self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris, token_endpoint_auth_method}
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
@@ -44,6 +45,11 @@ class OAuthStorage:
             )
         for client_id, secret in clients.items():
             allowed_redirect_uris = set(redirect_uris.get(client_id, []))
+
+            existing = self._clients.get(client_id)
+            if existing and existing.get("registered_at") is not None:
+                self._dynamic_clients_count -= 1
+
             self._clients[client_id] = {
                 "secret": secret,
                 "redirect_uris": allowed_redirect_uris,
@@ -69,13 +75,18 @@ class OAuthStorage:
     ) -> None:
         """Dynamically register a new client (public mode, DCR or CIMD)."""
         self._cleanup_expired()
-        dynamic_client_ids = [
-            cid for cid, entry in self._clients.items()
-            if entry.get("registered_at") is not None and cid != client_id
-        ]
-        if len(dynamic_client_ids) >= self.max_dynamic_clients:
+
+        existing = self._clients.get(client_id)
+        is_existing_dynamic = existing is not None and existing.get("registered_at") is not None
+
+        if not is_existing_dynamic and self._dynamic_clients_count >= self.max_dynamic_clients:
             raise ValueError("Maximum number of dynamic clients reached")
+
         registered_at = _now()
+
+        if not is_existing_dynamic:
+            self._dynamic_clients_count += 1
+
         self._clients[client_id] = {
             "secret": client_secret,
             "redirect_uris": set(redirect_uris),
@@ -97,6 +108,7 @@ class OAuthStorage:
             and _now() - entry["registered_at"] > self.client_ttl
         ):
             self._clients.pop(client_id, None)
+            self._dynamic_clients_count -= 1
             return None
         return entry
 
@@ -155,6 +167,7 @@ class OAuthStorage:
                     current_exp = self._clients[k]["registered_at"] + self.client_ttl
                     if current_exp == exp:
                         del self._clients[k]
+                        self._dynamic_clients_count -= 1
 
     def store_code(
         self,
