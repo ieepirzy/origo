@@ -195,6 +195,32 @@ def test_seeded_clients_are_never_evicted_by_cap_overflow():
 
     assert bounded_storage.client_exists("permanent-client")
 
+def test_get_client_metadata_existing(storage):
+    storage.register_client("meta-client", "secret", client_metadata={"logo_uri": "https://example.com/logo.png", "client_name": "Test App"})
+    metadata = storage.get_client_metadata("meta-client")
+    assert metadata is not None
+    assert metadata["logo_uri"] == "https://example.com/logo.png"
+    assert metadata["client_name"] == "Test App"
+
+
+def test_get_client_metadata_unknown(storage):
+    assert storage.get_client_metadata("nonexistent") is None
+
+
+def test_get_client_metadata_expired():
+    storage = OAuthStorage(client_ttl=1)
+    storage.register_client("meta-client", "secret", client_metadata={"client_name": "Expiring App"})
+    assert storage.get_client_metadata("meta-client") is not None
+    with patch("origo.storage._now", return_value=9999999999.0):
+        assert storage.get_client_metadata("meta-client") is None
+
+
+def test_get_client_metadata_seeded(storage):
+    storage.seed_clients({"seeded": "s"}, {"seeded": ["https://example.com"]})
+    metadata = storage.get_client_metadata("seeded")
+    assert metadata == {}
+
+
 def test_get_client_auth_method_unknown(storage):
     assert storage.get_client_auth_method("nobody") is None
 
