@@ -219,3 +219,15 @@ def test_get_client_metadata_seeded(storage):
     storage.seed_clients({"seeded": "s"}, {"seeded": ["https://example.com"]})
     metadata = storage.get_client_metadata("seeded")
     assert metadata == {}
+
+
+def test_get_client_auth_method_unknown(storage):
+    assert storage.get_client_auth_method("nobody") is None
+
+def test_get_client_auth_method_default(storage):
+    storage.register_client("new-client", "new-secret")
+    assert storage.get_client_auth_method("new-client") == "client_secret_post"
+
+def test_get_client_auth_method_custom(storage):
+    storage.register_client("new-client", "new-secret", token_endpoint_auth_method="none")
+    assert storage.get_client_auth_method("new-client") == "none"
