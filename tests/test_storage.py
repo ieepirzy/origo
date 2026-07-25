@@ -231,3 +231,23 @@ def test_get_client_auth_method_default(storage):
 def test_get_client_auth_method_custom(storage):
     storage.register_client("new-client", "new-secret", token_endpoint_auth_method="none")
     assert storage.get_client_auth_method("new-client") == "none"
+
+def test_seed_clients_warnings(storage):
+    # Both global and client-specific warnings when no redirect_uris provided at all
+    with pytest.warns(UserWarning) as record:
+        storage.seed_clients({"alice": "secret1"})
+
+    assert len(record) == 2
+    assert "clients seeded with no redirect_uris" in str(record[0].message)
+    assert "client 'alice' seeded with no redirect_uris" in str(record[1].message)
+
+def test_seed_clients_warning_specific_client(storage):
+    # Only client-specific warning when one client has uris but another doesn't
+    with pytest.warns(UserWarning) as record:
+        storage.seed_clients(
+            {"alice": "secret1", "bob": "secret2"},
+            {"alice": ["https://example.com"]}
+        )
+
+    assert len(record) == 1
+    assert "client 'bob' seeded with no redirect_uris" in str(record[0].message)
