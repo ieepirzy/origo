@@ -3,6 +3,7 @@ import hmac
 import html
 import http.client
 import functools
+from dataclasses import dataclass
 import ipaddress
 import json
 import secrets
@@ -26,6 +27,13 @@ import asyncio
 
 _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
 _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
+
+
+@dataclass
+class UserClaims:
+    subject: str
+    email: str | None
+    scope: str
 
 
 def _safe_compare_digest(a: str, b: str) -> bool:
@@ -235,17 +243,17 @@ def _base64url_json(data: dict) -> str:
     return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode()
 
 
-def _signed_id_token(issuer: str, client_id: str, subject: str, email: str | None, scope: str, ttl: int, private_key: RSAPrivateKey) -> str:
+def _signed_id_token(issuer: str, client_id: str, user_claims: UserClaims, ttl: int, private_key: RSAPrivateKey) -> str:
     now = int(time.time())
     claims = {
         "iss": issuer,
-        "sub": subject,
+        "sub": user_claims.subject,
         "aud": client_id,
         "iat": now,
         "exp": now + ttl,
     }
-    if email and "email" in scope.split():
-        claims["email"] = email
+    if user_claims.email and "email" in user_claims.scope.split():
+        claims["email"] = user_claims.email
         claims["email_verified"] = True
 
     header = {"alg": "RS256", "typ": "JWT", "kid": "origo-1"}
@@ -642,12 +650,15 @@ async def token(request: Request) -> JSONResponse:
     if scope:
         response_body["scope"] = scope
     if "openid" in scope.split():
+        user_claims = UserClaims(
+            subject=request.app.state.user_subject,
+            email=request.app.state.user_email,
+            scope=scope,
+        )
         response_body["id_token"] = _signed_id_token(
             request.app.state.base_url,
             client_id,
-            request.app.state.user_subject,
-            request.app.state.user_email,
-            scope,
+            user_claims,
             storage.token_ttl,
             request.app.state.private_key,
         )
