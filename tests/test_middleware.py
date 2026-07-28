@@ -33,6 +33,14 @@ def provider():
 
 
 @pytest.mark.asyncio
+async def test_jwks_path_is_public(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/.well-known/jwks.json")
+        assert resp.status_code != 401
+
+
+@pytest.mark.asyncio
 async def test_public_paths_bypass_well_known(provider):
     app = _make_app(provider)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
