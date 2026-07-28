@@ -24,6 +24,7 @@ _PUBLIC_PATHS = {
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/jwks.json",
 }
 
 
