@@ -492,7 +492,7 @@ async def authorize(request: Request) -> Response:
     try:
         client_is_https = urlparse(client_id).scheme == "https"
     except ValueError:
-        pass
+        return JSONResponse({"error": "invalid_request", "error_description": "invalid client_id."}, status_code=400)
 
     if not storage.client_exists(client_id) and public_registration and client_is_https:
         metadata = await asyncio.to_thread(_fetch_client_metadata_document, client_id, allow_private_hosts=allow_private_cimd)
