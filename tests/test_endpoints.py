@@ -538,6 +538,20 @@ async def test_authorize_preserves_state(client_private):
     assert "state=unique-state-xyz" in resp.headers["location"]
 
 
+@pytest.mark.asyncio
+async def test_authorize_response_includes_rfc9207_issuer(client_private):
+    client, _ = client_private
+    _, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
+        "client_id": "test-client",
+        "redirect_uri": "https://example.com/cb",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "response_type": "code",
+    }, follow_redirects=False)
+    assert "iss=http%3A%2F%2Ftestserver" in resp.headers["location"]
+
+
 # --- Token ---
 
 @pytest.mark.asyncio

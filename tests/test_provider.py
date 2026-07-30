@@ -3,9 +3,11 @@ import warnings
 
 import pytest
 from starlette.applications import Starlette
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from origo.provider import OAuthProvider
 from origo.middleware import OAuthMiddleware
+from origo.storage import OAuthStorage
 
 
 def test_provider_initialization_warnings():
@@ -53,6 +55,19 @@ def test_asgi_app():
     app = provider.asgi_app()
     assert isinstance(app, Starlette)
     assert app is provider._app
+
+
+def test_provider_accepts_shared_storage_and_persistent_signing_key():
+    storage = OAuthStorage()
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    provider = OAuthProvider(
+        base_url="http://example.com",
+        public_registration=True,
+        storage=storage,
+        private_key=private_key,
+    )
+    assert provider.storage is storage
+    assert provider.private_key is private_key
 
 
 def test_middleware():

@@ -63,6 +63,8 @@ class OAuthMiddleware:
             f'realm="{self.provider.base_url}"',
             f'resource_metadata="{self.provider.protected_resource_metadata_url}"',
         ]
+        if self.provider.scopes_supported:
+            parts.append(f'scope="{" ".join(self.provider.scopes_supported)}"')
         if error:
             parts.append(f'error="{error}"')
         return ("Bearer " + ", ".join(parts)).encode()
@@ -111,7 +113,12 @@ class OAuthMiddleware:
         except UnicodeDecodeError:
             token = ""
 
-        if not token or self.provider.verify_token(token, resource=self.provider.resource_identifier) is None:
+        token_metadata = (
+            self.provider.verify_token(token, resource=self.provider.resource_identifier)
+            if token
+            else None
+        )
+        if token_metadata is None:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             else:
@@ -122,6 +129,12 @@ class OAuthMiddleware:
                     [(b"www-authenticate", self._www_authenticate("invalid_token"))],
                 )
             return
+
+        # Expose only non-secret authorization context to the protected ASGI app.
+        # Starlette Request.state reads from this per-request scope dictionary.
+        request_state = scope.setdefault("state", {})
+        request_state["client_id"] = token_metadata.get("client_id")
+        request_state["oauth_scope"] = token_metadata.get("scope", "")
 
         try:
             await self.app(scope, receive, send)

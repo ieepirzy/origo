@@ -5,6 +5,7 @@ from typing import Optional
 from starlette.applications import Starlette
 from starlette.routing import Route
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 from .endpoints import (
     authorize,
@@ -61,6 +62,12 @@ class OAuthProvider:
                              app clients. Off by default — an unconfigured scheme could
                              be claimed by another app on the same device, so schemes
                              must be declared explicitly by the operator.
+        storage:             Optional storage instance. Inject a shared implementation
+                             before running multiple replicas; the default OAuthStorage
+                             is process-local memory.
+        private_key:         Optional persistent RSA signing key. The default is generated
+                             per process and is therefore unsuitable for interchangeable
+                             replicas.
     """
 
     def __init__(
@@ -81,6 +88,8 @@ class OAuthProvider:
         user_subject: Optional[str] = None,
         allow_private_cimd: bool = False,
         custom_redirect_uri_schemes: Optional[list[str]] = None,
+        storage: Optional[OAuthStorage] = None,
+        private_key: Optional[RSAPrivateKey] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -92,7 +101,7 @@ class OAuthProvider:
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
 
-        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.private_key = private_key or rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
         if isinstance(custom_redirect_uri_schemes, str):
             raise TypeError("custom_redirect_uri_schemes must be a list of strings, not a single string")
@@ -105,7 +114,7 @@ class OAuthProvider:
                 schemes.append(sanitized)
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
-        self.storage = OAuthStorage(
+        self.storage = storage or OAuthStorage(
             token_ttl=token_ttl,
             refresh_token_ttl=refresh_token_ttl,
             client_ttl=client_ttl,

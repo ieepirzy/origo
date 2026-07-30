@@ -81,6 +81,23 @@ async def test_protected_path_with_valid_token_passes(provider):
 
 
 @pytest.mark.asyncio
+async def test_valid_token_exposes_client_identity_to_protected_app(provider):
+    async def identity(request: Request):
+        return JSONResponse({
+            "client_id": request.state.client_id,
+            "oauth_scope": request.state.oauth_scope,
+        })
+
+    token = provider.storage.store_token("c", scope="bookings:write")
+    app = Starlette(routes=[Route("/mcp", identity)])
+    app.add_middleware(OAuthMiddleware, provider=provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {"client_id": "c", "oauth_scope": "bookings:write"}
+
+
+@pytest.mark.asyncio
 async def test_authorize_path_is_public(provider):
     app = _make_app(provider)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -116,6 +133,19 @@ async def test_www_authenticate_header_includes_realm(provider):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
         resp = await client.get("/mcp")
         assert "testserver" in resp.headers.get("WWW-Authenticate", "")
+
+
+@pytest.mark.asyncio
+async def test_www_authenticate_header_includes_configured_scope():
+    scoped_provider = OAuthProvider(
+        base_url="http://testserver",
+        public_registration=True,
+        scopes_supported=["bookings:write"],
+    )
+    app = _make_app(scoped_provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get("/mcp")
+    assert 'scope="bookings:write"' in resp.headers["WWW-Authenticate"]
 
 
 try:

@@ -282,6 +282,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "id_token_signing_alg_values_supported": ["RS256"],
         "code_challenge_methods_supported": ["S256"],
         "client_id_metadata_document_supported": True,
+        "authorization_response_iss_parameter_supported": True,
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
     }
     if scopes_supported:
@@ -534,14 +535,20 @@ async def authorize(request: Request) -> Response:
         approved = params.get("approved", "true")
         if approved != "true":
             try:
-                redirect_url = _build_redirect(redirect_uri, {"error": "access_denied", "state": state})
+                redirect_url = _build_redirect(
+                    redirect_uri,
+                    {"error": "access_denied", "state": state, "iss": request.app.state.base_url},
+                )
             except ValueError:
                 return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
             return RedirectResponse(redirect_url, status_code=302)
 
     code = storage.store_code(client_id, redirect_uri, code_challenge, code_challenge_method, resource=resource, scope=scope)
     try:
-        redirect_url = _build_redirect(redirect_uri, {"code": code, "state": state})
+        redirect_url = _build_redirect(
+            redirect_uri,
+            {"code": code, "state": state, "iss": request.app.state.base_url},
+        )
     except ValueError:
         return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
     return RedirectResponse(redirect_url, status_code=302)

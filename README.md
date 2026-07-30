@@ -208,6 +208,10 @@ auth = OAuthProvider(
 )
 ```
 
+DCR clients that cannot keep a secret should register with
+`"token_endpoint_auth_method": "none"` and use PKCE. Origo then returns a
+`client_id` without issuing a `client_secret`.
+
 Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) have no such restriction — any redirect URI is accepted, since the operator controls both sides.
 
 By default, dynamically registered `redirect_uris` must use `https` (or `http://localhost`/`127.0.0.1`/`::1` for the RFC 8252 §7.3 native-app loopback exemption). Native/mobile app clients that use a private-use URI scheme instead (RFC 8252 §7.1, e.g. `myapp://callback`) are rejected unless the operator explicitly opts in:
@@ -241,6 +245,14 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 | `user_email` | `str` | `None` | Optional static email claim returned by lightweight OIDC `/userinfo` |
 | `allow_private_cimd` | `bool` | `False` | Allow CIMD `client_id` documents to be fetched from private/loopback/link-local hosts (see [CIMD and SSRF hardening](#cimd-and-ssrf-hardening)) |
 | `custom_redirect_uri_schemes` | `list[str]` | `None` | Private-use URI schemes (RFC 8252 §7.1, e.g. `["myapp"]`) accepted as `redirect_uris` during dynamic registration, for native app clients |
+| `storage` | `OAuthStorage` | in-memory instance | Injectable authorization storage. Supply a shared implementation before routing clients across multiple replicas |
+| `private_key` | `RSAPrivateKey` | generated at startup | Injectable persistent RSA key used for ID-token signing and JWKS |
+
+The default storage and signing key are process-local. MCP's sessionless
+transport does not change that OAuth state: restarts invalidate opaque tokens,
+authorization codes, dynamic registrations, and the generated signing key. A
+multi-replica deployment must inject shared storage and the same persistent key
+into every replica.
 
 ## OAuth Endpoints
 
@@ -272,8 +284,9 @@ the suffixed form first. Both return the same document.
 - CIMD clients can use an HTTPS metadata document URL as `client_id`; `origo` fetches it, validates redirect URIs, and treats it as a public PKCE client when the document requests `token_endpoint_auth_method=none`.
 - The optional OAuth `resource` parameter is preserved from `/authorize` to `/token` and stored with the issued access token metadata, so applications can verify which MCP resource the token was minted for.
 - `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced.
-- `WWW-Authenticate` challenges include `resource_metadata` so ChatGPT can discover OAuth metadata when an unauthenticated tool call reaches the server.
-- Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an unsigned `id_token` for `openid` requests, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
+- `WWW-Authenticate` challenges include `resource_metadata` and configured scopes so clients can discover the authorization requirements after an unauthenticated tool call.
+- Authorization responses include the RFC 9207 `iss` parameter, and discovery advertises support for it.
+- Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an RS256-signed `id_token` for `openid` requests, publishes its key through JWKS, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
 
 For ChatGPT connectors, register the redirect URI shown in ChatGPT (for example, `https://chatgpt.com/connector/oauth/{callback_id}`) and use your public MCP endpoint as the `resource` value, typically `https://your-domain.example/mcp`.
 
