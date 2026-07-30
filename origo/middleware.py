@@ -24,6 +24,7 @@ _PUBLIC_PATHS = {
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/jwks.json",
 }
 
 
@@ -77,8 +78,21 @@ class OAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers", []))
-        auth_bytes = headers.get(b"authorization", b"")
+        raw_headers = scope.get("headers", [])
+        auth_headers = [v for k, v in raw_headers if k.lower() == b"authorization"]
+
+        if len(auth_headers) > 1:
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await _send_json(
+                    send,
+                    {"error": "invalid_request", "error_description": "Multiple Authorization headers present."},
+                    400,
+                )
+            return
+
+        auth_bytes = auth_headers[0] if auth_headers else b""
 
         if not auth_bytes.startswith(b"Bearer "):
             if scope["type"] == "websocket":

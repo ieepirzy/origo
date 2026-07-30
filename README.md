@@ -232,6 +232,9 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 | `public_registration` | `bool` | `False` | Allow dynamic client registration |
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
+| `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request |
+| `client_ttl` | `int` | `None` | Lifetime in seconds for dynamically-registered clients (DCR `/register` or CIMD). `None` means no expiration. Pre-registered `clients=` are always permanent |
+| `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept in memory; oldest is evicted on overflow. Pre-registered `clients=` don't count against this cap |
 | `mcp_path` | `str` | `"/mcp"` | Path where MCP endpoint is mounted |
 | `scopes_supported` | `list[str]` | `[]` | OAuth/OIDC scopes advertised in metadata |
 | `resource_documentation` | `str` | `None` | Optional URL added to protected resource metadata |
@@ -268,6 +271,7 @@ the suffixed form first. Both return the same document.
 - Dynamic client registration accepts `token_endpoint_auth_method=none` for clients that should exchange authorization codes without a client secret.
 - CIMD clients can use an HTTPS metadata document URL as `client_id`; `origo` fetches it, validates redirect URIs, and treats it as a public PKCE client when the document requests `token_endpoint_auth_method=none`.
 - The optional OAuth `resource` parameter is preserved from `/authorize` to `/token` and stored with the issued access token metadata, so applications can verify which MCP resource the token was minted for.
+- `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced.
 - `WWW-Authenticate` challenges include `resource_metadata` so ChatGPT can discover OAuth metadata when an unauthenticated tool call reaches the server.
 - Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an unsigned `id_token` for `openid` requests, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
 

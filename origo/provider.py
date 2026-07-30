@@ -4,9 +4,11 @@ from typing import Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from .endpoints import (
     authorize,
+    jwks,
     oauth_metadata,
     protected_resource_metadata,
     register,
@@ -31,6 +33,18 @@ class OAuthProvider:
         auto_approve:        Skip consent page, approve all valid clients.
                              Default False.
         token_ttl:           Access token lifetime in seconds. Default 3600.
+        refresh_token_ttl:   Refresh token lifetime in seconds. Default 30 days.
+                             Refresh tokens are single-use and rotated on every
+                             /token request (a new one is issued each time).
+        client_ttl:          Lifetime in seconds for dynamically-registered clients
+                             (via DCR /register or CIMD auto-registration). Default
+                             None (no expiration). Pre-registered clients passed via
+                             `clients=` are always permanent and unaffected.
+        max_dynamic_clients: Maximum number of dynamically-registered clients (DCR
+                             and CIMD) kept in memory at once; the oldest is evicted
+                             when a new one would exceed this cap. Default 1000.
+                             Pre-registered clients passed via `clients=` don't count
+                             against this cap.
         mcp_path:            Path where MCP endpoint is mounted. Default "/mcp".
         scopes_supported:    OAuth scopes advertised to clients.
         resource_documentation: Optional protected resource documentation URL.
@@ -57,6 +71,9 @@ class OAuthProvider:
         public_registration: bool = False,
         auto_approve: bool = False,
         token_ttl: int = 3600,
+        refresh_token_ttl: int = 30 * 24 * 3600,
+        client_ttl: Optional[int] = None,
+        max_dynamic_clients: int = 1000,
         mcp_path: str = "/mcp",
         scopes_supported: Optional[list[str]] = None,
         resource_documentation: Optional[str] = None,
@@ -75,6 +92,8 @@ class OAuthProvider:
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
 
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
         if isinstance(custom_redirect_uri_schemes, str):
             raise TypeError("custom_redirect_uri_schemes must be a list of strings, not a single string")
         schemes = []
@@ -86,7 +105,12 @@ class OAuthProvider:
                 schemes.append(sanitized)
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
-        self.storage = OAuthStorage(token_ttl=token_ttl)
+        self.storage = OAuthStorage(
+            token_ttl=token_ttl,
+            refresh_token_ttl=refresh_token_ttl,
+            client_ttl=client_ttl,
+            max_dynamic_clients=max_dynamic_clients,
+        )
 
         if clients:
             self.storage.seed_clients(clients, client_redirect_uris)
@@ -116,6 +140,7 @@ class OAuthProvider:
                     protected_resource_metadata,
                     methods=["GET"],
                 ),
+                Route("/.well-known/jwks.json", jwks, methods=["GET"]),
                 Route("/register", register, methods=["POST"]),
                 Route("/authorize", authorize, methods=["GET", "POST"]),
                 Route("/token", token, methods=["POST"]),
@@ -133,6 +158,7 @@ class OAuthProvider:
         app.state.user_subject = self.user_subject
         app.state.allow_private_cimd = self.allow_private_cimd
         app.state.custom_redirect_uri_schemes = self.custom_redirect_uri_schemes
+        app.state.private_key = self.private_key
         return app
 
     def asgi_app(self) -> Starlette:

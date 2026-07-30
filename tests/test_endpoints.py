@@ -7,11 +7,102 @@ import pytest
 
 from tests.conftest import make_pkce_pair
 
-from origo.endpoints import _verify_pkce
+from origo.endpoints import _verify_pkce, _is_valid_redirect_uri, _build_redirect, _redirect_uri_error_description, _safe_compare_digest
+
+def test_safe_compare_digest_type_error():
+    """Test that _safe_compare_digest safely handles TypeError."""
+    # Test valid comparisons
+    assert _safe_compare_digest("abc", "abc") is True
+    assert _safe_compare_digest("abc", "def") is False
+
+    # Test invalid types that would normally raise TypeError
+    assert _safe_compare_digest("abc", 123) is False
+    assert _safe_compare_digest(123, "abc") is False
+    assert _safe_compare_digest(None, "abc") is False
+    assert _safe_compare_digest("abc", None) is False
+
+def test_build_redirect_invalid_url():
+    """Test that _build_redirect raises ValueError on invalid URL."""
+    with pytest.raises(ValueError, match="Invalid redirect URI:"):
+        _build_redirect("http://]/", {"param": "value"})
+
+
+def test_redirect_uri_error_description_empty():
+    """Test that _redirect_uri_error_description works with an empty set."""
+    res = _redirect_uri_error_description(frozenset())
+    assert res == "must be valid URIs using https (or http://localhost for loopback)."
+
+
+def test_redirect_uri_error_description_single():
+    """Test that _redirect_uri_error_description works with a single custom scheme."""
+    res = _redirect_uri_error_description(frozenset(["myapp"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:."
+
+
+def test_redirect_uri_error_description_multiple():
+    """Test that _redirect_uri_error_description works with multiple custom schemes."""
+    res = _redirect_uri_error_description(frozenset(["myapp", "zapp", "other"]))
+    assert res == "must be valid URIs using https (or http://localhost for loopback), or one of these custom schemes: myapp:, other:, zapp:."
 
 def test_verify_pkce_unsupported_method():
     """Test that _verify_pkce returns False for an unsupported method."""
     assert _verify_pkce("test-verifier", "test-challenge", "unsupported") is False
+
+
+def test_verify_pkce_invalid_utf8_verifier():
+    """Test that _verify_pkce handles UnicodeEncodeError and returns False."""
+    assert _verify_pkce("\ud800", "some-challenge", "S256") is False
+
+
+# --- Validation ---
+
+def test_is_valid_redirect_uri_https():
+    assert _is_valid_redirect_uri("https://example.com/callback") is True
+    assert _is_valid_redirect_uri("https://example.com") is True
+    assert _is_valid_redirect_uri("https://127.0.0.1/callback") is True
+
+def test_is_valid_redirect_uri_https_missing_hostname():
+    assert _is_valid_redirect_uri("https:///callback") is False
+    assert _is_valid_redirect_uri("https://") is False
+
+def test_is_valid_redirect_uri_http_loopback():
+    assert _is_valid_redirect_uri("http://localhost/callback") is True
+    assert _is_valid_redirect_uri("http://127.0.0.1/callback") is True
+    assert _is_valid_redirect_uri("http://[::1]/callback") is True
+    assert _is_valid_redirect_uri("http://localhost:8080/callback") is True
+
+def test_is_valid_redirect_uri_http_non_loopback():
+    assert _is_valid_redirect_uri("http://example.com/callback") is False
+    assert _is_valid_redirect_uri("http://10.0.0.1/callback") is False
+    assert _is_valid_redirect_uri("http:///callback") is False
+
+def test_is_valid_redirect_uri_rejects_fragments():
+    assert _is_valid_redirect_uri("https://example.com/callback#fragment") is False
+
+def test_is_valid_redirect_uri_rejects_credentials():
+    assert _is_valid_redirect_uri("https://user:pass@example.com/callback") is False
+    assert _is_valid_redirect_uri("https://user@example.com/callback") is False
+
+def test_is_valid_redirect_uri_custom_schemes():
+    assert _is_valid_redirect_uri("myapp://callback", frozenset(["myapp"])) is True
+    assert _is_valid_redirect_uri("myapp://callback") is False
+    assert _is_valid_redirect_uri("otherapp://callback", frozenset(["myapp"])) is False
+    assert _is_valid_redirect_uri("myapp:/callback", frozenset(["myapp"])) is True
+
+def test_is_valid_redirect_uri_unparseable():
+    # Example of a URL that urlparse rejects with ValueError in Python 3.12+ (invalid IPv6)
+    assert _is_valid_redirect_uri("https://]/") is False
+
+
+def test_base64url_json():
+    """Test that _base64url_json correctly encodes a dict to a base64url string without padding."""
+    from origo.endpoints import _base64url_json
+
+    data = {"alg": "none", "typ": "JWT"}
+    expected = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
+    assert _base64url_json(data) == expected
+
+    assert _base64url_json({}) == "e30"
 
 
 # --- Discovery ---
@@ -26,6 +117,10 @@ async def test_oauth_metadata(client_private):
     assert data["authorization_endpoint"] == "http://testserver/authorize"
     assert data["token_endpoint"] == "http://testserver/token"
     assert "authorization_code" in data["grant_types_supported"]
+    assert "refresh_token" in data["grant_types_supported"]
+    assert "jwks_uri" in data
+    assert data["jwks_uri"] == "http://testserver/.well-known/jwks.json"
+    assert data["id_token_signing_alg_values_supported"] == ["RS256"]
     assert data["code_challenge_methods_supported"] == ["S256"]
     assert "plain" not in data["code_challenge_methods_supported"]
     assert "registration_endpoint" not in data
@@ -78,6 +173,43 @@ async def test_register_public_mode(client_public):
     assert "client_id" in data
     assert "client_secret" in data
     assert provider.storage.client_exists(data["client_id"])
+
+
+@pytest.mark.asyncio
+async def test_register_respects_max_dynamic_clients_cap():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, max_dynamic_clients=2)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        client_ids = []
+        for _ in range(2):
+            resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+            assert resp.status_code == 201
+            client_ids.append(resp.json()["client_id"])
+
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        assert resp.status_code == 429
+        assert resp.json()["error"] == "server_error"
+
+    # Should reject when cap reached, keeping original items
+    assert p.storage.client_exists(client_ids[0])
+    assert p.storage.client_exists(client_ids[1])
+
+
+@pytest.mark.asyncio
+async def test_register_dynamic_client_expires_after_ttl(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, client_ttl=1)
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        client_id = resp.json()["client_id"]
+
+    assert p.storage.client_exists(client_id)
+    monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
+    assert p.storage.client_exists(client_id) is False
 
 
 @pytest.mark.asyncio
@@ -297,7 +429,7 @@ async def test_authorize_shows_consent_page(client_public):
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=False,
     )
     verifier, challenge = make_pkce_pair()
@@ -361,7 +493,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=False,
     )
     verifier, challenge = make_pkce_pair()
@@ -375,7 +507,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "response_type": "code",
             "state": "s1",
         })
-        csrf_token = get_resp.cookies.get("origo_csrf")
+        csrf_token = get_resp.cookies.get("__Host-origo_csrf")
 
         resp = await c.post("/authorize", data={
             "client_id": "c",
@@ -386,7 +518,7 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "state": "s1",
             "approved": "false",
             "csrf_token": csrf_token,
-        }, cookies={"origo_csrf": csrf_token}, follow_redirects=False)
+        }, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
     assert "error=access_denied" in resp.headers["location"]
 
@@ -428,6 +560,7 @@ async def test_token_exchange_s256(client_private):
     assert "access_token" in data
     assert data["token_type"] == "bearer"
     assert "expires_in" in data
+    assert "refresh_token" in data
 
 
 @pytest.mark.asyncio
@@ -566,7 +699,7 @@ async def test_token_client_id_mismatch():
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"client-a": "secret-a", "client-b": "secret-b"},
+        clients={"client-a": "secret-a", "client-b": "secret-b"}, client_redirect_uris={"client-a": ["https://example.com/cb"], "client-b": ["https://example.com/cb"]},
         auto_approve=True,
     )
     verifier, challenge = make_pkce_pair()
@@ -597,7 +730,7 @@ def test_no_clients_warning():
 def test_middleware_method():
     import functools
     from origo import OAuthProvider, OAuthMiddleware
-    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]})
     mw = p.middleware()
     assert isinstance(mw, functools.partial)
     assert mw.func is OAuthMiddleware
@@ -643,7 +776,7 @@ def test_cleanup_expired_codes_and_tokens():
     from unittest.mock import patch
     from origo.storage import OAuthStorage
     s = OAuthStorage()
-    s.seed_clients({"c": "s"})
+    s.seed_clients({"c": "s"}, {"c": ["https://example.com/cb"]})
     code = s.store_code("c", "https://example.com", "challenge")
     token = s.store_token("c")
     assert code in s._codes
@@ -748,6 +881,146 @@ async def test_token_exchange_rejects_resource_mismatch(client_private):
     assert resp.status_code == 401
     assert resp.json()["error"] == "invalid_grant"
 
+
+# --- Refresh token ---
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_issues_new_access_token(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+    })
+    assert first.status_code == 200
+    refresh_token = first.json()["refresh_token"]
+
+    second = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert second.status_code == 200
+    data = second.json()
+    assert "access_token" in data
+    assert data["access_token"] != first.json()["access_token"]
+    assert provider.verify_token(data["access_token"]) is not None
+    # Rotated: a new refresh token is issued and the old one is single-use.
+    assert data["refresh_token"] != refresh_token
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_preserves_resource(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    resource = "http://testserver/mcp"
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256", resource=resource)
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+        "resource": resource,
+    })
+    assert first.status_code == 200
+    refresh_token = first.json()["refresh_token"]
+
+    # Refresh without passing the resource parameter explicitly
+    second = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert second.status_code == 200
+    data = second.json()
+    assert "access_token" in data
+    meta = provider.verify_token(data["access_token"])
+    assert meta is not None
+    assert meta["resource"] == resource
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_rotates_and_invalidates_old_token(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    first = await client.post("/token", data={
+        "grant_type": "authorization_code",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": "https://example.com/cb",
+    })
+    refresh_token = first.json()["refresh_token"]
+
+    reused = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert reused.status_code == 200
+
+    reused_again = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+    assert reused_again.status_code == 401
+    assert reused_again.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_wrong_client(client_private):
+    client, provider = client_private
+    refresh_token = provider.storage.store_refresh_token("test-client")
+    provider.storage.seed_clients({"other-client": "other-secret"}, {"other-client": ["https://example.com/cb"]})
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "other-client",
+        "client_secret": "other-secret",
+        "refresh_token": refresh_token,
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_missing_token(client_private):
+    client, _ = client_private
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+    })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_grant_invalid_token(client_private):
+    client, _ = client_private
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": "bogus",
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+
+
 @pytest.mark.asyncio
 async def test_oauth_metadata_includes_cimd_and_oidc_fields():
     from origo import OAuthProvider
@@ -822,6 +1095,105 @@ async def test_authorize_accepts_cimd_client_metadata_document(monkeypatch):
         })
     assert token_resp.status_code == 200
     assert p.storage.get_client_auth_method(client_id) == "none"
+
+
+@pytest.mark.asyncio
+async def test_authorize_cimd_registration_respects_max_dynamic_clients_cap(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    def fake_fetch(url, allow_private_hosts=False):
+        return {
+            "client_id": url,
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "none",
+        }
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True, max_dynamic_clients=2)
+    verifier, challenge = make_pkce_pair()
+    client_ids = [f"https://cimd.example.com/doc-{i}.json" for i in range(3)]
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        for cid in client_ids[:2]:
+            resp = await c.get("/authorize", params={
+                "client_id": cid,
+                "redirect_uri": "https://example.com/callback",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "response_type": "code",
+            }, follow_redirects=False)
+            assert resp.status_code == 302
+
+        resp = await c.get("/authorize", params={
+            "client_id": client_ids[2],
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+        assert resp.status_code == 429
+        assert resp.json()["error"] == "server_error"
+
+    # Should reject when cap reached, keeping original items
+    assert p.storage.client_exists(client_ids[0])
+    assert p.storage.client_exists(client_ids[1])
+
+
+@pytest.mark.asyncio
+async def test_authorize_cimd_registration_expires_after_ttl(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    client_id = "https://cimd.example.com/doc.json"
+
+    def fake_fetch(url, allow_private_hosts=False):
+        return {
+            "client_id": client_id,
+            "redirect_uris": ["https://example.com/callback"],
+            "token_endpoint_auth_method": "none",
+        }
+
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
+    p = OAuthProvider(base_url="http://testserver", public_registration=True, auto_approve=True, client_ttl=1)
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        await c.get("/authorize", params={
+            "client_id": client_id,
+            "redirect_uri": "https://example.com/callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        }, follow_redirects=False)
+
+    assert p.storage.client_exists(client_id)
+    monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
+    assert p.storage.client_exists(client_id) is False
+
+
+@pytest.mark.asyncio
+async def test_preregistered_clients_not_evicted_by_dynamic_registration_cap_or_ttl(monkeypatch):
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"preseeded-client": "preseeded-secret"}, client_redirect_uris={"preseeded-client": ["https://example.com/callback"]},
+        public_registration=True,
+        max_dynamic_clients=1,
+        client_ttl=1,
+    )
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+        assert resp.status_code == 201
+
+        for _ in range(2):
+            resp = await c.post("/register", json={"redirect_uris": ["https://example.com/cb"]})
+            assert resp.status_code == 429
+
+    assert p.storage.client_exists("preseeded-client")
+    monkeypatch.setattr("origo.storage._now", lambda: 9999999999.0)
+    assert p.storage.client_exists("preseeded-client")
+    assert p.storage.get_client_secret("preseeded-client") == "preseeded-secret"
 
 
 def test_is_public_host_rejects_private_and_loopback_targets():
@@ -1000,7 +1372,7 @@ async def test_openid_userinfo_and_id_token():
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=True,
         scopes_supported=["openid", "email"],
         user_email="user@example.com",
@@ -1029,6 +1401,18 @@ async def test_openid_userinfo_and_id_token():
         token_data = token_resp.json()
         assert token_data["scope"] == "openid email"
         assert "id_token" in token_data
+
+        parts = token_data["id_token"].split(".")
+        assert len(parts) == 3
+
+        jwks_resp = await c.get("/.well-known/jwks.json")
+        assert jwks_resp.status_code == 200
+        jwks_data = jwks_resp.json()
+        assert "keys" in jwks_data
+        assert len(jwks_data["keys"]) == 1
+        assert jwks_data["keys"][0]["kty"] == "RSA"
+        assert jwks_data["keys"][0]["kid"] == "origo-1"
+
         userinfo = await c.get("/userinfo", headers={"Authorization": f"Bearer {token_data['access_token']}"})
     assert userinfo.status_code == 200
     assert userinfo.json()["email"] == "user@example.com"
@@ -1040,7 +1424,7 @@ async def test_authorize_rejects_unsupported_scope():
     from httpx import ASGITransport, AsyncClient
     p = OAuthProvider(
         base_url="http://testserver",
-        clients={"c": "s"},
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb", "https://example.com/callback", "myapp://callback"]},
         auto_approve=True,
         scopes_supported=["files:read"],
     )
@@ -1089,7 +1473,7 @@ async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch
         raise AssertionError("Should not be called when public_registration=False")
 
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fake_fetch)
-    p = OAuthProvider(base_url="http://testserver", public_registration=False, auto_approve=True, clients={"existing": "secret"})
+    p = OAuthProvider(base_url="http://testserver", public_registration=False, auto_approve=True, clients={"existing": "secret"}, client_redirect_uris={"existing": ["https://example.com/cb"]})
     verifier, challenge = make_pkce_pair()
     async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
         resp = await c.get("/authorize", params={
