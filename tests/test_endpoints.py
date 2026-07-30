@@ -428,6 +428,9 @@ async def test_authorize_shows_consent_page(client_public):
         })
     assert resp.status_code == 200
     assert b"<form" in resp.content
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp.headers.get("Content-Security-Policy") == "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none';"
 
 
 @pytest.mark.asyncio
