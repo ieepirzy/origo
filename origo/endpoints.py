@@ -62,7 +62,10 @@ def _build_redirect(uri: str, params: dict) -> str:
         parts = urlparse(uri)
     except ValueError as e:
         raise ValueError(f"Invalid redirect URI: {e}") from e
-    qs = urlencode(parse_qsl(parts.query) + list(params.items()))
+    try:
+        qs = urlencode(parse_qsl(parts.query) + list(params.items()))
+    except UnicodeEncodeError as e:
+        raise ValueError(f"Invalid characters in parameters: {e}") from e
     return urlunparse(parts._replace(query=qs))
 
 
