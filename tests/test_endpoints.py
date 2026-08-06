@@ -1473,3 +1473,41 @@ async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch
         }, follow_redirects=False)
     assert resp.status_code == 401
     assert resp.json()["error"] == "unauthorized_client"
+
+@pytest.mark.asyncio
+async def test_authorize_post_consent_form_includes_response_type(client_public):
+    # Ensure the manual consent form correctly passes response_type so it doesn't fail with 400
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    import re
+
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb"]},
+        auto_approve=False,
+    )
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        get_resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+            "state": "s1",
+        })
+        assert get_resp.status_code == 200
+
+        csrf_token = get_resp.cookies.get("__Host-origo_csrf")
+
+        # Extract inputs from HTML
+        inputs = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', get_resp.text))
+        assert "response_type" in inputs
+        assert inputs["response_type"] == "code"
+
+        post_data = inputs.copy()
+        post_data["approved"] = "true"
+
+        post_resp = await c.post("/authorize", data=post_data, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
+        assert post_resp.status_code == 302
+        assert "code=" in post_resp.headers["Location"]
