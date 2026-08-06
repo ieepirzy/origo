@@ -407,7 +407,7 @@ async def register(request: Request) -> JSONResponse:
 # --- Authorize ---
 
 def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
-    expected_params = ["client_id", "redirect_uri", "code_challenge", "code_challenge_method", "state", "resource", "scope"]
+    expected_params = ["client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "state", "resource", "scope"]
     hidden = "\n".join(
         f'<input type="hidden" name="{html.escape(str(k))}" value="{html.escape(str(params.get(k, "")))}">'
         for k in expected_params if k in params
