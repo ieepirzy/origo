@@ -430,7 +430,33 @@ async def test_authorize_shows_consent_page(client_public):
     assert b"<form" in resp.content
     assert resp.headers.get("X-Frame-Options") == "DENY"
     assert resp.headers.get("X-Content-Type-Options") == "nosniff"
-    assert resp.headers.get("Content-Security-Policy") == "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none';"
+    # form-action must include the (already allowlist-validated) redirect
+    # origin: Chromium enforces form-action against the redirect following
+    # the form submission, so 'self' alone dead-ends the consent flow.
+    assert resp.headers.get("Content-Security-Policy") == "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://example.com; frame-ancestors 'none';"
+
+
+@pytest.mark.asyncio
+async def test_consent_page_form_action_for_custom_scheme_redirect():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"}, client_redirect_uris={"c": ["myapp://callback"]},
+        custom_redirect_uri_schemes=["myapp"],
+        auto_approve=False,
+    )
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "myapp://callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        })
+    assert resp.status_code == 200
+    assert "form-action 'self' myapp://callback;" in resp.headers.get("Content-Security-Policy", "")
 
 
 @pytest.mark.asyncio
