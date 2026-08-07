@@ -34,12 +34,15 @@ class OAuthStorage:
     # --- Clients ---
 
     def seed_clients(self, clients: dict[str, str], redirect_uris: Optional[dict[str, list[str]]] = None) -> None:
-        """Seed pre-registered clients. Empty redirect_uris means any URI is allowed."""
+        """Seed pre-registered clients. A client seeded with an empty redirect_uris
+        list fails closed: is_redirect_uri_allowed() will reject every redirect_uri
+        for it, so it cannot complete /authorize until explicit URIs are configured."""
         redirect_uris = redirect_uris or {}
         if clients and not any(redirect_uris.values()):
             warnings.warn(
                 "OAuthProvider: clients seeded with no redirect_uris — "
-                "any redirect_uri will be accepted. Specify allowed URIs in production.",
+                "they will reject every redirect_uri at /authorize (fail closed). "
+                "Specify allowed URIs in production.",
                 UserWarning,
                 stacklevel=3,
             )
@@ -60,7 +63,8 @@ class OAuthStorage:
             if not allowed_redirect_uris:
                 warnings.warn(
                     f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
-                    "any redirect_uri will be accepted. Specify allowed URIs in production.",
+                    "it will reject every redirect_uri at /authorize (fail closed). "
+                    "Specify allowed URIs to make it usable.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -128,7 +132,13 @@ class OAuthStorage:
         return self._get_client(client_id) is not None
 
     def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
-        """Return True if redirect_uri is allowed for the client."""
+        """Return True if redirect_uri is allowed for the client.
+
+        Fails closed: a client whose redirect_uris list is empty (e.g. seeded
+        without explicit URIs) has no allowlist to match against, so every
+        redirect_uri is rejected for it — this does not grant an "accept any
+        redirect_uri" escape hatch.
+        """
         entry = self._get_client(client_id)
         if entry is None:
             return False
