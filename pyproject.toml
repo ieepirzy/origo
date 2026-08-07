@@ -29,11 +29,17 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-fastmcp = ["fastmcp>=2.0.0"]
+# Floor verified against fastmcp source tags, not guessed: TokenVerifier
+# exists from 2.11.0, but AccessToken only gained the `claims` field the
+# adapter depends on in 2.12.0 (2.11.0 re-exports the mcp SDK's claims-less
+# AccessToken, which would silently discard the metadata hosts use to
+# distinguish origo credentials). test_fastmcp_auth.py passes against
+# 2.12.0 exactly.
+fastmcp = ["fastmcp>=2.12.0"]
 fastapi = ["fastapi>=0.100.0"]
 # fastmcp is in dev so tests/test_fastmcp_auth.py actually runs in CI —
 # it importorskips, so its absence would silently skip the adapter's tests.
-dev = ["pytest", "pytest-asyncio", "httpx", "pytest-cov", "fastmcp>=2.0.0"]
+dev = ["pytest", "pytest-asyncio", "httpx", "pytest-cov", "fastmcp>=2.12.0"]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/origo"
