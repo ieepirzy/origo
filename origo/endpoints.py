@@ -406,6 +406,23 @@ async def register(request: Request) -> JSONResponse:
 
 # --- Authorize ---
 
+def _form_action_source(redirect_uri: str) -> str:
+    """CSP source expression for the redirect URI's origin ('' if unusable).
+
+    A custom-scheme URI (myapp://callback) yields its scheme://host form; a
+    bare-scheme URI degrades to 'scheme:', both valid CSP source expressions.
+    """
+    try:
+        parts = urlparse(redirect_uri)
+    except ValueError:
+        return ""
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    if parts.scheme:
+        return f"{parts.scheme}:"
+    return ""
+
+
 def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     expected_params = ["client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "state", "resource", "scope"]
     hidden = "\n".join(
@@ -446,7 +463,21 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     response.set_cookie("__Host-origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none';"
+    # form-action must include the redirect target's origin, not just 'self':
+    # Chromium enforces form-action against the redirect that FOLLOWS the
+    # form submission (unlike Firefox — long-standing spec dispute), so with
+    # 'self' alone the 302 from POST /authorize back to the OAuth client's
+    # callback is silently blocked and the consent flow dead-ends on the
+    # consent page. Reproduced with real Chromium (miradeploy, 2026-08-07):
+    # 'self' alone → blocked with a form-action console violation; 'self'
+    # plus the callback origin → flow completes. Including the origin is
+    # safe: by the time the consent page renders, redirect_uri has already
+    # been validated against the client's registered allowlist.
+    redirect_source = _form_action_source(str(params.get("redirect_uri", "")))
+    form_action = "'self'" + (f" {redirect_source}" if redirect_source else "")
+    response.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; frame-ancestors 'none';"
+    )
     return response
 
 
