@@ -185,7 +185,7 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
             if "json" not in content_type:
                 return None
             body = response.read(65536)
-    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, http.client.InvalidURL, ValueError):
         return None
 
     try:
