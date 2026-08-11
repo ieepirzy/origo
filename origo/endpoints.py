@@ -460,7 +460,7 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
 </body>
 </html>"""
     response = HTMLResponse(page_html)
-    response.set_cookie("__Host-origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True)
+    response.set_cookie("__Host-origo_csrf", csrf_token, httponly=True, samesite="lax", max_age=300, secure=True, path="/")
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     # form-action must include the redirect target's origin, not just 'self':
