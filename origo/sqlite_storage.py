@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS consumed_refresh_tokens (
     family TEXT NOT NULL,
     retain_until REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS revoked_families (
+    family TEXT PRIMARY KEY,
+    retain_until REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_tokens_family ON tokens (family);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens (family);
 """
@@ -275,6 +279,7 @@ class SQLiteOAuthStorage:
             self._conn.execute("DELETE FROM tokens WHERE expires_at <= ?", (now,))
             self._conn.execute("DELETE FROM refresh_tokens WHERE expires_at <= ?", (now,))
             self._conn.execute("DELETE FROM consumed_refresh_tokens WHERE retain_until <= ?", (now,))
+            self._conn.execute("DELETE FROM revoked_families WHERE retain_until <= ?", (now,))
             if self.client_ttl is not None:
                 self._conn.execute(
                     "DELETE FROM clients WHERE registered_at + ? <= ?", (self.client_ttl, now)
@@ -343,10 +348,21 @@ class SQLiteOAuthStorage:
         token = secrets.token_urlsafe(48)
         with self._lock:
             self._cleanup_expired()
-            self._conn.execute(
-                "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)",
-                (_hash(token), client_id, resource, scope, _mem._now() + self.token_ttl, family),
-            )
+            # Check-and-insert in one IMMEDIATE transaction: a concurrent
+            # process's family revocation either lands before (we refuse) or
+            # after (its DELETE sweeps this row) — never between.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if family is not None and self._family_revoked_locked(family):
+                    raise _mem.FamilyRevokedError(family)
+                self._conn.execute(
+                    "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)",
+                    (_hash(token), client_id, resource, scope, _mem._now() + self.token_ttl, family),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
         return token
 
     def verify_token(self, token: str) -> Optional[dict]:
@@ -379,17 +395,25 @@ class SQLiteOAuthStorage:
         token = secrets.token_urlsafe(48)
         with self._lock:
             self._cleanup_expired()
-            self._conn.execute(
-                "INSERT INTO refresh_tokens VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    _hash(token),
-                    client_id,
-                    resource,
-                    scope,
-                    _mem._now() + self.refresh_token_ttl,
-                    family or secrets.token_urlsafe(16),
-                ),
-            )
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if family is not None and self._family_revoked_locked(family):
+                    raise _mem.FamilyRevokedError(family)
+                self._conn.execute(
+                    "INSERT INTO refresh_tokens VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _hash(token),
+                        client_id,
+                        resource,
+                        scope,
+                        _mem._now() + self.refresh_token_ttl,
+                        family or secrets.token_urlsafe(16),
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
         return token
 
     def exchange_refresh_token(self, refresh_token: str) -> Optional[dict]:
@@ -435,11 +459,24 @@ class SQLiteOAuthStorage:
             "family": row["family"],
         }
 
+    def _family_revoked_locked(self, family: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM revoked_families WHERE family = ? AND retain_until > ?",
+            (family, _mem._now()),
+        ).fetchone()
+        return row is not None
+
     def _revoke_family_locked(self, family: Optional[str]) -> None:
         if not family:
             return
         self._conn.execute("DELETE FROM refresh_tokens WHERE family = ?", (family,))
         self._conn.execute("DELETE FROM tokens WHERE family = ?", (family,))
+        # Persistent marker: an in-flight refresh that already exchanged this
+        # family's token must not be able to mint replacements afterwards.
+        self._conn.execute(
+            "INSERT OR REPLACE INTO revoked_families VALUES (?, ?)",
+            (family, _mem._now() + self.refresh_token_ttl),
+        )
 
     def revoke_family(self, family: Optional[str]) -> None:
         """Revoke every live refresh and access token belonging to a family."""

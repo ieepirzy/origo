@@ -81,7 +81,6 @@ class OAuthProvider:
         auto_approve: bool = False,
         token_ttl: int = 3600,
         refresh_token_ttl: int = 30 * 24 * 3600,
-        storage_path: Optional[str] = None,
         client_ttl: Optional[int] = None,
         max_dynamic_clients: int = 1000,
         mcp_path: str = "/mcp",
@@ -91,6 +90,9 @@ class OAuthProvider:
         user_subject: Optional[str] = None,
         allow_private_cimd: bool = False,
         custom_redirect_uri_schemes: Optional[list[str]] = None,
+        # New parameters go at the end: inserting one mid-signature would
+        # silently rebind existing callers' positional arguments.
+        storage_path: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration

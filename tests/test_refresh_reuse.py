@@ -51,10 +51,85 @@ def test_replay_does_not_touch_other_families(storage):
     assert storage.verify_token(bystander_access) is not None
 
 
+def test_revoked_family_refuses_new_issuance(storage):
+    """The revoked-family marker closes the exchange/issuance race: a caller
+    that exchanged a refresh token before a concurrent replay revoked the
+    family must not be able to mint replacements afterwards."""
+    from origo.storage import FamilyRevokedError
+
+    old = storage.store_refresh_token("c")
+    family = storage.exchange_refresh_token(old)["family"]
+    storage.revoke_family(family)
+
+    with pytest.raises(FamilyRevokedError):
+        storage.store_token("c", family=family)
+    with pytest.raises(FamilyRevokedError):
+        storage.store_refresh_token("c", family=family)
+    # Unrelated (and family-less) issuance is unaffected.
+    assert storage.store_token("c", family="other")
+    assert storage.store_token("c")
+
+
+def test_sqlite_cross_process_race_cannot_outlive_revocation(tmp_path):
+    """Two connections on one file, interleaved like two processes: A
+    exchanges, B replays the same token (reuse -> family revoked), then A
+    tries to mint replacements — A must fail, not resurrect the family."""
+    from origo.storage import FamilyRevokedError
+
+    db = str(tmp_path / "origo.db")
+    proc_a = SQLiteOAuthStorage(db)
+    proc_b = SQLiteOAuthStorage(db)
+
+    stolen = proc_a.store_refresh_token("c")
+    entry = proc_a.exchange_refresh_token(stolen)  # A wins the exchange
+    assert proc_b.exchange_refresh_token(stolen) is None  # B replays -> revokes family
+    with pytest.raises(FamilyRevokedError):
+        proc_a.store_refresh_token("c", family=entry["family"])
+    with pytest.raises(FamilyRevokedError):
+        proc_a.store_token("c", family=entry["family"])
+
+
 def test_unknown_refresh_token_revokes_nothing(storage):
     live = storage.store_refresh_token("c")
     assert storage.exchange_refresh_token("never-issued") is None
     assert storage.exchange_refresh_token(live) is not None
+
+
+async def test_endpoint_maps_family_revoked_to_401(monkeypatch):
+    """If the family is revoked between exchange and issuance, /token answers
+    401 invalid_grant, not a 500."""
+    from origo.storage import FamilyRevokedError
+    from httpx import ASGITransport, AsyncClient
+
+    provider = OAuthProvider(
+        base_url="http://testserver",
+        clients={"test-client": "test-secret"},
+        client_redirect_uris={"test-client": ["https://example.com/cb"]},
+        auto_approve=True,
+    )
+    storage = provider.storage
+    real_exchange = storage.exchange_refresh_token
+
+    def exchange_then_lose_race(token):
+        entry = real_exchange(token)
+        if entry is not None:
+            storage.revoke_family(entry["family"])  # concurrent replay wins
+        return entry
+
+    monkeypatch.setattr(storage, "exchange_refresh_token", exchange_then_lose_race)
+
+    refresh_token = storage.store_refresh_token("test-client")
+    async with AsyncClient(
+        transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver"
+    ) as client:
+        resp = await client.post("/token", data={
+            "grant_type": "refresh_token",
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+            "refresh_token": refresh_token,
+        })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
 
 
 async def test_endpoint_refresh_reuse_revokes_family():

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from .storage import OAuthStorage
+from .storage import FamilyRevokedError, OAuthStorage
 
 import base64
 import asyncio
@@ -677,8 +677,14 @@ async def token(request: Request) -> JSONResponse:
         scope = refresh_entry.get("scope", "")
         token_family = refresh_entry.get("family") or secrets.token_urlsafe(16)
 
-    access_token = storage.store_token(client_id, resource=resource, scope=scope, family=token_family)
-    new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope, family=token_family)
+    try:
+        access_token = storage.store_token(client_id, resource=resource, scope=scope, family=token_family)
+        new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope, family=token_family)
+    except FamilyRevokedError:
+        # The family was revoked between our refresh-token exchange and the
+        # replacement issuance (a concurrent replay tripped reuse detection).
+        # Refuse issuance — the losing side of that race gets no live tokens.
+        return JSONResponse({"error": "invalid_grant", "error_description": "Token family has been revoked."}, status_code=401)
 
     response_body = {
         "access_token": access_token,

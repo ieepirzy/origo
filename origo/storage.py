@@ -10,6 +10,17 @@ def _now() -> float:
     return time.time()
 
 
+class FamilyRevokedError(Exception):
+    """Raised when issuing a token into a family that has been revoked.
+
+    Revocation and issuance can race: one caller can be between "exchange the
+    refresh token" and "mint the replacements" while another caller's replay
+    of a stolen token revokes the family. The revoked-family marker makes the
+    losing side of that race fail here instead of issuing live tokens into a
+    dead family.
+    """
+
+
 def _secret_matches(stored: str, presented: str) -> bool:
     try:
         if not isinstance(stored, str) or not isinstance(presented, str):
@@ -40,11 +51,13 @@ class OAuthStorage:
         # reuse (theft signal) and the whole token family revoked, per the
         # OAuth 2.1 refresh-token rotation guidance.
         self._consumed_refresh_tokens: dict[str, dict] = {}  # refresh_token -> {family, retain_until}
+        self._revoked_families: dict[str, float] = {}  # family -> retain_until
         self._clients_expiry: deque = deque()
         self._codes_expiry: deque = deque()
         self._tokens_expiry: deque = deque()
         self._refresh_tokens_expiry: deque = deque()
         self._consumed_refresh_expiry: deque = deque()
+        self._revoked_families_expiry: deque = deque()
 
     # --- Clients ---
 
@@ -197,6 +210,12 @@ class OAuthStorage:
             if k in self._consumed_refresh_tokens and self._consumed_refresh_tokens[k]["retain_until"] == exp:
                 del self._consumed_refresh_tokens[k]
 
+        # Clean up revoked-family markers
+        while self._revoked_families_expiry and self._revoked_families_expiry[0][1] <= now:
+            k, exp = self._revoked_families_expiry.popleft()
+            if self._revoked_families.get(k) == exp:
+                del self._revoked_families[k]
+
         # Clean up clients
         if self.client_ttl is not None:
             while self._clients_expiry and self._clients_expiry[0][1] <= now:
@@ -245,6 +264,8 @@ class OAuthStorage:
 
     def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
         self._cleanup_expired()
+        if family is not None and family in self._revoked_families:
+            raise FamilyRevokedError(family)
         token = secrets.token_urlsafe(48)
         expires_at = _now() + self.token_ttl
         self._tokens[token] = {
@@ -273,6 +294,8 @@ class OAuthStorage:
         """Store a refresh token. `family` groups a token with every token
         rotated from the same original grant; one is generated when omitted."""
         self._cleanup_expired()
+        if family is not None and family in self._revoked_families:
+            raise FamilyRevokedError(family)
         token = secrets.token_urlsafe(48)
         expires_at = _now() + self.refresh_token_ttl
         self._refresh_tokens[token] = {
@@ -313,10 +336,15 @@ class OAuthStorage:
         return entry
 
     def revoke_family(self, family: Optional[str]) -> None:
-        """Revoke every live refresh and access token belonging to a family."""
+        """Revoke every live refresh and access token belonging to a family,
+        and mark the family so no new tokens can be issued into it (closes the
+        race where an in-flight refresh mints replacements after revocation)."""
         if not family:
             return
         for k in [k for k, v in self._refresh_tokens.items() if v.get("family") == family]:
             del self._refresh_tokens[k]
         for k in [k for k, v in self._tokens.items() if v.get("family") == family]:
             del self._tokens[k]
+        retain_until = _now() + self.refresh_token_ttl
+        self._revoked_families[family] = retain_until
+        self._revoked_families_expiry.append((family, retain_until))
