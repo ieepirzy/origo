@@ -1,4 +1,6 @@
 import functools
+import hashlib
+import os
 import warnings
 from typing import Optional
 
@@ -18,6 +20,35 @@ from .endpoints import (
 from .middleware import OAuthMiddleware
 from .sqlite_storage import SQLiteOAuthStorage
 from .storage import OAuthStorage
+
+# Distinguishes "storage_path not passed" (persist by default, at an
+# automatically-derived path) from the explicit, permanent opt-out
+# storage_path=None (always in-memory). A plain default of None could not
+# make that distinction.
+_AUTO_STORAGE_PATH = object()
+
+
+def _default_storage_dir() -> Optional[str]:
+    """Directory persistent storage defaults into when storage_path isn't
+    passed. ORIGO_STORAGE_PATH overrides it; set to the empty string, it
+    forces in-memory storage without touching code (an operational opt-out
+    alongside the code-level storage_path=None one)."""
+    if "ORIGO_STORAGE_PATH" in os.environ:
+        env_value = os.environ["ORIGO_STORAGE_PATH"]
+        return env_value or None
+    return ".origo"
+
+
+def _default_storage_path(base_url: str, mcp_path: str) -> Optional[str]:
+    """A default per-deployment file path, namespaced by the one pair of
+    values that already identifies an OAuthProvider instance. Hashed rather
+    than used verbatim so the path never embeds a public URL directly on
+    disk, and so it's filesystem-safe regardless of what base_url looks like."""
+    base_dir = _default_storage_dir()
+    if base_dir is None:
+        return None
+    digest = hashlib.sha256(f"{base_url}|{mcp_path}".encode()).hexdigest()[:16]
+    return os.path.join(base_dir, f"{digest}.db")
 
 
 class OAuthProvider:
@@ -39,12 +70,17 @@ class OAuthProvider:
                              /token request (a new one is issued each time).
                              Replaying an already-used refresh token revokes
                              every token descended from the same grant.
-        storage_path:        Optional path to a SQLite database file. When set,
-                             tokens, refresh tokens, and dynamically-registered
-                             clients persist across restarts (stored hashed, in
-                             a 0600-mode file) instead of living in memory —
-                             still in-process, no extra service. Default None
-                             (in-memory storage; everything is lost on restart).
+        storage_path:        Path to a SQLite database file for persistent storage
+                             (tokens, refresh tokens, and dynamically-registered
+                             clients survive restarts — stored hashed, in a
+                             0600-mode file — instead of living in memory; still
+                             in-process, no extra service). When omitted (the
+                             default), origo persists automatically to a path
+                             derived from base_url/mcp_path under ./.origo (see
+                             ORIGO_STORAGE_PATH in the README to relocate or
+                             disable this without a code change). Pass
+                             storage_path=None explicitly to force in-memory
+                             storage regardless of that default.
         client_ttl:          Lifetime in seconds for dynamically-registered clients
                              (via DCR /register or CIMD auto-registration). Default
                              None (no expiration). Pre-registered clients passed via
@@ -92,7 +128,7 @@ class OAuthProvider:
         custom_redirect_uri_schemes: Optional[list[str]] = None,
         # New parameters go at the end: inserting one mid-signature would
         # silently rebind existing callers' positional arguments.
-        storage_path: Optional[str] = None,
+        storage_path: Optional[str] = _AUTO_STORAGE_PATH,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -117,31 +153,61 @@ class OAuthProvider:
                 schemes.append(sanitized)
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
-        if storage_path is not None:
-            self.storage = SQLiteOAuthStorage(
-                storage_path,
+        is_auto = storage_path is _AUTO_STORAGE_PATH
+        resolved_path = _default_storage_path(self.base_url, self.mcp_path) if is_auto else storage_path
+
+        def _memory_storage() -> OAuthStorage:
+            return OAuthStorage(
                 token_ttl=token_ttl,
                 refresh_token_ttl=refresh_token_ttl,
                 client_ttl=client_ttl,
                 max_dynamic_clients=max_dynamic_clients,
             )
-            if public_registration and client_ttl is None:
+
+        if resolved_path is None:
+            # Either an explicit storage_path=None (permanent code-level
+            # opt-out) or the ORIGO_STORAGE_PATH="" operational opt-out.
+            self.storage = _memory_storage()
+        else:
+            try:
+                storage_dir = os.path.dirname(resolved_path)
+                if storage_dir:
+                    os.makedirs(storage_dir, exist_ok=True)
+                self.storage = SQLiteOAuthStorage(
+                    resolved_path,
+                    token_ttl=token_ttl,
+                    refresh_token_ttl=refresh_token_ttl,
+                    client_ttl=client_ttl,
+                    max_dynamic_clients=max_dynamic_clients,
+                )
+            except OSError as exc:
+                if not is_auto:
+                    # storage_path was passed explicitly: persistence was
+                    # requested, not merely defaulted, so a failure to
+                    # provide it must not be silently downgraded.
+                    raise
                 warnings.warn(
-                    "OAuthProvider: public_registration=True with persistent storage "
-                    "and no client_ttl — dynamically-registered clients now survive "
-                    "restarts, so once max_dynamic_clients is reached registration "
-                    "stays blocked forever (a restart no longer clears it). Set "
-                    "client_ttl so abandoned registrations expire.",
+                    f"OAuthProvider: could not initialize persistent storage at "
+                    f"'{resolved_path}' ({exc}) — falling back to in-memory "
+                    f"storage for this run (tokens will not survive a restart). "
+                    f"Pass storage_path=None to choose in-memory storage "
+                    f"deliberately and silence this warning, or fix/relocate the "
+                    f"path via the ORIGO_STORAGE_PATH environment variable.",
                     UserWarning,
                     stacklevel=2,
                 )
-        else:
-            self.storage = OAuthStorage(
-                token_ttl=token_ttl,
-                refresh_token_ttl=refresh_token_ttl,
-                client_ttl=client_ttl,
-                max_dynamic_clients=max_dynamic_clients,
-            )
+                self.storage = _memory_storage()
+            else:
+                if public_registration and client_ttl is None:
+                    warnings.warn(
+                        "OAuthProvider: public_registration=True with persistent storage "
+                        "and no client_ttl — dynamically-registered clients now survive "
+                        "restarts, so once max_dynamic_clients is reached registration "
+                        "stays blocked forever (a restart no longer clears it). Set "
+                        "client_ttl so abandoned registrations expire.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
         if clients:
             self.storage.seed_clients(clients, client_redirect_uris)

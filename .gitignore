@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Default local SQLite storage path when running/importing origo without
+# storage_path set — a stray dev run should never end up in a commit.
+.origo/
+
 # C extensions
 *.so
 
