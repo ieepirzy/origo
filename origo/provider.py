@@ -16,6 +16,7 @@ from .endpoints import (
     userinfo,
 )
 from .middleware import OAuthMiddleware
+from .sqlite_storage import SQLiteOAuthStorage
 from .storage import OAuthStorage
 
 
@@ -36,15 +37,23 @@ class OAuthProvider:
         refresh_token_ttl:   Refresh token lifetime in seconds. Default 30 days.
                              Refresh tokens are single-use and rotated on every
                              /token request (a new one is issued each time).
+                             Replaying an already-used refresh token revokes
+                             every token descended from the same grant.
+        storage_path:        Optional path to a SQLite database file. When set,
+                             tokens, refresh tokens, and dynamically-registered
+                             clients persist across restarts (stored hashed, in
+                             a 0600-mode file) instead of living in memory —
+                             still in-process, no extra service. Default None
+                             (in-memory storage; everything is lost on restart).
         client_ttl:          Lifetime in seconds for dynamically-registered clients
                              (via DCR /register or CIMD auto-registration). Default
                              None (no expiration). Pre-registered clients passed via
                              `clients=` are always permanent and unaffected.
         max_dynamic_clients: Maximum number of dynamically-registered clients (DCR
-                             and CIMD) kept in memory at once; the oldest is evicted
-                             when a new one would exceed this cap. Default 1000.
-                             Pre-registered clients passed via `clients=` don't count
-                             against this cap.
+                             and CIMD) kept at once; registration attempts past the
+                             cap are rejected (HTTP 429) until existing ones expire
+                             via client_ttl. Default 1000. Pre-registered clients
+                             passed via `clients=` don't count against this cap.
         mcp_path:            Path where MCP endpoint is mounted. Default "/mcp".
         scopes_supported:    OAuth scopes advertised to clients.
         resource_documentation: Optional protected resource documentation URL.
@@ -72,6 +81,7 @@ class OAuthProvider:
         auto_approve: bool = False,
         token_ttl: int = 3600,
         refresh_token_ttl: int = 30 * 24 * 3600,
+        storage_path: Optional[str] = None,
         client_ttl: Optional[int] = None,
         max_dynamic_clients: int = 1000,
         mcp_path: str = "/mcp",
@@ -105,12 +115,31 @@ class OAuthProvider:
                 schemes.append(sanitized)
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
-        self.storage = OAuthStorage(
-            token_ttl=token_ttl,
-            refresh_token_ttl=refresh_token_ttl,
-            client_ttl=client_ttl,
-            max_dynamic_clients=max_dynamic_clients,
-        )
+        if storage_path is not None:
+            self.storage = SQLiteOAuthStorage(
+                storage_path,
+                token_ttl=token_ttl,
+                refresh_token_ttl=refresh_token_ttl,
+                client_ttl=client_ttl,
+                max_dynamic_clients=max_dynamic_clients,
+            )
+            if public_registration and client_ttl is None:
+                warnings.warn(
+                    "OAuthProvider: public_registration=True with persistent storage "
+                    "and no client_ttl — dynamically-registered clients now survive "
+                    "restarts, so once max_dynamic_clients is reached registration "
+                    "stays blocked forever (a restart no longer clears it). Set "
+                    "client_ttl so abandoned registrations expire.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        else:
+            self.storage = OAuthStorage(
+                token_ttl=token_ttl,
+                refresh_token_ttl=refresh_token_ttl,
+                client_ttl=client_ttl,
+                max_dynamic_clients=max_dynamic_clients,
+            )
 
         if clients:
             self.storage.seed_clients(clients, client_redirect_uris)

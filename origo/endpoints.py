@@ -631,8 +631,7 @@ async def token(request: Request) -> JSONResponse:
     if client_auth_method != "none":
         if not client_secret:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
-        stored_secret = storage.get_client_secret(client_id)
-        if stored_secret is None or not _safe_compare_digest(stored_secret, client_secret):
+        if not storage.verify_client_secret(client_id, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
     if grant_type == "authorization_code":
@@ -657,6 +656,9 @@ async def token(request: Request) -> JSONResponse:
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=401)
 
         scope = code_entry.get("scope", "")
+        # New grant: start a fresh token family. Every token rotated from this
+        # grant shares the id, so refresh-token reuse can revoke them together.
+        token_family = secrets.token_urlsafe(16)
     else:
         # Exchange (and rotate) refresh token
         refresh_entry = storage.exchange_refresh_token(refresh_token)
@@ -673,9 +675,10 @@ async def token(request: Request) -> JSONResponse:
             return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
 
         scope = refresh_entry.get("scope", "")
+        token_family = refresh_entry.get("family") or secrets.token_urlsafe(16)
 
-    access_token = storage.store_token(client_id, resource=resource, scope=scope)
-    new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope)
+    access_token = storage.store_token(client_id, resource=resource, scope=scope, family=token_family)
+    new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope, family=token_family)
 
     response_body = {
         "access_token": access_token,

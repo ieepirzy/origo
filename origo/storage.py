@@ -1,3 +1,4 @@
+import hmac
 import secrets
 import time
 import warnings
@@ -7,6 +8,15 @@ from collections import deque
 
 def _now() -> float:
     return time.time()
+
+
+def _secret_matches(stored: str, presented: str) -> bool:
+    try:
+        if not isinstance(stored, str) or not isinstance(presented, str):
+            return False
+        return hmac.compare_digest(stored.encode("utf-8"), presented.encode("utf-8"))
+    except Exception:
+        return False
 
 
 class OAuthStorage:
@@ -26,10 +36,15 @@ class OAuthStorage:
         self._codes: dict[str, dict] = {}          # code -> metadata
         self._tokens: dict[str, dict] = {}         # token -> metadata
         self._refresh_tokens: dict[str, dict] = {}  # refresh_token -> metadata
+        # Rotated-out refresh tokens, kept so a replay can be recognized as
+        # reuse (theft signal) and the whole token family revoked, per the
+        # OAuth 2.1 refresh-token rotation guidance.
+        self._consumed_refresh_tokens: dict[str, dict] = {}  # refresh_token -> {family, retain_until}
         self._clients_expiry: deque = deque()
         self._codes_expiry: deque = deque()
         self._tokens_expiry: deque = deque()
         self._refresh_tokens_expiry: deque = deque()
+        self._consumed_refresh_expiry: deque = deque()
 
     # --- Clients ---
 
@@ -120,6 +135,14 @@ class OAuthStorage:
         entry = self._get_client(client_id)
         return entry["secret"] if entry else None
 
+    def verify_client_secret(self, client_id: str, client_secret: str) -> bool:
+        """Constant-time check of a presented client_secret. False for unknown
+        clients and for public (secret-less) clients."""
+        entry = self._get_client(client_id)
+        if entry is None or entry["secret"] is None:
+            return False
+        return _secret_matches(entry["secret"], client_secret)
+
     def get_client_auth_method(self, client_id: str) -> Optional[str]:
         entry = self._get_client(client_id)
         return entry.get("token_endpoint_auth_method", "client_secret_post") if entry else None
@@ -168,6 +191,12 @@ class OAuthStorage:
             if k in self._refresh_tokens and self._refresh_tokens[k]["expires_at"] == exp:
                 del self._refresh_tokens[k]
 
+        # Clean up consumed-refresh-token markers
+        while self._consumed_refresh_expiry and self._consumed_refresh_expiry[0][1] <= now:
+            k, exp = self._consumed_refresh_expiry.popleft()
+            if k in self._consumed_refresh_tokens and self._consumed_refresh_tokens[k]["retain_until"] == exp:
+                del self._consumed_refresh_tokens[k]
+
         # Clean up clients
         if self.client_ttl is not None:
             while self._clients_expiry and self._clients_expiry[0][1] <= now:
@@ -214,7 +243,7 @@ class OAuthStorage:
 
     # --- Tokens ---
 
-    def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "") -> str:
+    def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
         self._cleanup_expired()
         token = secrets.token_urlsafe(48)
         expires_at = _now() + self.token_ttl
@@ -223,6 +252,7 @@ class OAuthStorage:
             "resource": resource,
             "scope": scope,
             "expires_at": expires_at,
+            "family": family,
         }
         self._tokens_expiry.append((token, expires_at))
         return token
@@ -239,7 +269,9 @@ class OAuthStorage:
 
     # --- Refresh tokens ---
 
-    def store_refresh_token(self, client_id: str, resource: Optional[str] = None, scope: str = "") -> str:
+    def store_refresh_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
+        """Store a refresh token. `family` groups a token with every token
+        rotated from the same original grant; one is generated when omitted."""
         self._cleanup_expired()
         token = secrets.token_urlsafe(48)
         expires_at = _now() + self.refresh_token_ttl
@@ -248,15 +280,43 @@ class OAuthStorage:
             "resource": resource,
             "scope": scope,
             "expires_at": expires_at,
+            "family": family or secrets.token_urlsafe(16),
         }
         self._refresh_tokens_expiry.append((token, expires_at))
         return token
 
     def exchange_refresh_token(self, refresh_token: str) -> Optional[dict]:
-        """Return and consume a refresh token (rotation). None if missing or expired."""
+        """Return and consume a refresh token (rotation). None if missing or expired.
+
+        Presenting an already-consumed (rotated-out) refresh token is treated
+        as evidence of theft: the entire token family — every live refresh and
+        access token descended from the same grant — is revoked before None is
+        returned, so neither the thief nor the victim keeps a live session.
+        """
+        consumed = self._consumed_refresh_tokens.get(refresh_token)
+        if consumed is not None:
+            self.revoke_family(consumed["family"])
+            return None
         entry = self._refresh_tokens.pop(refresh_token, None)
         if entry is None:
             return None
         if _now() > entry["expires_at"]:
             return None
+        # Remember the consumed token for as long as any descendant rotated
+        # from it could still be alive, so a later replay still maps to its family.
+        retain_until = _now() + self.refresh_token_ttl
+        self._consumed_refresh_tokens[refresh_token] = {
+            "family": entry["family"],
+            "retain_until": retain_until,
+        }
+        self._consumed_refresh_expiry.append((refresh_token, retain_until))
         return entry
+
+    def revoke_family(self, family: Optional[str]) -> None:
+        """Revoke every live refresh and access token belonging to a family."""
+        if not family:
+            return
+        for k in [k for k, v in self._refresh_tokens.items() if v.get("family") == family]:
+            del self._refresh_tokens[k]
+        for k in [k for k, v in self._tokens.items() if v.get("family") == family]:
+            del self._tokens[k]

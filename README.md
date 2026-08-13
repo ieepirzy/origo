@@ -108,7 +108,9 @@ If your server exposes both `/mcp` and `/sse`, create the protected-resource met
 
 Traditional OAuth deployments separate the authorization server from the resource server — the MCP server asks a dedicated auth service "is this token valid?" on every request (RFC 7662 token introspection). This is correct for multi-tenant systems where tokens need to be revoked instantly across many services.
 
-`origo` collapses this into a single process. Token validation is an in-memory lookup. Fast, zero network overhead, no second service to run. The tradeoff is that token revocation requires a server restart, and there's no centralized auth service to share across multiple resource servers. This also introduce a single point of failure and security relies on the shared memory with the application it is authenticating for.
+`origo` collapses this into a single process. Token validation is an in-process lookup. Fast, zero network overhead, no second service to run. The tradeoff is that there's no centralized auth service to share across multiple resource servers. This also introduces a single point of failure, and security relies on sharing a process with the application it is authenticating for.
+
+By default all state is in memory: a restart revokes everything (and forces every client through interactive re-authorization). With `storage_path` set (see [Token persistence](#token-persistence)), tokens survive restarts instead — and revocation then means deleting rows from (or simply deleting) the SQLite file, not restarting.
 
 **Use this when:**
 
@@ -162,6 +164,35 @@ auth = OAuthProvider(
 
 Only schemes listed here are accepted — arbitrary `foo://` schemes are always rejected, since an unclaimed scheme could be registered by another app on the same device.
 
+## Token persistence
+
+By default origo keeps all OAuth state in memory, which means every restart, redeploy, or crash silently logs out every connected client — each one has to go through interactive re-authorization. For long-lived MCP connectors that presents as "auth randomly breaks".
+
+Pass `storage_path` to persist state to a SQLite file instead. It stays a drop-in: same process, no extra service, and the in-memory backend remains the default.
+
+```python
+auth = OAuthProvider(
+    base_url="https://mcp.yourdomain.com",
+    clients={os.getenv("MCP_CLIENT_ID"): os.getenv("MCP_CLIENT_SECRET")},
+    storage_path="/data/origo.db",  # tokens survive restarts
+)
+```
+
+What persists: access tokens, refresh tokens, pending auth codes, and dynamically-registered (DCR/CIMD) clients. What doesn't: pre-registered `clients=` (your config re-seeds them every boot, so they are never written to disk) and the per-process RSA signing key (ID tokens are verified at delivery, so a restart only rotates the JWKS).
+
+Security properties of the file:
+
+- Every credential — auth codes, access tokens, refresh tokens, dynamic client secrets — is stored **only as a SHA-256 hash**. A copy of the database file yields no replayable credential. (This works because origo generates all of these as high-entropy random values; there is nothing guessable to attack offline.)
+- The file is created with `0600` permissions, and SQLite's WAL sidecar files inherit that mode.
+- Because dynamic client secrets are hashed, they exist in plaintext only in the one `/register` response that delivered them.
+
+Two operational consequences worth knowing:
+
+- **Revocation**: with in-memory storage a restart revoked everything; with persistence it deliberately doesn't. To revoke, delete rows from the SQLite file (or delete the file) — tokens are keyed by SHA-256 hash of the token value.
+- **Registration flooding**: dynamically-registered clients also survive restarts, so on a `public_registration=True` deployment the `max_dynamic_clients` cap can now fill up permanently instead of being cleared by the next restart. Set `client_ttl` so abandoned registrations expire; origo warns at startup if you don't.
+
+If you run multiple workers/processes against the same file, SQLite's WAL mode plus origo's transactional single-use exchanges keep codes and refresh tokens atomic across processes — but note each process still generates its own RSA signing key, so run a single process if you rely on ID tokens.
+
 ## Options
 
 | Parameter | Type | Default | Description |
@@ -172,9 +203,10 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 | `public_registration` | `bool` | `False` | Allow dynamic client registration |
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
-| `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request |
+| `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request; replaying a used one revokes the whole token family |
+| `storage_path` | `str` | `None` | Path to a SQLite file for persistent storage (see [Token persistence](#token-persistence)). `None` keeps everything in memory |
 | `client_ttl` | `int` | `None` | Lifetime in seconds for dynamically-registered clients (DCR `/register` or CIMD). `None` means no expiration. Pre-registered `clients=` are always permanent |
-| `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept in memory; oldest is evicted on overflow. Pre-registered `clients=` don't count against this cap |
+| `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept at once; registrations past the cap are rejected (HTTP 429) until existing ones expire via `client_ttl`. Pre-registered `clients=` don't count against this cap |
 | `mcp_path` | `str` | `"/mcp"` | Path where MCP endpoint is mounted |
 | `scopes_supported` | `list[str]` | `[]` | OAuth/OIDC scopes advertised in metadata |
 | `resource_documentation` | `str` | `None` | Optional URL added to protected resource metadata |
@@ -205,7 +237,7 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 - Dynamic client registration accepts `token_endpoint_auth_method=none` for clients that should exchange authorization codes without a client secret.
 - CIMD clients can use an HTTPS metadata document URL as `client_id`; `origo` fetches it, validates redirect URIs, and treats it as a public PKCE client when the document requests `token_endpoint_auth_method=none`.
 - The optional OAuth `resource` parameter is preserved from `/authorize` to `/token` and stored with the issued access token metadata, so applications can verify which MCP resource the token was minted for.
-- `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced.
+- `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced. Replaying an already-used refresh token is treated as theft (per the OAuth 2.1 rotation guidance): the entire token family descended from that grant — live refresh tokens and access tokens both — is revoked on the spot, so a stolen-and-rotated chain dies the moment the legitimate holder's token resurfaces. (Corollary: a client that retries a `/token` refresh call after losing the response will trigger this and must re-authorize interactively.)
 - `WWW-Authenticate` challenges include `resource_metadata` so ChatGPT can discover OAuth metadata when an unauthenticated tool call reaches the server.
 - Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an unsigned `id_token` for `openid` requests, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
 
