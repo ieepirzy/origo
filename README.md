@@ -110,7 +110,7 @@ Traditional OAuth deployments separate the authorization server from the resourc
 
 `origo` collapses this into a single process. Token validation is an in-process lookup. Fast, zero network overhead, no second service to run. The tradeoff is that there's no centralized auth service to share across multiple resource servers. This also introduces a single point of failure, and security relies on sharing a process with the application it is authenticating for.
 
-By default all state is in memory: a restart revokes everything (and forces every client through interactive re-authorization). With `storage_path` set (see [Token persistence](#token-persistence)), tokens survive restarts instead — and revocation then means deleting rows from (or simply deleting) the SQLite file, not restarting.
+By default, origo persists state to a local SQLite file, so tokens survive restarts and redeploys — revocation means deleting rows from (or simply deleting) that file, not restarting. Pass `storage_path=None` for the old in-memory-only behavior instead, where a restart revokes everything (and forces every client through interactive re-authorization). See [Token persistence](#token-persistence) for the default file location and how to relocate or disable it.
 
 **Use this when:**
 
@@ -166,17 +166,27 @@ Only schemes listed here are accepted — arbitrary `foo://` schemes are always 
 
 ## Token persistence
 
-By default origo keeps all OAuth state in memory, which means every restart, redeploy, or crash silently logs out every connected client — each one has to go through interactive re-authorization. For long-lived MCP connectors that presents as "auth randomly breaks".
-
-Pass `storage_path` to persist state to a SQLite file instead. It stays a drop-in: same process, no extra service, and the in-memory backend remains the default.
+**origo persists OAuth state to SQLite by default.** Every restart, redeploy, or crash used to silently log out every connected client — each one had to go through interactive re-authorization, which for long-lived MCP connectors presented as "auth randomly breaks". As of this version, that's no longer the default: with no code changes at all, an existing `OAuthProvider(...)` call now writes tokens to a SQLite file instead of keeping them only in memory. It stays a drop-in: same process, no extra service.
 
 ```python
 auth = OAuthProvider(
     base_url="https://mcp.yourdomain.com",
     clients={os.getenv("MCP_CLIENT_ID"): os.getenv("MCP_CLIENT_SECRET")},
-    storage_path="/data/origo.db",  # tokens survive restarts
+    # storage_path omitted -> persists automatically, see below
 )
 ```
+
+**Where it persists to.** With `storage_path` omitted, origo writes to `./.origo/<hash>.db` relative to the process's working directory, where `<hash>` is derived from `base_url` + `mcp_path` (so multiple `OAuthProvider` instances, or restarts of the same deployment, land on the same file without a collision). Two ways to change that without touching code:
+
+- **`ORIGO_STORAGE_PATH=/data/origo`** (env var) — persists under that directory instead. Point this at a mounted volume so tokens survive a full redeploy, not just an in-process restart — `./.origo` under an ephemeral container filesystem only survives a crash/reload of the *same* container.
+- **`ORIGO_STORAGE_PATH=`** (set to the empty string) — forces in-memory storage, restoring the pre-persistence behavior without editing code. Useful for test suites and CI.
+
+And two ways in code:
+
+- `storage_path=None` — the permanent, explicit opt-out: always in-memory, regardless of `ORIGO_STORAGE_PATH`.
+- `storage_path="/exact/path/to/origo.db"` — persist to that exact file, ignoring the auto-derived default and `ORIGO_STORAGE_PATH`.
+
+If the default path can't be created or opened (read-only filesystem, permission error), origo warns and falls back to in-memory storage for that run rather than failing to start — persistence quietly degrading to the old behavior is the safe failure mode for something that was never explicitly requested. An **explicit** `storage_path` that can't be opened raises instead, since a caller who asked for persistence by name should find out immediately if they didn't get it.
 
 What persists: access tokens, refresh tokens, pending auth codes, and dynamically-registered (DCR/CIMD) clients. What doesn't: pre-registered `clients=` (your config re-seeds them every boot, so they are never written to disk) and the per-process RSA signing key (ID tokens are verified at delivery, so a restart only rotates the JWKS).
 
@@ -191,7 +201,9 @@ Two operational consequences worth knowing:
 - **Revocation**: with in-memory storage a restart revoked everything; with persistence it deliberately doesn't. To revoke, delete rows from the SQLite file (or delete the file) — tokens are keyed by SHA-256 hash of the token value.
 - **Registration flooding**: dynamically-registered clients also survive restarts, so on a `public_registration=True` deployment the `max_dynamic_clients` cap can now fill up permanently instead of being cleared by the next restart. Set `client_ttl` so abandoned registrations expire; origo warns at startup if you don't.
 
-If you run multiple workers/processes against the same file, SQLite's WAL mode plus origo's transactional single-use exchanges keep codes and refresh tokens atomic across processes — but note each process still generates its own RSA signing key, so run a single process if you rely on ID tokens.
+If you run multiple workers/processes against the same file, SQLite's WAL mode plus origo's transactional single-use exchanges (including reuse-detection's revoked-family marker) keep codes and refresh tokens atomic across processes — but note each process still generates its own RSA signing key, so run a single process if you rely on ID tokens.
+
+**Upgrading from an in-memory-only origo version:** if your test suite constructs more than one `OAuthProvider` with the *same* `base_url`/`mcp_path` pair across different test cases and expects each to start with an empty store (a common pattern — reusing a fixed test `base_url` everywhere), those instances now share one persisted file by default and will leak state between tests. Set `ORIGO_STORAGE_PATH=""` for your test run (a single environment variable, e.g. in your test suite's setup or CI env) to keep the old fully-isolated-in-memory behavior; individual tests that want to exercise real persistence can still pass `storage_path=` explicitly, which always overrides the environment variable.
 
 ## Options
 
@@ -204,7 +216,7 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
 | `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request; replaying a used one revokes the whole token family |
-| `storage_path` | `str` | `None` | Path to a SQLite file for persistent storage (see [Token persistence](#token-persistence)). `None` keeps everything in memory |
+| `storage_path` | `str` | auto (`./.origo/<hash>.db`, or `$ORIGO_STORAGE_PATH`) | Path to a SQLite file for persistent storage (see [Token persistence](#token-persistence)). Pass `None` explicitly to force in-memory storage |
 | `client_ttl` | `int` | `None` | Lifetime in seconds for dynamically-registered clients (DCR `/register` or CIMD). `None` means no expiration. Pre-registered `clients=` are always permanent |
 | `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept at once; registrations past the cap are rejected (HTTP 429) until existing ones expire via `client_ttl`. Pre-registered `clients=` don't count against this cap |
 | `mcp_path` | `str` | `"/mcp"` | Path where MCP endpoint is mounted |
