@@ -110,7 +110,7 @@ Traditional OAuth deployments separate the authorization server from the resourc
 
 `origo` collapses this into a single process. Token validation is an in-process lookup. Fast, zero network overhead, no second service to run. The tradeoff is that there's no centralized auth service to share across multiple resource servers. This also introduces a single point of failure, and security relies on sharing a process with the application it is authenticating for.
 
-By default all state is in memory: a restart revokes everything (and forces every client through interactive re-authorization). With `storage_path` set (see [Token persistence](#token-persistence)), tokens survive restarts instead — and revocation then means deleting rows from (or simply deleting) the SQLite file, not restarting.
+By default, origo persists state to a local SQLite file, so tokens survive restarts and redeploys — revocation means deleting rows from (or simply deleting) that file, not restarting. Pass `storage_path=None` for the old in-memory-only behavior instead, where a restart revokes everything (and forces every client through interactive re-authorization). See [Token persistence](#token-persistence) for the default file location and how to relocate or disable it.
 
 **Use this when:**
 

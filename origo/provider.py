@@ -1,6 +1,7 @@
 import functools
 import hashlib
 import os
+import sqlite3
 import warnings
 from typing import Optional
 
@@ -180,7 +181,13 @@ class OAuthProvider:
                     client_ttl=client_ttl,
                     max_dynamic_clients=max_dynamic_clients,
                 )
-            except OSError as exc:
+            except (OSError, sqlite3.Error) as exc:
+                # OSError: can't create the directory, or open/create the
+                # file (permissions, read-only fs). sqlite3.Error: the file
+                # exists but isn't a usable database -- e.g. corrupt, a
+                # non-SQLite file sitting at that path, or a locked file
+                # SQLite can't get a handle on (sqlite3.DatabaseError /
+                # OperationalError are not OSError subclasses).
                 if not is_auto:
                     # storage_path was passed explicitly: persistence was
                     # requested, not merely defaulted, so a failure to

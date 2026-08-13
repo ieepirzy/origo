@@ -78,6 +78,30 @@ def test_unwritable_default_path_falls_back_to_memory_with_warning(tmp_path, mon
     assert isinstance(provider.storage, OAuthStorage)
 
 
+def test_corrupt_db_at_default_path_falls_back_to_memory_with_warning(tmp_path, monkeypatch):
+    """A file can exist and be perfectly writable but not be a usable SQLite
+    database (corrupt, truncated, or just not SQLite at all) -- SQLite raises
+    sqlite3.DatabaseError/OperationalError for that, not OSError, so the
+    fallback has to catch both."""
+    import hashlib
+
+    monkeypatch.setenv("ORIGO_STORAGE_PATH", str(tmp_path))
+    base_url, mcp_path = "https://example.com", "/mcp"
+    digest = hashlib.sha256(f"{base_url}|{mcp_path}".encode()).hexdigest()[:16]
+    (tmp_path / f"{digest}.db").write_bytes(b"not a sqlite database")
+
+    with pytest.warns(UserWarning, match="falling back to in-memory storage"):
+        provider = OAuthProvider(base_url=base_url, clients={"c": "s"}, mcp_path=mcp_path)
+    assert isinstance(provider.storage, OAuthStorage)
+
+
+def test_corrupt_db_at_explicit_path_raises_instead_of_falling_back(tmp_path):
+    bad_db = tmp_path / "corrupt.db"
+    bad_db.write_bytes(b"not a sqlite database")
+    with pytest.raises(Exception):
+        OAuthProvider(base_url="https://example.com", clients={"c": "s"}, storage_path=str(bad_db))
+
+
 def test_unwritable_explicit_path_raises_instead_of_falling_back(tmp_path):
     blocked = tmp_path / "blocked"
     blocked.write_text("not a directory")
