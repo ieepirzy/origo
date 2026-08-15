@@ -150,7 +150,30 @@ auth = OAuthProvider(
 )
 ```
 
-Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) have no such restriction — any redirect URI is accepted, since the operator controls both sides.
+Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) get their allowlist from `client_redirect_uris` and are held to the same exact-match, fail-closed rule: a pre-registered client with no configured URIs rejects every `redirect_uri`.
+
+### Redirect URIs for pre-registered clients
+
+Every rejected `redirect_uri` is logged on the `origo` logger (WARNING level) together with its `client_id`, so when a connector with an undocumented callback URL fails at `/authorize`, the exact value to add to `client_redirect_uris` is one log line away.
+
+A pre-registered **confidential** client (one with a real secret) can opt out of exact matching entirely with the `ANY_REDIRECT_URI` sentinel, as the whole allowlist:
+
+```python
+from origo import ANY_REDIRECT_URI, OAuthProvider
+
+auth = OAuthProvider(
+    base_url="https://mcp.yourdomain.com",
+    clients={"my-client-id": "my-client-secret"},
+    client_redirect_uris={"my-client-id": ANY_REDIRECT_URI},  # or [ANY_REDIRECT_URI]
+)
+```
+
+This exists for single-operator deployments facing connector surfaces (ChatGPT, Grok, …) whose callback URLs are undocumented or change, where the alternative would be the strictly more open `public_registration=True`. Know what it trades away before using it:
+
+- **What still holds:** the client secret gates `/token`, so an authorization code that leaks to an attacker's redirect URI cannot be exchanged for a token; scheme validation still applies (`https` only, plus the loopback exemption and any `custom_redirect_uri_schemes`, never `javascript:`/`data:`); PKCE and `state` work unchanged; every wildcard-accepted URI is logged at INFO with its `client_id`, so you can harvest real connector callbacks and later pin them down to an exact list.
+- **What it gives up:** exact redirect URI matching is a defense-in-depth layer required by the OAuth Security BCP (RFC 9700) — with it off, everything rests on the secret staying secret, and `/authorize` will bounce a browser to any `https` URL for anyone who knows the public `client_id` (with `auto_approve=True`, without even a consent page in between).
+
+The sentinel is rejected at startup for clients without a secret, when mixed with explicit URIs, and is never available to dynamically registered clients.
 
 By default, dynamically registered `redirect_uris` must use `https` (or `http://localhost`/`127.0.0.1`/`::1` for the RFC 8252 §7.3 native-app loopback exemption). Native/mobile app clients that use a private-use URI scheme instead (RFC 8252 §7.1, e.g. `myapp://callback`) are rejected unless the operator explicitly opts in:
 
@@ -211,7 +234,7 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | --- | --- | --- | --- |
 | `base_url` | `str` | required | Public base URL, no trailing slash |
 | `clients` | `dict` | `None` | Pre-registered `{client_id: client_secret}` |
-| `client_redirect_uris` | `dict` | `None` | Optional redirect URI allowlist for pre-registered clients |
+| `client_redirect_uris` | `dict` | `None` | Optional redirect URI allowlist for pre-registered clients (exact-match, fail-closed). A confidential client may map to `ANY_REDIRECT_URI` instead of a list — see [Redirect URIs for pre-registered clients](#redirect-uris-for-pre-registered-clients) |
 | `public_registration` | `bool` | `False` | Allow dynamic client registration |
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |

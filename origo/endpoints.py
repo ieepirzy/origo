@@ -3,6 +3,7 @@ import hmac
 import html
 import http.client
 import functools
+import logging
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -24,6 +25,8 @@ from .storage import FamilyRevokedError, OAuthStorage
 import base64
 import asyncio
 
+
+logger = logging.getLogger("origo")
 
 _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
 _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
@@ -472,7 +475,9 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     # 'self' alone → blocked with a form-action console violation; 'self'
     # plus the callback origin → flow completes. Including the origin is
     # safe: by the time the consent page renders, redirect_uri has already
-    # been validated against the client's registered allowlist.
+    # been validated against the client's registered allowlist (or, for an
+    # ANY_REDIRECT_URI wildcard client, through _is_valid_redirect_uri's
+    # scheme rules).
     redirect_source = _form_action_source(str(params.get("redirect_uri", "")))
     form_action = "'self'" + (f" {redirect_source}" if redirect_source else "")
     response.headers["Content-Security-Policy"] = (
@@ -552,7 +557,41 @@ async def authorize(request: Request) -> Response:
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
 
-    if not storage.is_redirect_uri_allowed(client_id, redirect_uri):
+    if storage.allows_any_redirect_uri(client_id):
+        # ANY_REDIRECT_URI sentinel: exact matching is off for this client,
+        # but scheme validation is not — the same rules dynamic registration
+        # enforces (https, loopback http, declared custom schemes) apply, so
+        # "any" never means javascript:, data:, or an undeclared app scheme.
+        if not _is_valid_redirect_uri(redirect_uri, custom_redirect_uri_schemes):
+            logger.warning(
+                "authorize: rejected redirect_uri %r for wildcard client %r — "
+                "%s.",
+                redirect_uri,
+                client_id,
+                _redirect_uri_error_description(custom_redirect_uri_schemes),
+            )
+            return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not allowed."}, status_code=400)
+        # INFO, not DEBUG: this is the operational record of which callback
+        # URLs connectors actually use, for operators running the wildcard
+        # temporarily to harvest URIs for an exact allowlist.
+        logger.info(
+            "authorize: accepted redirect_uri %r for client %r via its "
+            "any-redirect-uri wildcard.",
+            redirect_uri,
+            client_id,
+        )
+    elif not storage.is_redirect_uri_allowed(client_id, redirect_uri):
+        # Log the rejected URI: when a connector's callback URL is
+        # undocumented (ChatGPT, Grok, ...), this line is how an operator
+        # finds the exact value to add to the client's allowlist.
+        logger.warning(
+            "authorize: rejected redirect_uri %r for client %r — not on the "
+            "client's redirect URI allowlist. If this request came from a "
+            "connector you are setting up, add this exact URI to the "
+            "client's allowlist.",
+            redirect_uri,
+            client_id,
+        )
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not allowed."}, status_code=400)
 
     # Show consent page on GET unless auto_approve
