@@ -43,6 +43,13 @@ app = Starlette(routes=[
 
 With that setup, `/.well-known/oauth-protected-resource` advertises `https://mcp.yourdomain.com/sse`, and middleware validates bearer tokens for the protected SSE MCP route.
 
+## Connector callback URLs
+
+Connector surfaces frequently fail at `/authorize` because their OAuth callback URL is undocumented or changes. Two mechanisms exist for this (see "Redirect URIs for pre-registered clients" in the README):
+
+- Every rejected `redirect_uri` is logged with its `client_id` on the `origo` logger, so the exact value to allowlist is in the server log after one failed connection attempt.
+- A pre-registered confidential client can be seeded with the `ANY_REDIRECT_URI` sentinel to skip exact matching entirely (scheme validation still applies; the client secret still gates `/token`). This trades away the RFC 9700 exact-match layer and is meant for single-operator deployments — it is refused for secret-less clients and unavailable to dynamically registered ones.
+
 ## Remaining follow-ups
 
 - If a specific hosted connector requires a non-standard `/sse` handshake, add that support in the MCP server/framework layer or a separate adapter package rather than inside Origo's OAuth layer.

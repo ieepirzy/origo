@@ -60,7 +60,16 @@ class OAuthProvider:
         base_url:            Public base URL of your server (no trailing slash).
         clients:             Pre-registered {client_id: client_secret} dict.
                              Required when public_registration=False.
-        client_redirect_uris: Optional {client_id: [redirect_uri, ...]} allowlist for pre-registered clients.
+        client_redirect_uris: Optional {client_id: [redirect_uri, ...]} allowlist for
+                             pre-registered clients. Exact-match, fail-closed. A
+                             confidential (secret-holding) client may instead map to
+                             the ANY_REDIRECT_URI sentinel ("any", as the bare string
+                             or sole list element) to accept every redirect URI that
+                             passes scheme validation — see the sentinel's docs in
+                             origo.storage for the security trade-off. Rejected and
+                             wildcard-accepted redirect URIs are logged on the
+                             "origo" logger so their exact values can be collected
+                             into an allowlist.
         public_registration: Allow dynamic client registration (DCR).
                              Default False.
         auto_approve:        Skip consent page, approve all valid clients.

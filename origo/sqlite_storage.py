@@ -136,9 +136,10 @@ class SQLiteOAuthStorage:
 
     # --- Clients ---
 
-    def seed_clients(self, clients: dict[str, str], redirect_uris: Optional[dict[str, list[str]]] = None) -> None:
+    def seed_clients(self, clients: dict[str, str], redirect_uris: Optional[dict[str, list]] = None) -> None:
         """Seed pre-registered clients (kept in memory only, never persisted).
-        Same fail-closed semantics as OAuthStorage.seed_clients."""
+        Same fail-closed semantics as OAuthStorage.seed_clients, including the
+        ANY_REDIRECT_URI sentinel and its confidential-client requirement."""
         redirect_uris = redirect_uris or {}
         if clients and not any(redirect_uris.values()):
             warnings.warn(
@@ -149,10 +150,13 @@ class SQLiteOAuthStorage:
                 stacklevel=3,
             )
         for client_id, secret in clients.items():
-            allowed_redirect_uris = set(redirect_uris.get(client_id, []))
+            allowed_redirect_uris, allow_any = _mem._resolve_seed_redirect_uris(
+                client_id, secret, redirect_uris.get(client_id)
+            )
             self._seeded[client_id] = {
                 "secret": secret,
                 "redirect_uris": allowed_redirect_uris,
+                "allow_any_redirect_uri": allow_any,
                 "token_endpoint_auth_method": "client_secret_post",
                 "client_metadata": {},
                 "registered_at": None,
@@ -160,7 +164,7 @@ class SQLiteOAuthStorage:
             # A seeded id shadows (and replaces) any persisted dynamic client.
             with self._lock:
                 self._conn.execute("DELETE FROM clients WHERE client_id = ?", (client_id,))
-            if not allowed_redirect_uris:
+            if not allowed_redirect_uris and not allow_any:
                 warnings.warn(
                     f"OAuthProvider: client '{client_id}' seeded with no redirect_uris — "
                     "it will reject every redirect_uri at /authorize (fail closed). "
@@ -259,7 +263,7 @@ class SQLiteOAuthStorage:
         return client_id in self._seeded or self._get_dynamic_client(client_id) is not None
 
     def is_redirect_uri_allowed(self, client_id: str, redirect_uri: str) -> bool:
-        """Fail-closed allowlist check, same semantics as OAuthStorage."""
+        """Fail-closed exact-match allowlist check, same semantics as OAuthStorage."""
         seeded = self._seeded.get(client_id)
         if seeded is not None:
             allowed = seeded["redirect_uris"]
@@ -269,6 +273,21 @@ class SQLiteOAuthStorage:
             return False
         allowed = json.loads(row["redirect_uris"])
         return bool(allowed and redirect_uri in allowed)
+
+    def allows_any_redirect_uri(self, client_id: str) -> bool:
+        """ANY_REDIRECT_URI sentinel check, same semantics as OAuthStorage.
+
+        Only consults the seeded (in-memory) clients: dynamic clients are
+        registered through paths that validate every redirect URI as a real
+        URI, so a persisted row can never carry the sentinel legitimately —
+        and must not gain wildcard behavior even if one did.
+        """
+        seeded = self._seeded.get(client_id)
+        return bool(
+            seeded is not None
+            and seeded.get("allow_any_redirect_uri")
+            and seeded.get("secret")
+        )
 
     # --- Expiry ---
 

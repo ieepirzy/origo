@@ -3,6 +3,7 @@ import hmac
 import html
 import http.client
 import functools
+import logging
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -24,6 +25,8 @@ from .storage import FamilyRevokedError, OAuthStorage
 import base64
 import asyncio
 
+
+logger = logging.getLogger("origo")
 
 _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
 _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
@@ -56,6 +59,33 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     return False
 
 
+# C0 controls (includes CR, LF, NUL, tab) and DEL. A raw one of these in a
+# redirect URI is either a header-injection attempt (CR/LF split the Location
+# response header) or malformed input no legitimate RFC 3986 URI contains —
+# such characters must be percent-encoded on the wire. Kept as an explicit
+# set so the intent, and the CR/LF response-splitting motivation, is legible.
+_UNSAFE_URI_CHARS = frozenset(chr(c) for c in range(0x20)) | {"\x7f"}
+
+
+def _uri_is_header_safe(uri: str) -> bool:
+    """True if uri can be placed in a Location header without control-character
+    injection or an encoding crash.
+
+    Rejects C0/DEL control characters (CR/LF response-splitting) and any string
+    that is not UTF-8 encodable (a lone surrogate, e.g. from a percent-decoded
+    \\uD800, raises UnicodeEncodeError when the response layer serializes the
+    header — a 500/DoS). Deliberately server-independent: origo must not depend
+    on the fronting ASGI server to strip these, since not every server does.
+    """
+    if any(c in _UNSAFE_URI_CHARS for c in uri):
+        return False
+    try:
+        uri.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _build_redirect(uri: str, params: dict) -> str:
     """Append params to uri, preserving any existing query string."""
     try:
@@ -66,7 +96,14 @@ def _build_redirect(uri: str, params: dict) -> str:
         qs = urlencode(parse_qsl(parts.query) + list(params.items()))
     except UnicodeEncodeError as e:
         raise ValueError(f"Invalid characters in parameters: {e}") from e
-    return urlunparse(parts._replace(query=qs))
+    result = urlunparse(parts._replace(query=qs))
+    # Belt-and-suspenders: even if a non-header-safe uri reached here (it
+    # should have been rejected upstream by _is_valid_redirect_uri), refuse it
+    # as a ValueError — which authorize turns into a 400 — rather than letting
+    # a control char or lone surrogate reach the response layer as a 500.
+    if not _uri_is_header_safe(result):
+        raise ValueError("Invalid characters in redirect URI.")
+    return result
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -212,6 +249,15 @@ def _is_valid_redirect_uri(uri: str, allowed_custom_schemes: frozenset[str] = fr
     since an unconfigured scheme could be claimed by another app on the
     same device.
     """
+    # Reject control characters and non-encodable input up front: urlparse
+    # happily returns a scheme+hostname for "https://h/\r\nX" or a URI holding
+    # a lone surrogate, so without this gate such a value would pass validation
+    # and only blow up (CR/LF header injection, or a UnicodeEncodeError 500) at
+    # the response layer. Applies everywhere this validator runs — dynamic
+    # registration and the ANY_REDIRECT_URI wildcard path alike.
+    if not _uri_is_header_safe(uri):
+        return False
+
     try:
         parsed = urlparse(uri)
     except ValueError:
@@ -411,16 +457,29 @@ def _form_action_source(redirect_uri: str) -> str:
 
     A custom-scheme URI (myapp://callback) yields its scheme://host form; a
     bare-scheme URI degrades to 'scheme:', both valid CSP source expressions.
+
+    Returns '' for any origin that is not ASCII. The result is written into the
+    Content-Security-Policy response header, which Starlette serializes as
+    Latin-1; a raw non-ASCII host (an IDN/IRI redirect URI like
+    https://例え.テスト/cb) would otherwise raise UnicodeEncodeError and 500 the
+    consent page. Because a wildcard (ANY_REDIRECT_URI) client_id is public,
+    that would be a trivially reachable DoS — and a seeded exact-match client
+    with such a URI reaches here without passing _is_valid_redirect_uri at all,
+    so the guard lives here rather than only in the validator. Dropping the
+    origin falls the CSP back to 'self'; a URI whose host is a real IDN should
+    be registered in its ASCII punycode (xn--) form, which passes unchanged.
     """
     try:
         parts = urlparse(redirect_uri)
     except ValueError:
         return ""
     if parts.scheme and parts.netloc:
-        return f"{parts.scheme}://{parts.netloc}"
-    if parts.scheme:
-        return f"{parts.scheme}:"
-    return ""
+        source = f"{parts.scheme}://{parts.netloc}"
+    elif parts.scheme:
+        source = f"{parts.scheme}:"
+    else:
+        return ""
+    return source if source.isascii() else ""
 
 
 def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
@@ -472,7 +531,9 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     # 'self' alone → blocked with a form-action console violation; 'self'
     # plus the callback origin → flow completes. Including the origin is
     # safe: by the time the consent page renders, redirect_uri has already
-    # been validated against the client's registered allowlist.
+    # been validated against the client's registered allowlist (or, for an
+    # ANY_REDIRECT_URI wildcard client, through _is_valid_redirect_uri's
+    # scheme rules).
     redirect_source = _form_action_source(str(params.get("redirect_uri", "")))
     form_action = "'self'" + (f" {redirect_source}" if redirect_source else "")
     response.headers["Content-Security-Policy"] = (
@@ -552,7 +613,41 @@ async def authorize(request: Request) -> Response:
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
 
-    if not storage.is_redirect_uri_allowed(client_id, redirect_uri):
+    if storage.allows_any_redirect_uri(client_id):
+        # ANY_REDIRECT_URI sentinel: exact matching is off for this client,
+        # but scheme validation is not — the same rules dynamic registration
+        # enforces (https, loopback http, declared custom schemes) apply, so
+        # "any" never means javascript:, data:, or an undeclared app scheme.
+        if not _is_valid_redirect_uri(redirect_uri, custom_redirect_uri_schemes):
+            logger.warning(
+                "authorize: rejected redirect_uri %r for wildcard client %r — "
+                "%s.",
+                redirect_uri,
+                client_id,
+                _redirect_uri_error_description(custom_redirect_uri_schemes),
+            )
+            return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not allowed."}, status_code=400)
+        # INFO, not DEBUG: this is the operational record of which callback
+        # URLs connectors actually use, for operators running the wildcard
+        # temporarily to harvest URIs for an exact allowlist.
+        logger.info(
+            "authorize: accepted redirect_uri %r for client %r via its "
+            "any-redirect-uri wildcard.",
+            redirect_uri,
+            client_id,
+        )
+    elif not storage.is_redirect_uri_allowed(client_id, redirect_uri):
+        # Log the rejected URI: when a connector's callback URL is
+        # undocumented (ChatGPT, Grok, ...), this line is how an operator
+        # finds the exact value to add to the client's allowlist.
+        logger.warning(
+            "authorize: rejected redirect_uri %r for client %r — not on the "
+            "client's redirect URI allowlist. If this request came from a "
+            "connector you are setting up, add this exact URI to the "
+            "client's allowlist.",
+            redirect_uri,
+            client_id,
+        )
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not allowed."}, status_code=400)
 
     # Show consent page on GET unless auto_approve
