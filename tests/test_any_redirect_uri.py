@@ -21,19 +21,24 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from origo import ANY_REDIRECT_URI, OAuthProvider
-from origo.endpoints import _build_redirect, _is_valid_redirect_uri, _uri_is_header_safe
+from origo.endpoints import (
+    _build_redirect,
+    _form_action_source,
+    _is_valid_redirect_uri,
+    _uri_is_header_safe,
+)
 from origo.sqlite_storage import SQLiteOAuthStorage
 from origo.storage import OAuthStorage
 
 from tests.conftest import do_full_flow, make_pkce_pair
 
 
-def _wildcard_provider(**kwargs):
+def _wildcard_provider(auto_approve=True, **kwargs):
     return OAuthProvider(
         base_url="http://testserver",
         clients={"wild": "wild-secret"},
         client_redirect_uris={"wild": ANY_REDIRECT_URI},
-        auto_approve=True,
+        auto_approve=auto_approve,
         **kwargs,
     )
 
@@ -196,6 +201,62 @@ def test_percent_decoded_surrogate_is_header_safe_false():
 
     decoded = unquote("https://ok.example/%ED%A0%80", errors="surrogatepass")
     assert _uri_is_header_safe(decoded) is False
+
+
+# ── CSP header: a non-ASCII (IDN/IRI) host must not 500 the consent page ─────
+#
+# The CSP form-action origin is written into a response header (Latin-1 in
+# Starlette). A raw Unicode host would raise UnicodeEncodeError → 500, and with
+# a public wildcard client_id any caller could trigger it. Also covers seeded
+# exact-match clients, which reach the consent page without passing
+# _is_valid_redirect_uri, so the guard has to live at header construction.
+
+
+def test_form_action_source_drops_non_ascii_origin():
+    assert _form_action_source("https://例え.テスト/callback") == ""
+    # ASCII origins — including a real IDN host in its punycode form — are kept.
+    assert _form_action_source("https://ok.example/cb") == "https://ok.example"
+    assert _form_action_source("https://xn--r8jz45g.example/cb") == "https://xn--r8jz45g.example"
+    assert _form_action_source("https://ok.example:8443/cb") == "https://ok.example:8443"
+
+
+def test_form_action_source_output_is_always_latin1_encodable():
+    # Whatever it returns must be writable as an HTTP header value.
+    for uri in ("https://例え.テスト/cb", "https://ok.example/cb", "https://xn--r8jz45g.example/cb"):
+        _form_action_source(uri).encode("latin-1")  # must not raise
+
+
+async def test_wildcard_consent_page_does_not_500_on_unicode_host():
+    provider = _wildcard_provider(auto_approve=False)
+    async with AsyncClient(
+        transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver"
+    ) as client:
+        # httpx percent-encodes the param on the wire; origo decodes it back to
+        # the raw Unicode host, exactly as a real client delivery would.
+        resp = await _authorize(client, "https://例え.テスト/callback")
+    assert resp.status_code == 200  # the consent page renders, not a 500
+    # The CSP header exists and is header-safe (origin dropped to 'self').
+    resp.headers["content-security-policy"].encode("latin-1")
+    assert "例" not in resp.headers["content-security-policy"]
+
+
+async def test_seeded_exact_client_with_unicode_host_does_not_500():
+    # This client never passes _is_valid_redirect_uri — the operator seeded the
+    # Unicode-host URI directly — so only the header-construction guard saves it.
+    provider = OAuthProvider(
+        base_url="http://testserver",
+        clients={"idn": "idn-secret"},
+        client_redirect_uris={"idn": ["https://例え.テスト/callback"]},
+        auto_approve=False,
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver"
+    ) as client:
+        resp = await _authorize(
+            client, "https://例え.テスト/callback", client_id="idn"
+        )
+    assert resp.status_code == 200
+    resp.headers["content-security-policy"].encode("latin-1")
 
 
 def test_legitimate_uris_still_pass_the_hardened_validator():

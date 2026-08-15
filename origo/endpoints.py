@@ -457,16 +457,29 @@ def _form_action_source(redirect_uri: str) -> str:
 
     A custom-scheme URI (myapp://callback) yields its scheme://host form; a
     bare-scheme URI degrades to 'scheme:', both valid CSP source expressions.
+
+    Returns '' for any origin that is not ASCII. The result is written into the
+    Content-Security-Policy response header, which Starlette serializes as
+    Latin-1; a raw non-ASCII host (an IDN/IRI redirect URI like
+    https://例え.テスト/cb) would otherwise raise UnicodeEncodeError and 500 the
+    consent page. Because a wildcard (ANY_REDIRECT_URI) client_id is public,
+    that would be a trivially reachable DoS — and a seeded exact-match client
+    with such a URI reaches here without passing _is_valid_redirect_uri at all,
+    so the guard lives here rather than only in the validator. Dropping the
+    origin falls the CSP back to 'self'; a URI whose host is a real IDN should
+    be registered in its ASCII punycode (xn--) form, which passes unchanged.
     """
     try:
         parts = urlparse(redirect_uri)
     except ValueError:
         return ""
     if parts.scheme and parts.netloc:
-        return f"{parts.scheme}://{parts.netloc}"
-    if parts.scheme:
-        return f"{parts.scheme}:"
-    return ""
+        source = f"{parts.scheme}://{parts.netloc}"
+    elif parts.scheme:
+        source = f"{parts.scheme}:"
+    else:
+        return ""
+    return source if source.isascii() else ""
 
 
 def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
