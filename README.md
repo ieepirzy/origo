@@ -175,6 +175,8 @@ This exists for single-operator deployments facing connector surfaces (ChatGPT, 
 
 The sentinel is rejected at startup for clients without a secret, when mixed with explicit URIs, and is never available to dynamically registered clients.
 
+Redirect URIs are validated for header safety independently of the fronting server: a `redirect_uri` containing a C0 control character (CR/LF response-splitting, NUL, tab, …), DEL, or a lone surrogate is rejected at `/authorize` (and at dynamic registration) rather than reflected into a `Location` header or allowed to raise an encoding error. `origo` does not rely on the ASGI server in front of it to strip such input.
+
 By default, dynamically registered `redirect_uris` must use `https` (or `http://localhost`/`127.0.0.1`/`::1` for the RFC 8252 §7.3 native-app loopback exemption). Native/mobile app clients that use a private-use URI scheme instead (RFC 8252 §7.1, e.g. `myapp://callback`) are rejected unless the operator explicitly opts in:
 
 ```python

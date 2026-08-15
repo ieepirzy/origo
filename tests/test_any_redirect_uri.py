@@ -21,6 +21,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from origo import ANY_REDIRECT_URI, OAuthProvider
+from origo.endpoints import _build_redirect, _is_valid_redirect_uri, _uri_is_header_safe
 from origo.sqlite_storage import SQLiteOAuthStorage
 from origo.storage import OAuthStorage
 
@@ -118,6 +119,96 @@ async def test_wildcard_honors_declared_custom_schemes():
     ) as client:
         resp = await _authorize(client, "myapp://callback")
     assert resp.status_code == 302
+
+
+# ── adversarial input hardening: control chars, surrogates, header injection ─
+#
+# The wildcard path is the first to let an arbitrary scheme-valid redirect_uri
+# reach store_code/_build_redirect, so it's where a control character or a lone
+# surrogate would otherwise turn into CR/LF header injection or a
+# UnicodeEncodeError 500. These pin the server-independent rejection — origo
+# must not rely on the fronting ASGI server to sanitize such input.
+
+
+@pytest.mark.parametrize(
+    "label,bad_uri",
+    [
+        ("raw-crlf", "https://ok.example/cb\r\nSet-Cookie: p=1"),
+        ("bare-cr", "https://ok.example/cb\rX"),
+        ("bare-lf", "https://ok.example/cb\nX"),
+        ("nul", "https://ok.example/cb\x00evil"),
+        ("tab", "https://ok.example/cb\tx"),
+        ("us-control", "https://ok.example/cb\x1f"),
+        ("del", "https://ok.example/cb\x7f"),
+        ("lone-surrogate", "https://ok.example/\ud800"),
+        ("tab-in-scheme", "htt\tps://ok.example/cb"),
+    ],
+)
+def test_header_unsafe_uris_rejected_by_validator(label, bad_uri):
+    # The shared validator is the primary gate, exercised directly so the raw
+    # bytes reach it without an HTTP client re-encoding them first.
+    assert _uri_is_header_safe(bad_uri) is False
+    assert _is_valid_redirect_uri(bad_uri) is False
+
+
+def test_build_redirect_refuses_surrogate_base_uri_as_valueerror():
+    # A lone surrogate in the base URI must surface as ValueError (which
+    # /authorize renders as a 400), never a bare UnicodeEncodeError 500.
+    with pytest.raises(ValueError, match="Invalid characters in redirect URI"):
+        _build_redirect("https://ok.example/\ud800", {"code": "x"})
+
+
+def test_build_redirect_output_is_always_header_safe_for_crlf():
+    # urlunparse strips \r\n\t (WHATWG), so for CRLF the function neutralizes by
+    # sanitizing rather than raising. Either outcome is acceptable; what must
+    # hold is that whatever it RETURNS carries no CR/LF into the Location header.
+    out = _build_redirect("https://ok.example/cb\r\nX: 1", {"code": "x"})
+    assert "\r" not in out and "\n" not in out
+    assert _uri_is_header_safe(out)
+
+
+@pytest.mark.parametrize(
+    "label,bad_uri",
+    [
+        ("raw-crlf", "https://ok.example/cb\r\nX"),
+        ("nul", "https://ok.example/cb\x00"),
+        ("control", "https://ok.example/cb\x01\x1f"),
+    ],
+)
+async def test_wildcard_authorize_rejects_control_chars_cleanly(label, bad_uri):
+    # End to end through /authorize on the wildcard client: a clean 400, no
+    # 500, and no control character reflected into a Location header.
+    provider = _wildcard_provider()
+    async with AsyncClient(
+        transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver"
+    ) as client:
+        resp = await _authorize(client, bad_uri)
+    assert resp.status_code == 400
+    assert resp.json()["error_description"] == "redirect_uri not allowed."
+    assert "location" not in resp.headers
+
+
+def test_percent_decoded_surrogate_is_header_safe_false():
+    # %ED%A0%80 percent-decodes to U+D800; whatever a fronting server hands us,
+    # origo's own guard classifies it as unsafe rather than trusting the server
+    # to have replaced it.
+    from urllib.parse import unquote
+
+    decoded = unquote("https://ok.example/%ED%A0%80", errors="surrogatepass")
+    assert _uri_is_header_safe(decoded) is False
+
+
+def test_legitimate_uris_still_pass_the_hardened_validator():
+    # The hardening must not reject normal callback URLs, including punycode
+    # IDN hosts and query-bearing URLs.
+    for good in (
+        "https://connector.example/oauth/cb?flow=2&state=abc",
+        "http://localhost/cb",
+        "http://127.0.0.1:8765/callback",
+        "https://xn--e1awd7f.example/cb",
+    ):
+        assert _uri_is_header_safe(good) is True
+        assert _is_valid_redirect_uri(good) is True
 
 
 # ── seeding guard rails ──────────────────────────────────────────────────────

@@ -59,6 +59,33 @@ def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
     return False
 
 
+# C0 controls (includes CR, LF, NUL, tab) and DEL. A raw one of these in a
+# redirect URI is either a header-injection attempt (CR/LF split the Location
+# response header) or malformed input no legitimate RFC 3986 URI contains —
+# such characters must be percent-encoded on the wire. Kept as an explicit
+# set so the intent, and the CR/LF response-splitting motivation, is legible.
+_UNSAFE_URI_CHARS = frozenset(chr(c) for c in range(0x20)) | {"\x7f"}
+
+
+def _uri_is_header_safe(uri: str) -> bool:
+    """True if uri can be placed in a Location header without control-character
+    injection or an encoding crash.
+
+    Rejects C0/DEL control characters (CR/LF response-splitting) and any string
+    that is not UTF-8 encodable (a lone surrogate, e.g. from a percent-decoded
+    \\uD800, raises UnicodeEncodeError when the response layer serializes the
+    header — a 500/DoS). Deliberately server-independent: origo must not depend
+    on the fronting ASGI server to strip these, since not every server does.
+    """
+    if any(c in _UNSAFE_URI_CHARS for c in uri):
+        return False
+    try:
+        uri.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _build_redirect(uri: str, params: dict) -> str:
     """Append params to uri, preserving any existing query string."""
     try:
@@ -69,7 +96,14 @@ def _build_redirect(uri: str, params: dict) -> str:
         qs = urlencode(parse_qsl(parts.query) + list(params.items()))
     except UnicodeEncodeError as e:
         raise ValueError(f"Invalid characters in parameters: {e}") from e
-    return urlunparse(parts._replace(query=qs))
+    result = urlunparse(parts._replace(query=qs))
+    # Belt-and-suspenders: even if a non-header-safe uri reached here (it
+    # should have been rejected upstream by _is_valid_redirect_uri), refuse it
+    # as a ValueError — which authorize turns into a 400 — rather than letting
+    # a control char or lone surrogate reach the response layer as a 500.
+    if not _uri_is_header_safe(result):
+        raise ValueError("Invalid characters in redirect URI.")
+    return result
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -215,6 +249,15 @@ def _is_valid_redirect_uri(uri: str, allowed_custom_schemes: frozenset[str] = fr
     since an unconfigured scheme could be claimed by another app on the
     same device.
     """
+    # Reject control characters and non-encodable input up front: urlparse
+    # happily returns a scheme+hostname for "https://h/\r\nX" or a URI holding
+    # a lone surrogate, so without this gate such a value would pass validation
+    # and only blow up (CR/LF header injection, or a UnicodeEncodeError 500) at
+    # the response layer. Applies everywhere this validator runs — dynamic
+    # registration and the ANY_REDIRECT_URI wildcard path alike.
+    if not _uri_is_header_safe(uri):
+        return False
+
     try:
         parsed = urlparse(uri)
     except ValueError:
