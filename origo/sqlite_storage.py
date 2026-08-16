@@ -95,7 +95,10 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens (family);
 
 
 def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    try:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return ""
 
 
 class SQLiteOAuthStorage:

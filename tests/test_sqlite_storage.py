@@ -314,3 +314,15 @@ def test_provider_warns_on_persistent_public_registration_without_client_ttl(db_
             public_registration=True,
             storage_path=db_path,
         )
+
+def test_hash_surrogate_handling(db_path):
+    storage = SQLiteOAuthStorage(db_path)
+    storage.register_client("c", "s")
+
+    # Should not raise UnicodeEncodeError
+    assert storage.verify_token("secret\ud800") is None
+    assert storage.exchange_code("secret\ud800") is None
+    assert storage.exchange_refresh_token("secret\ud800") is None
+    assert storage.verify_client_secret("c", "secret\ud800") is False
+
+    storage.close()
