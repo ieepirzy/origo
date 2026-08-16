@@ -93,3 +93,7 @@
 **Vulnerability:** The CSRF cookie was using the `__Host-` prefix but relied on the framework's default behavior for the `Path` attribute.
 **Learning:** `__Host-` prefixed cookies must explicitly specify `Path=/`. While frameworks like Starlette may default to this, omitting it creates a fragile security boundary that could break and lead to cookie rejection by browsers if defaults change or the code is ported.
 **Prevention:** Always explicitly set `path="/"` when configuring `__Host-` cookies to guarantee compliance with RFC 6265bis.
+## 2025-02-21 - Fix DoS via UnicodeEncodeError in SQLite Storage Hashing
+**Vulnerability:** A Denial of Service (DoS) vulnerability existed in `origo/sqlite_storage.py` where the `_hash` function called `.encode("utf-8")` without catching `UnicodeEncodeError`. If an attacker provided a token or secret containing lone surrogate characters (e.g., `\ud800`), the application would crash with a 500 error when attempting to hash it for a database lookup or storage.
+**Learning:** Functions that hash inputs using `hashlib` must first encode strings to bytes. If user input contains surrogate characters, `.encode("utf-8")` will raise a `UnicodeEncodeError`.
+**Prevention:** Wrap the encoding and hashing in a `try...except UnicodeEncodeError` block. When handling lookup fields (like tokens or secrets), returning an empty string `""` on error safely guarantees the database query will find no match without crashing the server.
