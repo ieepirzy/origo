@@ -238,18 +238,38 @@ class OAuthProvider:
         self._app = self._build_app()
 
     def _build_app(self) -> Starlette:
-        app = Starlette(
-            routes=[
-                Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
-                Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
-                Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
-                Route("/.well-known/jwks.json", jwks, methods=["GET"]),
-                Route("/register", register, methods=["POST"]),
-                Route("/authorize", authorize, methods=["GET", "POST"]),
-                Route("/token", token, methods=["POST"]),
-                Route("/userinfo", userinfo, methods=["GET", "POST"]),
-            ],
-        )
+        routes = [
+            Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+            Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
+            Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
+            Route("/.well-known/jwks.json", jwks, methods=["GET"]),
+            Route("/register", register, methods=["POST"]),
+            Route("/authorize", authorize, methods=["GET", "POST"]),
+            Route("/token", token, methods=["POST"]),
+            Route("/userinfo", userinfo, methods=["GET", "POST"]),
+        ]
+
+        # RFC 9728 §3.1: when the resource identifier has a path component, the
+        # metadata lives at the well-known URI with that path *inserted after*
+        # it — https://host/.well-known/oauth-protected-resource/mcp for a
+        # resource at https://host/mcp. That is the URL a client constructs
+        # from the resource identifier it was challenged with. Without this
+        # route the request fell through to the mounted application and came
+        # back 401 from OAuthMiddleware, so a client following the challenge
+        # correctly was told to authenticate in order to discover how to
+        # authenticate. Observed in production at
+        # https://mcp.muutto365.fi/.well-known/oauth-protected-resource/mcp.
+        #
+        # Same handler and same document as the un-suffixed route: this adds a
+        # spec-mandated address for the metadata, not a second version of it.
+        if self._protected_resource_metadata_path != "/.well-known/oauth-protected-resource":
+            routes.append(Route(
+                self._protected_resource_metadata_path,
+                protected_resource_metadata,
+                methods=["GET"],
+            ))
+
+        app = Starlette(routes=routes)
         app.state.base_url = self.base_url
         app.state.mcp_path = self.mcp_path
         app.state.storage = self.storage
@@ -278,7 +298,37 @@ class OAuthProvider:
         return meta
 
     @property
+    def _protected_resource_metadata_path(self) -> str:
+        """RFC 9728 §3.1 path-inserted metadata path, e.g. /.well-known/oauth-protected-resource/mcp.
+
+        Only the *leading* separator is removed, so the two segments cannot
+        concatenate into a double slash. A trailing slash is deliberately
+        preserved: it is part of resource_identifier, so a client deriving
+        this URL from a resource of https://host/mcp/ asks for
+        …/oauth-protected-resource/mcp/, and a route registered without the
+        slash does not answer it. Stripping both ends produced exactly that —
+        307 from the bare app, and 401 from an OAuthMiddleware-wrapped one,
+        which rejects on its exact `==` comparison before routing ever runs.
+
+        When mcp_path is empty or "/" the resource identifier has no path
+        component, RFC 9728 §3.1 does not apply, and this collapses to the
+        un-suffixed path — _build_app checks for that and does not register a
+        duplicate route.
+        """
+        suffix = self.mcp_path.lstrip("/")
+        return f"/.well-known/oauth-protected-resource/{suffix}" if suffix else "/.well-known/oauth-protected-resource"
+
+    @property
+    def protected_resource_metadata_path(self) -> str:
+        """Public alias of the above, used by OAuthMiddleware to leave this path unauthenticated."""
+        return self._protected_resource_metadata_path
+
+    @property
     def protected_resource_metadata_url(self) -> str:
+        # Kept pointing at the un-suffixed URL: it is what this provider has
+        # always advertised, both routes serve the same document, and changing
+        # what goes into WWW-Authenticate is a behavioural change for existing
+        # clients rather than the bug fix this is.
         return f"{self.base_url}/.well-known/oauth-protected-resource"
 
     @property

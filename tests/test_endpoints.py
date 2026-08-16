@@ -145,6 +145,73 @@ async def test_protected_resource_metadata(client_private):
     assert data["bearer_methods_supported"] == ["header"]
 
 
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_at_rfc9728_path_inserted_url(client_private):
+    """RFC 9728 §3.1: a resource identifier with a path component means the
+    metadata is at the well-known URI with that path inserted after it.
+
+    That is the URL a client builds from the resource identifier it was
+    challenged with, so it has to serve the same document as the un-suffixed
+    one. It previously 404'd through to the mounted app and came back 401.
+    """
+    client, provider = client_private
+    suffixed = await client.get("/.well-known/oauth-protected-resource/mcp")
+    plain = await client.get("/.well-known/oauth-protected-resource")
+
+    assert suffixed.status_code == 200
+    # Same document, not merely a second 200 — one metadata fact, two addresses.
+    assert suffixed.json() == plain.json()
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_path_follows_mcp_path():
+    """The suffix is derived from mcp_path, not hardcoded to "mcp"."""
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/api/v2/mcp")
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource/api/v2/mcp"
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/oauth-protected-resource/api/v2/mcp")
+    assert resp.status_code == 200
+    assert resp.json()["resource"] == "http://testserver/api/v2/mcp"
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_path_preserves_a_trailing_slash():
+    """A trailing slash is part of the resource identifier, so it is part of
+    the URL a client derives from it.
+
+    With mcp_path="/mcp/" the resource is https://host/mcp/ and the §3.1 URL is
+    …/oauth-protected-resource/mcp/. Normalising the slash away made the bare
+    app answer 307 and an OAuthMiddleware-wrapped one answer 401, because the
+    middleware compares the request path exactly and rejects before routing.
+    """
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/mcp/")
+    assert p.resource_identifier == "http://testserver/mcp/"
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource/mcp/"
+
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/oauth-protected-resource/mcp/")
+    assert resp.status_code == 200
+    assert resp.json()["resource"] == "http://testserver/mcp/"
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_no_duplicate_route_for_root_mcp_path():
+    """A resource identifier with no path component has no §3.1 variant, so the
+    suffixed path collapses onto the plain one and must not be registered twice."""
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/")
+    paths = [r.path for r in p.asgi_app().routes]
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource"
+    assert paths.count("/.well-known/oauth-protected-resource") == 1
+
+
 # --- Registration ---
 
 @pytest.mark.asyncio
