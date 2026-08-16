@@ -17,6 +17,12 @@ def _is_client_disconnect(exc: BaseException) -> bool:
 # This is an exact-match set derived directly from the route table in OAuthProvider.
 # Using exact matching (not prefix/startswith) prevents prefix-confusion attacks
 # where a path like /token_info or /.well-known-decoy/x would bypass auth.
+#
+# RFC 9728's path-inserted variant (/.well-known/oauth-protected-resource/<mcp_path>)
+# is not listed here because it depends on the provider's mcp_path, which is
+# configurable. It is matched separately in __call__ against
+# provider.protected_resource_metadata_path — still an exact comparison, so it
+# opens exactly one more path and inherits the same prefix-confusion immunity.
 _PUBLIC_PATHS = {
     "/register",
     "/authorize",
@@ -67,7 +73,7 @@ class OAuthMiddleware:
 
         path = scope.get("path", "")
 
-        if path in _PUBLIC_PATHS:
+        if path in _PUBLIC_PATHS or path == self.provider.protected_resource_metadata_path:
             await self.app(scope, receive, send)
             return
 

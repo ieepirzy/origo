@@ -195,6 +195,37 @@ async def test_well_known_non_public_paths_require_auth(provider, path):
 
 
 # ---------------------------------------------------------------------------
+# RFC 9728 §3.1 path-inserted metadata URL
+#
+# Not in _PUBLIC_PATHS because it depends on the provider's configurable
+# mcp_path; matched separately against provider.protected_resource_metadata_path.
+# Discovery metadata that requires a token to read tells a client to
+# authenticate in order to learn how to authenticate, which is what production
+# was doing before this bypass existed.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rfc9728_path_inserted_metadata_bypasses_auth(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get(provider.protected_resource_metadata_path)
+        assert resp.status_code == 200, (
+            "the RFC 9728 §3.1 metadata URL must be readable without a token"
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_inserted_bypass_is_exact_not_prefix(provider):
+    """The extra comparison must not open the whole subtree beneath it."""
+    app = _make_app(provider)
+    base = provider.protected_resource_metadata_path
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        for path in (f"{base}/extra", f"{base}x", f"{base}/../secret"):
+            resp = await client.get(path)
+            assert resp.status_code == 401, f"{path!r} must still require auth"
+
+
+# ---------------------------------------------------------------------------
 # Substring / embedded public-path strings — must require auth
 #
 # Verifies that matching is anchored to the full path, not "contains".
