@@ -178,6 +178,29 @@ async def test_protected_resource_metadata_path_follows_mcp_path():
 
 
 @pytest.mark.asyncio
+async def test_protected_resource_metadata_path_preserves_a_trailing_slash():
+    """A trailing slash is part of the resource identifier, so it is part of
+    the URL a client derives from it.
+
+    With mcp_path="/mcp/" the resource is https://host/mcp/ and the §3.1 URL is
+    …/oauth-protected-resource/mcp/. Normalising the slash away made the bare
+    app answer 307 and an OAuthMiddleware-wrapped one answer 401, because the
+    middleware compares the request path exactly and rejects before routing.
+    """
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/mcp/")
+    assert p.resource_identifier == "http://testserver/mcp/"
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource/mcp/"
+
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/oauth-protected-resource/mcp/")
+    assert resp.status_code == 200
+    assert resp.json()["resource"] == "http://testserver/mcp/"
+
+
+@pytest.mark.asyncio
 async def test_protected_resource_metadata_no_duplicate_route_for_root_mcp_path():
     """A resource identifier with no path component has no §3.1 variant, so the
     suffixed path collapses onto the plain one and must not be registered twice."""

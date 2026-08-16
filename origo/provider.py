@@ -301,18 +301,21 @@ class OAuthProvider:
     def _protected_resource_metadata_path(self) -> str:
         """RFC 9728 §3.1 path-inserted metadata path, e.g. /.well-known/oauth-protected-resource/mcp.
 
-        mcp_path is stored exactly as the caller passed it and is not
-        normalized anywhere, so it may arrive as "/mcp", "mcp" or "/mcp/".
-        Stripping both ends covers all three: the segments cannot concatenate
-        into a double slash, and there is no trailing slash to stop the
-        middleware's exact `==` comparison from matching the request path.
+        Only the *leading* separator is removed, so the two segments cannot
+        concatenate into a double slash. A trailing slash is deliberately
+        preserved: it is part of resource_identifier, so a client deriving
+        this URL from a resource of https://host/mcp/ asks for
+        …/oauth-protected-resource/mcp/, and a route registered without the
+        slash does not answer it. Stripping both ends produced exactly that —
+        307 from the bare app, and 401 from an OAuthMiddleware-wrapped one,
+        which rejects on its exact `==` comparison before routing ever runs.
 
         When mcp_path is empty or "/" the resource identifier has no path
         component, RFC 9728 §3.1 does not apply, and this collapses to the
         un-suffixed path — _build_app checks for that and does not register a
         duplicate route.
         """
-        suffix = self.mcp_path.strip("/")
+        suffix = self.mcp_path.lstrip("/")
         return f"/.well-known/oauth-protected-resource/{suffix}" if suffix else "/.well-known/oauth-protected-resource"
 
     @property
