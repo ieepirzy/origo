@@ -310,3 +310,81 @@ async def test_invalid_token_returns_401_with_www_authenticate(provider):
         assert resp.status_code == 401
         assert resp.json()["error"] == "invalid_token"
         assert "WWW-Authenticate" in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# Application-declared public paths
+#
+# The middleware protects everything it wraps, which is right for the MCP
+# endpoint and wrong for a landing document or a liveness probe. Without a way
+# to say so, an origo-protected service answers a bare 401 at its root to every
+# visitor and every scanner.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_declared_public_path_bypasses_auth():
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={"/"})
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get("/")).status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_declared_public_paths_are_exact_not_prefixes():
+    """Same anchoring as _PUBLIC_PATHS: a prefix rule would turn "/docs" into a
+    bypass for "/docs/../secret" and for anything merely starting with it."""
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={"/docs"})
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        for path in ("/docs/extra", "/docsx", "/docs/../secret", "/adocs"):
+            assert (await client.get(path)).status_code == 401, f"{path!r} must still require auth"
+
+
+@pytest.mark.asyncio
+async def test_undeclared_paths_still_require_auth():
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={"/"})
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get("/anything-else")).status_code == 401
+
+
+def test_public_paths_refuses_the_mcp_endpoint():
+    """The one genuinely dangerous entry: exempting the MCP path would serve
+    the whole protected resource unauthenticated."""
+    from origo import OAuthProvider
+
+    with pytest.raises(ValueError, match="protected resource"):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"},
+                      mcp_path="/mcp", public_paths={"/mcp"})
+    # Also caught when written with a trailing slash.
+    with pytest.raises(ValueError, match="protected resource"):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"},
+                      mcp_path="/mcp", public_paths={"/mcp/"})
+
+
+@pytest.mark.parametrize("bad", ["relative", "", "no-slash/x"])
+def test_public_paths_requires_absolute_paths(bad):
+    from origo import OAuthProvider
+
+    with pytest.raises(ValueError, match="absolute"):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={bad})
+
+
+def test_public_paths_rejects_non_strings():
+    from origo import OAuthProvider
+
+    with pytest.raises(TypeError):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={42})
+
+
+def test_public_paths_defaults_to_empty():
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
+    assert p.public_paths == frozenset()

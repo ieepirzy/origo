@@ -73,7 +73,14 @@ class OAuthMiddleware:
 
         path = scope.get("path", "")
 
-        if path in _PUBLIC_PATHS or path == self.provider.protected_resource_metadata_path:
+        if (
+            path in _PUBLIC_PATHS
+            or path == self.provider.protected_resource_metadata_path
+            # Application-declared, validated in OAuthProvider: absolute, exact,
+            # and never the MCP endpoint itself. getattr keeps a provider from
+            # an older origo working rather than raising on every request.
+            or path in getattr(self.provider, "public_paths", frozenset())
+        ):
             await self.app(scope, receive, send)
             return
 
