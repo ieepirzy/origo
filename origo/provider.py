@@ -322,24 +322,33 @@ class OAuthProvider:
         if not public_paths:
             return frozenset()
 
-        normalized: set[str] = set()
-        protected = "/" + self.mcp_path.strip("/") if self.mcp_path.strip("/") else None
+        declared: set[str] = set()
+        protected = self.mcp_path.strip("/")
         for raw in public_paths:
             if not isinstance(raw, str):
                 raise TypeError(f"public_paths entries must be strings; got {type(raw).__name__}")
             if not raw.startswith("/"):
                 raise ValueError(f"public_paths entries must be absolute paths starting with '/'; got {raw!r}")
-            # "/" is meaningful (the root); every other path loses a trailing
-            # slash so it matches the request path the middleware compares.
-            path = raw if raw == "/" else raw.rstrip("/")
-            if protected is not None and path == protected:
+            # Stored EXACTLY as configured, trailing slash and all. ASGI puts
+            # the raw path in scope["path"], so "/health/" and "/health" are
+            # different requests and the middleware compares them exactly.
+            # Trimming the slash here silently exempted the wrong one: a
+            # provider given "/health/" answered 401 to "/health/". The
+            # application knows which of the two its route table actually
+            # serves; this is not the place to guess, and normalising is how
+            # the same mistake was made once already for mcp_path.
+            #
+            # The MCP guard below is the one comparison that ignores the
+            # slash, because "/mcp" and "/mcp/" are the same resource for the
+            # purpose of "do not exempt it".
+            if protected and raw.strip("/") == protected:
                 raise ValueError(
-                    f"public_paths must not contain the MCP endpoint ({path!r}) — that is the "
+                    f"public_paths must not contain the MCP endpoint ({raw!r}) — that is the "
                     f"protected resource this middleware exists to guard, and exempting it would "
                     f"serve it to unauthenticated callers."
                 )
-            normalized.add(path)
-        return frozenset(normalized)
+            declared.add(raw)
+        return frozenset(declared)
 
     @property
     def _protected_resource_metadata_path(self) -> str:

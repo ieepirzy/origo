@@ -354,6 +354,39 @@ async def test_undeclared_paths_still_require_auth():
         assert (await client.get("/anything-else")).status_code == 401
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", ["/health/", "/health", "/a/b/", "/"])
+async def test_declared_public_paths_are_stored_and_matched_exactly(declared):
+    """ASGI puts the raw path in scope["path"], so "/health/" and "/health" are
+    different requests. Trimming the trailing slash at configuration time
+    exempted the wrong one — a provider given "/health/" answered 401 to
+    "/health/", which is the only path its route table actually serves."""
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={declared})
+    assert p.public_paths == frozenset({declared}), "the configured path must be stored verbatim"
+
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get(declared)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_declaring_one_slash_variant_does_not_exempt_the_other():
+    """Exact matching in both directions: declaring "/health" must not open
+    "/health/", and vice versa. An application that wants both says both."""
+    from origo import OAuthProvider
+
+    for declared, other in (("/health", "/health/"), ("/health/", "/health")):
+        p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={declared})
+        app = _make_app(p)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            assert (await client.get(declared)).status_code == 200
+            assert (await client.get(other)).status_code == 401, (
+                f"declaring {declared!r} must not exempt {other!r}"
+            )
+
+
 def test_public_paths_refuses_the_mcp_endpoint():
     """The one genuinely dangerous entry: exempting the MCP path would serve
     the whole protected resource unauthenticated."""
