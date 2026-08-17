@@ -3,7 +3,7 @@ import hashlib
 import os
 import sqlite3
 import warnings
-from typing import Optional
+from typing import Iterable, Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -139,6 +139,7 @@ class OAuthProvider:
         # New parameters go at the end: inserting one mid-signature would
         # silently rebind existing callers' positional arguments.
         storage_path: Optional[str] = _AUTO_STORAGE_PATH,
+        public_paths: Optional[Iterable[str]] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -225,6 +226,8 @@ class OAuthProvider:
                         stacklevel=2,
                     )
 
+        self.public_paths = self._normalize_public_paths(public_paths)
+
         if clients:
             self.storage.seed_clients(clients, client_redirect_uris)
         elif not public_registration:
@@ -296,6 +299,56 @@ class OAuthProvider:
         if resource is not None and meta.get("resource") not in (None, resource):
             return None
         return meta
+
+    def _normalize_public_paths(self, public_paths: Optional[Iterable[str]]) -> frozenset[str]:
+        """Validate application-declared paths that skip token validation.
+
+        The middleware protects everything it wraps, which is correct for the
+        MCP endpoint and wrong for anything an unauthenticated caller is
+        supposed to reach — a landing document at "/", a liveness probe, a
+        machine-readable index. Without this the application has no way to say
+        so, and its root answers a bare 401 to every visitor and every scanner.
+
+        Matched exactly, never as a prefix, for the same reason _PUBLIC_PATHS
+        is: a prefix rule turns "/x" into a bypass for "/x/../secret" and for
+        anything that merely starts with it.
+
+        Declaring a path here only *removes* authentication from it — it grants
+        nothing and cannot widen a token's reach. The one genuinely dangerous
+        mistake is naming the MCP endpoint itself, which would serve the whole
+        protected resource unauthenticated, so that is refused outright rather
+        than trusted to review.
+        """
+        if not public_paths:
+            return frozenset()
+
+        declared: set[str] = set()
+        protected = self.mcp_path.strip("/")
+        for raw in public_paths:
+            if not isinstance(raw, str):
+                raise TypeError(f"public_paths entries must be strings; got {type(raw).__name__}")
+            if not raw.startswith("/"):
+                raise ValueError(f"public_paths entries must be absolute paths starting with '/'; got {raw!r}")
+            # Stored EXACTLY as configured, trailing slash and all. ASGI puts
+            # the raw path in scope["path"], so "/health/" and "/health" are
+            # different requests and the middleware compares them exactly.
+            # Trimming the slash here silently exempted the wrong one: a
+            # provider given "/health/" answered 401 to "/health/". The
+            # application knows which of the two its route table actually
+            # serves; this is not the place to guess, and normalising is how
+            # the same mistake was made once already for mcp_path.
+            #
+            # The MCP guard below is the one comparison that ignores the
+            # slash, because "/mcp" and "/mcp/" are the same resource for the
+            # purpose of "do not exempt it".
+            if protected and raw.strip("/") == protected:
+                raise ValueError(
+                    f"public_paths must not contain the MCP endpoint ({raw!r}) — that is the "
+                    f"protected resource this middleware exists to guard, and exempting it would "
+                    f"serve it to unauthenticated callers."
+                )
+            declared.add(raw)
+        return frozenset(declared)
 
     @property
     def _protected_resource_metadata_path(self) -> str:
