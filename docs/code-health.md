@@ -38,15 +38,43 @@ cannot drift away from the record.
 ```bash
 pip install -e ".[dev,code-health,code-health-otel]"
 
+# Locally you produce the reports yourself. In CI the code-health job consumes
+# the ones the gating test matrix published (see below) rather than running the
+# suite again.
 pytest -q --junitxml=reports/junit.xml --cov=origo --cov-report=xml:reports/coverage.xml
 
 python -m tools.code_health \
   --output code-health.json \
   --junit reports/junit.xml \
   --coverage reports/coverage.xml \
+  --tests-python-version 3.12 \
   --baseline baseline/code-health.json \
   --gate --emit-otlp --emit-http
 ```
+
+### How the CI lane is wired
+
+The `code-health` job lives in `ci.yml` alongside the test matrix, not in a
+workflow of its own, so that it can consume the **very JUnit and coverage
+reports the gating run produced**. The 3.12 leg publishes them as an artifact;
+the code-health job downloads them in the same run.
+
+That placement is the point. A separate workflow could only reach those numbers
+by re-running pytest, and the snapshot would then describe a fourth execution
+rather than the one that actually gated the build — which is exactly what
+`tests_cov.collect` refuses to do by not running the suite itself.
+
+`needs: [test]` with `if: always()`: ordered after the suite so the reports
+exist, but still run when the suite failed. A failing commit's structural
+measurement is as valuable as a passing one's, and skipping it would leave a
+hole in the series precisely where the interesting commits are. If a matrix leg
+is cancelled and publishes nothing, the snapshot records `tests: skipped` and
+the structural measurement still lands.
+
+Only the 3.12 leg's reports are consumed, and `tests.python_version` records
+that. Coverage differs between interpreters wherever a branch is version-gated,
+so a coverage series that silently changed interpreter would not be one series;
+a change marks deltas `incomparable`.
 
 With no endpoint configured and no baseline available, the artifact is still
 produced and the summary is still printed. That is the intended degraded mode,
@@ -385,6 +413,43 @@ The `files` and `symbols` arrays are unbounded in principle (one entry per file
 and per function). For this repository the gzipped payload is a few tens of KB;
 a large monorepo will be larger, so size limits should be explicit rather than
 discovered.
+
+## Why a document sink as well as OTLP
+
+Raised in review on origo#97: the telemetry architecture is standardising on
+OTLP plus a Collector, so does the direct `CODE_HEALTH_ENDPOINT` path still
+earn its place? The answer this repository is going with, stated so it can be
+overruled on the evidence rather than on habit:
+
+**The canonical snapshot is a document, not a telemetry signal.** The two need
+different things from their storage:
+
+* **Structure.** OTLP log attributes are scalars or homogeneous arrays. Nested
+  structure has to be flattened (`complexity.p95`) or JSON-stringified — which
+  is what `otel._flatten` does to `symbols`-shaped data. That round trip is not
+  byte-exact, so the log record is a *view* of the snapshot, not the snapshot.
+* **Size.** The complete artifact is 39 KB for `origo` (5 KB gzipped) and
+  116 KB for `movingfirm-backend` (12 KB gzipped), carrying 277 per-symbol
+  records. The event path deliberately sends only the run record plus a capped
+  hotspot list, precisely so it does not become a per-push megabyte. Pushing
+  the whole document through the log signal would undo that.
+* **Retention.** Log backends are usually provisioned in weeks. This dataset is
+  meant to answer questions years out, and "preserve the complete canonical
+  artifact regardless" is the one rule the whole design is built around.
+
+There is also a concrete near-term requirement: the receiving endpoints are
+being built now, and the wire contract they implement is specified above under
+**Endpoint contract**.
+
+**What would change the answer.** If the Collector routes to durable
+object/analytical storage that accepts the document intact — which is squarely
+within what a Collector can do — then this path is redundant and should go. It
+is deliberately cheap to remove: one module (`emit.py`), one flag
+(`--emit-http`), two environment variables, and no schema change. Nothing else
+depends on it, and the artifact is written to disk either way.
+
+**It is off unless configured.** With `CODE_HEALTH_ENDPOINT` unset, emission is
+skipped and recorded as such. Failure is non-blocking by default.
 
 ## SonarQube Community Build — evaluation
 

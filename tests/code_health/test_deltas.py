@@ -157,3 +157,12 @@ def test_a_ruff_selection_change_makes_lint_deltas_incomparable(snapshot_factory
     result = deltas.compute(current, baseline)
     assert result["status"] == "incomparable"
     assert "ruff selection" in result["reason"]
+
+
+def test_a_test_interpreter_change_makes_coverage_deltas_incomparable(snapshot_factory):
+    current, baseline = snapshot_factory(), snapshot_factory()
+    current["tests"]["python_version"] = "3.13"
+    baseline["tests"]["python_version"] = "3.12"
+    result = deltas.compute(current, baseline)
+    assert result["status"] == "incomparable"
+    assert "test interpreter" in result["reason"]

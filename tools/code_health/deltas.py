@@ -86,6 +86,17 @@ def comparability(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
         reasons.append(
             f"ruff selection {_get(baseline, 'lint.select')} -> {_get(current, 'lint.select')}"
         )
+    # Coverage differs between interpreters wherever a branch is
+    # version-gated, so a coverage delta across a change of test interpreter is
+    # not a change in coverage.
+    current_tests_python = _get(current, "tests.python_version")
+    baseline_tests_python = _get(baseline, "tests.python_version")
+    if (
+        current_tests_python
+        and baseline_tests_python
+        and current_tests_python != baseline_tests_python
+    ):
+        reasons.append(f"test interpreter {baseline_tests_python} -> {current_tests_python}")
     current_python = _get(current, "typing.environment.python_version")
     baseline_python = _get(baseline, "typing.environment.python_version")
     if current_python and baseline_python and current_python != baseline_python:

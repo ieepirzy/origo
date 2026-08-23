@@ -26,6 +26,7 @@ def collect(
     *,
     junit_path: str | None = None,
     coverage_path: str | None = None,
+    python_version: str | None = None,
 ) -> tuple[dict[str, Any], ToolRun]:
     tool = ToolRun(name="tests")
     data: dict[str, Any] = {
@@ -39,6 +40,10 @@ def collect(
         "coverage_percent": None,
         "coverage_source": None,
         "junit_source": None,
+        # Which interpreter ran the suite these reports came from.  Coverage
+        # differs between versions wherever a branch is version-gated, so a
+        # coverage series that silently changes interpreter is not one series.
+        "python_version": python_version,
     }
 
     problems: list[str] = []

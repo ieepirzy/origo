@@ -186,3 +186,19 @@ def test_any_analyzer_error_fails_the_run(snapshot_factory):
 
     document = _snapshot_with_tools(snapshot_factory, {"tests": {"status": "error", "error": "bad xml"}})
     assert _analyzer_failures(document, type_checker="pyright")
+
+
+def test_the_test_interpreter_is_recorded(tmp_path):
+    """Coverage differs between interpreters wherever a branch is
+    version-gated, so the number has to name the interpreter that produced it."""
+    report = tmp_path / "junit.xml"
+    report.write_text('<testsuite tests="3" failures="0" errors="0" skipped="0" time="1"/>')
+    data, _ = tests_cov.collect(junit_path=str(report), python_version="3.12")
+    assert data["python_version"] == "3.12"
+
+
+def test_an_unrecorded_test_interpreter_is_null_not_guessed(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text('<testsuite tests="3" failures="0" errors="0" skipped="0" time="1"/>')
+    data, _ = tests_cov.collect(junit_path=str(report))
+    assert data["python_version"] is None

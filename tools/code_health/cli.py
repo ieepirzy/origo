@@ -31,6 +31,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--baseline", help="Previous snapshot to compute deltas against.")
     parser.add_argument("--junit", help="JUnit XML produced by the test run.")
     parser.add_argument("--coverage", help="coverage.py XML or JSON report.")
+    parser.add_argument(
+        "--tests-python-version",
+        help="Interpreter that produced the consumed test reports; recorded in the snapshot.",
+    )
     parser.add_argument("--bandit-json", help="Bandit JSON report.")
     parser.add_argument("--semgrep-json", help="Semgrep JSON report.")
     parser.add_argument("--osv-json", help="OSV-Scanner JSON report.")
@@ -117,7 +121,11 @@ def collect_snapshot(
             config.effective_typecheck_paths, tool_name=checker, cwd=root
         )
     with exporter.span("code_health.tests"):
-        tests, tests_tool = tests_cov.collect(junit_path=args.junit, coverage_path=args.coverage)
+        tests, tests_tool = tests_cov.collect(
+            junit_path=args.junit,
+            coverage_path=args.coverage,
+            python_version=args.tests_python_version,
+        )
     with exporter.span("code_health.security"):
         security, security_tool = security_analyzer.collect(
             bandit_json=args.bandit_json,
