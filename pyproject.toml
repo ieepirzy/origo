@@ -56,9 +56,14 @@ code-health = ["radon==6.0.1", "ruff==0.16.4", "pyright==1.1.408"]
 # OTLP export. Optional on purpose: with these absent the collector still
 # produces the canonical artifact and prints the summary, and records the
 # export as skipped rather than failing.
+# Pinned, though for a weaker reason than the analyzers: the SDK version
+# changes no recorded value, so it is not a comparability hazard. It is an
+# export-stability one -- `LogRecord` moved out of `opentelemetry.sdk._logs`
+# into `opentelemetry._logs` between releases, and a float across that boundary
+# silently disables the event stream while the job stays green.
 code-health-otel = [
-  "opentelemetry-sdk>=1.30",
-  "opentelemetry-exporter-otlp-proto-http>=1.30",
+  "opentelemetry-sdk==1.44.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
 ]
 
 [project.urls]
