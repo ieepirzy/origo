@@ -1,0 +1,132 @@
+name: Code health
+
+# Separate workflow rather than a job inside ci.yml: this lane has a different
+# failure contract (measurement is blocking, telemetry is not), a different
+# trigger surface, and it must be able to run on the default branch to produce
+# the canonical historical observation even when nothing else needs to.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      authoring_mode:
+        description: "Explicit authoring mode for this run"
+        required: false
+        type: choice
+        options: ["", "human", "human_assisted", "agent_supervised", "agent_autonomous", "mixed"]
+      agent_name:
+        description: "Agent that produced the change, if any"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-health-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-health:
+    name: Analyze and export
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Needed only to read the previous run's baseline artifact.
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The merge-base against the default branch is needed to describe a
+          # pull request's change; a shallow clone does not contain it.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the package, its tests, and the analyzers
+        run: pip install -e ".[dev,code-health,code-health-otel]"
+
+      # The collector consumes test reports; it deliberately does not run the
+      # suite itself. CI owns that, so the numbers in the snapshot are the
+      # numbers that actually gated the build.
+      - name: Run tests with machine-readable reports
+        id: tests
+        continue-on-error: true
+        run: |
+          pytest -q --tb=short \
+            --junitxml=reports/junit.xml \
+            --cov=origo --cov-report=xml:reports/coverage.xml
+
+      - name: Fetch the previous default-branch snapshot as a baseline
+        id: baseline
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # The most recent successful default-branch run of this workflow.
+          # A missing baseline is normal (first run, or a new branch) and must
+          # not fail the job -- the collector reports deltas as unavailable.
+          run_id="$(gh run list --workflow code-health.yml --branch main \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId' || true)"
+          if [ -z "${run_id:-}" ] || [ "${run_id}" = "null" ]; then
+            echo "no previous successful main run; deltas will be unavailable"
+            exit 0
+          fi
+          mkdir -p baseline
+          gh run download "$run_id" --name code-health-main --dir baseline \
+            || echo "baseline artifact unavailable for run $run_id"
+
+      - name: Collect, report, and export
+        env:
+          # Standard OpenTelemetry configuration only. The Collector decides
+          # where anything goes; CI does not know the backends.
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          # Optional direct document sink, independent of the Collector.
+          CODE_HEALTH_ENDPOINT: ${{ vars.CODE_HEALTH_ENDPOINT }}
+          CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
+          CODE_HEALTH_DEFAULT_BRANCH: main
+          # --- provenance: explicit metadata only, never inferred ---
+          CODE_HEALTH_AUTHORING_MODE: ${{ inputs.authoring_mode }}
+          CODE_HEALTH_AGENT_NAME: ${{ inputs.agent_name }}
+          # Labels are trusted because applying one needs write access.
+          CODE_HEALTH_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GITHUB_EVENT_PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python -m tools.code_health \
+            --output code-health.json \
+            --junit reports/junit.xml \
+            --coverage reports/coverage.xml \
+            --baseline baseline/code-health.json \
+            --gate \
+            --emit-otlp \
+            --emit-http
+
+      # Always uploaded, including when the gate failed: the measurement of a
+      # failing commit is exactly as valuable as the measurement of a passing
+      # one, and losing it would put a hole in the series.
+      - name: Upload the canonical artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-health-${{ github.ref_name == 'main' && 'main' || format('pr-{0}', github.run_id) }}
+          path: |
+            code-health.json
+            reports/
+          retention-days: 90
+
+      # The test step is `continue-on-error` so that a failing suite still
+      # produces a snapshot. The build must still fail, so the outcome is
+      # re-raised here, after the artifact is safely uploaded.
+      - name: Re-raise test failure
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "::error::test suite failed; see the Run tests step"
+          exit 1

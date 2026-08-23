@@ -1,0 +1,469 @@
+{
+  "schema_version": 1,
+  "generated_by": {
+    "name": "code-health",
+    "version": "0.1.0"
+  },
+  "definitions": {
+    "function_set": "radon:function|method|closure (class blocks excluded)",
+    "percentile_method": "nearest_rank",
+    "high_complexity_threshold": 10,
+    "complexity_buckets": [
+      10,
+      15,
+      20
+    ],
+    "density_min_source_loc": 200,
+    "growth_min_abs_delta_loc": 25,
+    "maintainability_aggregation": "unweighted_mean_over_files",
+    "loc_definition": "radon.raw: loc=physical lines, sloc=source lines (comments and blank lines excluded)"
+  },
+  "run": {
+    "repository": "origo",
+    "repository_url": "https://github.com/ieepirzy/origo",
+    "commit_sha": "43af83ee43b47825521d3e3a01b20ec640c2d929",
+    "branch": "main",
+    "default_branch": "main",
+    "is_default_branch": true,
+    "ref_class": "default_branch",
+    "change_id": null,
+    "base_ref": null,
+    "merge_base_sha": null,
+    "timestamp": "2026-08-23T07:35:00Z",
+    "canonical": true,
+    "observation_id": "sha256:571b286412f85a892c4592efa4900b41fc3e2c5dc0ec42180082a74a6d1a90a6"
+  },
+  "ci": {
+    "provider": "github-actions",
+    "workflow": "Code health",
+    "job": "code-health",
+    "run_id": "17482910337",
+    "run_attempt": "1",
+    "run_number": "42",
+    "event_name": "push",
+    "runner_os": "Linux",
+    "runner_environment": "github-hosted",
+    "actor": "ieepirzy"
+  },
+  "target": {
+    "language": "python",
+    "paths": [
+      "origo"
+    ],
+    "lint_paths": [
+      "origo",
+      "tests"
+    ],
+    "typecheck_paths": [
+      "origo"
+    ],
+    "python_version": "3.11.15"
+  },
+  "provenance": {
+    "authoring_mode": "agent_supervised",
+    "authoring_mode_source": "workflow_input",
+    "declared_modes": {
+      "workflow_input": "agent_supervised"
+    },
+    "conflict": false,
+    "human_authors": [
+      {
+        "id": "u_001",
+        "source": "workflow_input"
+      }
+    ],
+    "agents": [
+      {
+        "name": "claude-code",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "run_id": "run_01K3QW",
+        "source": "mirarun",
+        "environment_id": "env_origo_ci",
+        "routine_id": null
+      }
+    ],
+    "agent_run_ids": [
+      "run_01K3QW"
+    ],
+    "models": [
+      "claude-opus-5"
+    ],
+    "granularity": "change",
+    "review": {
+      "human_reviewed": true,
+      "approval_count": 1,
+      "review_source": "workflow_input"
+    }
+  },
+  "summary": {
+    "loc": 2377,
+    "source_loc": 1651,
+    "files": 7,
+    "functions": 92,
+    "function_set": "radon:function|method|closure (class blocks excluded)"
+  },
+  "complexity": {
+    "aggregate": 440,
+    "mean": 4.782608695652174,
+    "p50": 3,
+    "p90": 9,
+    "p95": 18,
+    "max": 34,
+    "min": 1,
+    "functions_gt_10": 8,
+    "functions_gt_15": 5,
+    "functions_gt_20": 3,
+    "high_complexity_fraction": 0.08695652173913043,
+    "density_per_kloc": 266.50514839491217,
+    "status": "ok"
+  },
+  "maintainability": {
+    "status": "ok",
+    "tool": "radon",
+    "mean_index": 57.11788015392652,
+    "min_index": 15.630915423989011,
+    "p10_index": 15.630915423989011,
+    "files_measured": 7
+  },
+  "halstead": {
+    "status": "ok",
+    "tool": "radon",
+    "volume_total": null,
+    "difficulty_mean": null,
+    "effort_total": null,
+    "bugs_total": null,
+    "files_measured": null
+  },
+  "lint": {
+    "status": "ok",
+    "tool": "ruff",
+    "errors": 12,
+    "warnings": 0,
+    "total": 12,
+    "fixable": 7,
+    "gate_errors": 0,
+    "gate_paths": [
+      "origo"
+    ],
+    "blocking_rule_prefixes": [
+      "F",
+      "E4",
+      "E7",
+      "E9"
+    ],
+    "by_rule": {
+      "F401": 7,
+      "F841": 3,
+      "E402": 2
+    }
+  },
+  "typing": {
+    "status": "ok",
+    "tool": "pyright",
+    "tool_version": "pyright 1.1.408",
+    "errors": 55,
+    "warnings": 0,
+    "information": 0,
+    "files_analyzed": 7,
+    "import_errors": 1,
+    "errors_excluding_imports": 54,
+    "environment": {
+      "python_version": "3.11.15",
+      "executable": "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/chvenv/bin/python",
+      "virtual_env": null
+    },
+    "by_rule": {
+      "reportArgumentType": 35,
+      "reportAttributeAccessIssue": 10,
+      "reportOptionalMemberAccess": 7,
+      "reportCallIssue": 2,
+      "reportMissingImports": 1
+    }
+  },
+  "tests": {
+    "status": "ok",
+    "passed": 329,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 1,
+    "total": 330,
+    "duration_seconds": 14.197,
+    "coverage_percent": 89.18,
+    "coverage_source": "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/coverage.xml",
+    "junit_source": "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/junit.xml"
+  },
+  "security": {
+    "status": "skipped",
+    "sast_findings": null,
+    "sast_high": null,
+    "sast_tool": null,
+    "secret_findings": null,
+    "secret_tool": null,
+    "dependency_findings": null,
+    "dependency_tool": null,
+    "sources": {}
+  },
+  "deltas": {
+    "status": "ok",
+    "reason": null,
+    "baseline": {
+      "commit_sha": "0000000000000000000000000000000000000000",
+      "branch": "main",
+      "timestamp": "2026-08-20T09:00:00Z",
+      "observation_id": "sha256:571b286412f85a892c4592efa4900b41fc3e2c5dc0ec42180082a74a6d1a90a6",
+      "schema_version": 1
+    },
+    "values": {
+      "loc": 120,
+      "source_loc": 104,
+      "files": 0,
+      "functions": 0,
+      "aggregate_complexity": 17,
+      "mean_complexity": 0.0,
+      "p50_complexity": 0,
+      "p90_complexity": 0,
+      "p95_complexity": 0,
+      "max_complexity": 0,
+      "functions_gt_10": 0,
+      "functions_gt_15": 0,
+      "functions_gt_20": 0,
+      "high_complexity_fraction": 0.0,
+      "complexity_density": -6.927301508125993,
+      "maintainability_index": 0.3999999999999986,
+      "lint_total": 0,
+      "type_errors": 2,
+      "type_errors_excluding_imports": 0,
+      "coverage_percent": 0.7999999999999972
+    },
+    "complexity_growth_per_loc": 0.16346153846153846
+  },
+  "hotspots": [
+    {
+      "path": "origo/endpoints.py",
+      "symbol": "authorize",
+      "symbol_type": "function",
+      "line": 545,
+      "endline": 678,
+      "loc": 134,
+      "cyclomatic_complexity": 34,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "path": "origo/endpoints.py",
+      "symbol": "token",
+      "symbol_type": "function",
+      "line": 683,
+      "endline": 808,
+      "loc": 126,
+      "cyclomatic_complexity": 29,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "path": "origo/storage.py",
+      "symbol": "OAuthStorage._cleanup_expired",
+      "symbol_type": "method",
+      "line": 267,
+      "endline": 309,
+      "loc": 43,
+      "cyclomatic_complexity": 26,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "path": "origo/provider.py",
+      "symbol": "OAuthProvider.__init__",
+      "symbol_type": "method",
+      "line": 121,
+      "endline": 241,
+      "loc": 121,
+      "cyclomatic_complexity": 19,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "_elided": "remaining hotspots omitted from this example only"
+    }
+  ],
+  "files": [
+    {
+      "path": "origo/__init__.py",
+      "loc": 6,
+      "source_loc": 5,
+      "comment_lines": 0,
+      "blank_lines": 1,
+      "logical_loc": 5,
+      "functions": null,
+      "complexity_total": null,
+      "complexity_max": null,
+      "maintainability_index": 100.0,
+      "maintainability_rank": "A",
+      "halstead": null
+    },
+    {
+      "path": "origo/endpoints.py",
+      "loc": 833,
+      "source_loc": 604,
+      "comment_lines": 57,
+      "blank_lines": 134,
+      "logical_loc": 565,
+      "functions": 27,
+      "complexity_total": 179,
+      "complexity_max": 34,
+      "maintainability_index": 15.630915423989011,
+      "maintainability_rank": "B",
+      "halstead": null
+    },
+    {
+      "_elided": "5 further file records omitted from this example only"
+    }
+  ],
+  "symbols": [
+    {
+      "path": "origo/endpoints.py",
+      "symbol": "_safe_compare_digest",
+      "symbol_type": "function",
+      "line": 42,
+      "endline": 48,
+      "loc": 7,
+      "cyclomatic_complexity": 4,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "path": "origo/endpoints.py",
+      "symbol": "_verify_pkce",
+      "symbol_type": "function",
+      "line": 51,
+      "endline": 59,
+      "loc": 9,
+      "cyclomatic_complexity": 3,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "path": "origo/endpoints.py",
+      "symbol": "_uri_is_header_safe",
+      "symbol_type": "function",
+      "line": 70,
+      "endline": 86,
+      "loc": 17,
+      "cyclomatic_complexity": 4,
+      "maintainability_index": null,
+      "nesting_depth": null
+    },
+    {
+      "_elided": "89 further symbol records omitted from this example only; the real artifact contains all 92"
+    }
+  ],
+  "tools": {
+    "radon": {
+      "name": "radon",
+      "status": "ok",
+      "version": "6.0.1",
+      "command": [
+        "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/chvenv/bin/radon",
+        "cc",
+        "-j",
+        "--show-closures",
+        "origo"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.11165455700006532,
+      "error": null
+    },
+    "radon-raw": {
+      "name": "radon-raw",
+      "status": "ok",
+      "version": "6.0.1",
+      "command": [
+        "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/chvenv/bin/radon",
+        "raw",
+        "-j",
+        "origo"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.14526551599988125,
+      "error": null
+    },
+    "radon-mi": {
+      "name": "radon-mi",
+      "status": "ok",
+      "version": "6.0.1",
+      "command": [
+        "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/chvenv/bin/radon",
+        "mi",
+        "-j",
+        "--show",
+        "origo"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.18592205300001297,
+      "error": null
+    },
+    "radon-hal": {
+      "name": "radon-hal",
+      "status": "ok",
+      "version": "6.0.1",
+      "command": [
+        "/tmp/claude-0/-home-user/4b74f7b7-8d5d-5e84-9792-966d1753643e/scratchpad/chvenv/bin/radon",
+        "hal",
+        "-j",
+        "origo"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.09500421200004894,
+      "error": null
+    },
+    "ruff": {
+      "name": "ruff",
+      "status": "ok",
+      "version": "ruff 0.15.8",
+      "command": [
+        "/root/.local/bin/ruff",
+        "check",
+        "--output-format",
+        "json",
+        "--exit-zero",
+        "origo",
+        "tests"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.016682187000014892,
+      "error": null
+    },
+    "pyright": {
+      "name": "pyright",
+      "status": "ok",
+      "version": "pyright 1.1.408",
+      "command": [
+        "/root/.local/bin/pyright",
+        "--outputjson",
+        "origo"
+      ],
+      "exit_code": 1,
+      "duration_seconds": 1.8386317919998874,
+      "error": null
+    },
+    "tests": {
+      "name": "tests",
+      "status": "ok",
+      "version": null,
+      "command": [],
+      "exit_code": null,
+      "duration_seconds": null,
+      "error": null
+    },
+    "security": {
+      "name": "security",
+      "status": "skipped",
+      "version": null,
+      "command": [],
+      "exit_code": null,
+      "duration_seconds": null,
+      "error": "no security reports configured"
+    }
+  }
+}
