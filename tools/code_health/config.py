@@ -1,10 +1,20 @@
 """Per-repository configuration.
 
-Read from ``[tool.code_health]`` in ``pyproject.toml`` so a repository declares
-its own analysis target in the file it already uses for tooling, rather than in
+A repository declares its own analysis target in a file it owns, rather than in
 workflow YAML.  That is what lets the same collector run unchanged across
 repositories: CI orchestrates, the repository configures, and neither contains
 the data model.
+
+Two sources, in precedence order:
+
+``code-health.toml``
+    A standalone file with the settings at the top level.  For repositories
+    with no ``pyproject.toml`` -- several of ours are ``requirements.txt``
+    applications rather than packages, and adding a ``pyproject.toml`` purely
+    to hold four settings changes how build and packaging tools see the
+    repository, which is a bigger change than it looks.
+``pyproject.toml``
+    ``[tool.code_health]``, for repositories that already have one.
 """
 
 from __future__ import annotations
@@ -38,6 +48,9 @@ class Config:
     language: str = "python"
     hotspot_limit: int = 20
     max_detail_events: int = 50
+    #: Which file supplied the settings, recorded in the snapshot's target
+    #: block so a reader knows what governed the run.
+    source: str | None = None
 
     @property
     def effective_lint_paths(self) -> list[str]:
@@ -58,16 +71,50 @@ class Config:
         return self.lint_gate_paths or self.paths
 
 
-def load(repo_root: str = ".") -> Config:
-    """Load ``[tool.code_health]``, falling back to sane defaults."""
-    path = os.path.join(repo_root, "pyproject.toml")
+#: Where configuration may live, most specific first.  The second element of
+#: each pair is the path to the settings table inside that file.
+CONFIG_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("code-health.toml", ()),
+    ("pyproject.toml", ("tool", "code_health")),
+)
+
+
+def _read_table(path: str, keys: tuple[str, ...]) -> dict[str, Any] | None:
     if tomllib is None or not os.path.exists(path):
-        return Config()
-    with open(path, "rb") as handle:
-        payload: dict[str, Any] = tomllib.load(handle)
-    section = payload.get("tool", {}).get("code_health", {})
+        return None
+    try:
+        with open(path, "rb") as handle:
+            payload: Any = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        # A malformed pyproject.toml is not this tool's problem to report, and
+        # falling back to defaults silently would hide a real misconfiguration
+        # -- so it is surfaced by the caller failing on the resulting analysis,
+        # not swallowed into a wrong config.
+        raise
+    for key in keys:
+        if not isinstance(payload, dict):
+            return None
+        payload = payload.get(key)
+        if payload is None:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def load(repo_root: str = ".") -> Config:
+    """Load repository configuration, falling back to sane defaults.
+
+    An unconfigured repository gets ``paths = ["."]``, which measures and gates
+    everything.  That is the safe default: a repository that forgot to
+    configure the lane is over-measured, never silently under-measured.
+    """
     config = Config()
-    for key, value in section.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
+    for filename, keys in CONFIG_SOURCES:
+        section = _read_table(os.path.join(repo_root, filename), keys)
+        if section is None:
+            continue
+        for key, value in section.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+        config.source = filename
+        break
     return config

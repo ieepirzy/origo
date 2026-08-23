@@ -131,6 +131,7 @@ def collect_snapshot(
         "lint_paths": config.effective_lint_paths,
         "typecheck_paths": config.effective_typecheck_paths,
         "python_version": sys.version.split()[0],
+        "config_source": config.source,
     }
 
     tool_runs = [radon_tool, raw_tool, mi_tool, hal_tool, lint_tool, type_tool, tests_tool, security_tool]
