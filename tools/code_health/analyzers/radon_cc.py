@@ -144,6 +144,29 @@ def collect_complexity(paths: list[str], *, cwd: str | None = None) -> tuple[lis
     return symbols, tool
 
 
+def _partition(payload: dict[str, Any], tool: ToolRun) -> tuple[dict[str, dict[str, Any]], ToolRun]:
+    """Keep the files radon measured; report the ones it could not.
+
+    radon returns a successful JSON response that carries a per-file
+    ``{"error": ...}`` entry for any file it failed to parse. Silently dropping
+    those leaves the tool in ``ok`` state while LOC, file count and density are
+    computed over a subset -- partial numbers presented as complete, which is
+    the one thing this collector is built not to do. ``collect_complexity``
+    already reported them; these three now do the same.
+    """
+    kept: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for path, value in payload.items():
+        if isinstance(value, dict) and "error" in value:
+            failures.append(f"{path}: {value['error']}")
+        elif isinstance(value, dict):
+            kept[path] = value
+    if failures:
+        tool.status = "error"
+        tool.error = "; ".join(failures)[:2000]
+    return kept, tool
+
+
 def collect_raw(paths: list[str], *, cwd: str | None = None) -> tuple[dict[str, dict[str, Any]], ToolRun]:
     """Per-file raw line metrics (loc / sloc / comments / blank)."""
     executable = which("radon")
@@ -168,7 +191,7 @@ def collect_raw(paths: list[str], *, cwd: str | None = None) -> tuple[dict[str, 
         tool.status = "error"
         tool.error = f"could not parse radon raw JSON: {exc}"
         return {}, tool
-    return {p: v for p, v in payload.items() if isinstance(v, dict) and "error" not in v}, tool
+    return _partition(payload, tool)
 
 
 def collect_maintainability(paths: list[str], *, cwd: str | None = None) -> tuple[dict[str, dict[str, Any]], ToolRun]:
@@ -200,7 +223,7 @@ def collect_maintainability(paths: list[str], *, cwd: str | None = None) -> tupl
         tool.status = "error"
         tool.error = f"could not parse radon mi JSON: {exc}"
         return {}, tool
-    return {p: v for p, v in payload.items() if isinstance(v, dict) and "error" not in v}, tool
+    return _partition(payload, tool)
 
 
 def collect_halstead(paths: list[str], *, cwd: str | None = None) -> tuple[dict[str, dict[str, Any]], ToolRun]:
@@ -237,10 +260,17 @@ def collect_halstead(paths: list[str], *, cwd: str | None = None) -> tuple[dict[
     keys = ("h1", "h2", "N1", "N2", "vocabulary", "length", "calculated_length",
             "volume", "difficulty", "effort", "time", "bugs")
     out: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
     for path, value in payload.items():
+        if isinstance(value, dict) and "error" in value:
+            failures.append(f"{path}: {value['error']}")
+            continue
         if not isinstance(value, dict) or "total" not in value:
             continue
         total = value["total"]
         if isinstance(total, list) and len(total) == len(keys):
             out[path] = dict(zip(keys, total))
+    if failures:
+        tool.status = "error"
+        tool.error = "; ".join(failures)[:2000]
     return out, tool

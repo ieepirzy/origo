@@ -46,11 +46,17 @@ def collect(
         "python_version": python_version,
     }
 
+    # Two different facts, and collapsing them is what made a cancelled test
+    # leg fail the whole lane. A report that was *never produced* (the upstream
+    # job was cancelled, or did not run) is a measurement we do not have --
+    # `skipped`. A report that exists and cannot be parsed is a measurement we
+    # thought we had and do not -- `error`, which fails the run.
+    missing: list[str] = []
     problems: list[str] = []
 
     if junit_path:
         if not os.path.exists(junit_path):
-            problems.append(f"junit report not found: {junit_path}")
+            missing.append(f"junit report not produced: {junit_path}")
         else:
             try:
                 data.update(_parse_junit(junit_path))
@@ -61,7 +67,7 @@ def collect(
 
     if coverage_path:
         if not os.path.exists(coverage_path):
-            problems.append(f"coverage report not found: {coverage_path}")
+            missing.append(f"coverage report not produced: {coverage_path}")
         else:
             try:
                 percent = _parse_coverage(coverage_path)
@@ -77,9 +83,20 @@ def collect(
         # A partially-read report is a partial measurement.  Whatever was read
         # is kept, but the status says the reading was not clean.
         data["status"] = "error"
-        data["error"] = "; ".join(problems)
+        data["error"] = "; ".join(problems + missing)
         tool.status = "error"
         tool.error = data["error"]
+    elif missing and data["status"] == "skipped":
+        # Nothing was produced at all. The reason is recorded rather than
+        # discarded, so "not produced" stays distinguishable from "never
+        # configured" when reading the artifact later.
+        tool.status = "skipped"
+        tool.error = "; ".join(missing)
+        data["error"] = tool.error
+    elif missing:
+        # One report arrived and the other did not. What was read is kept and
+        # the gap is recorded; it is not a failure.
+        data["error"] = "; ".join(missing)
     elif data["status"] == "skipped":
         tool.status = "skipped"
         tool.error = "no junit or coverage report configured"

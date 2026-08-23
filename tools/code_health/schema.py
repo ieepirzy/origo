@@ -109,21 +109,35 @@ def observation_id(
     repository: str,
     commit_sha: str | None,
     target_paths: list[str],
+    analyzed_tree_sha: str | None = None,
     schema_version: int = SCHEMA_VERSION,
 ) -> str:
-    """A stable identity for "this analysis of this commit".
+    """A stable identity for "this analysis of this code".
 
-    Re-analyzing the same commit with the same target produces the same value,
+    Re-analyzing the same code with the same target produces the same value,
     which is what lets a backend deduplicate repeated ingestion (a rerun, a
     replayed webhook, a workflow retried after a flake).  ``run_id`` and
     ``run_attempt`` are recorded separately and deliberately excluded here, so
     that reruns remain *distinguishable* while still being *dedupable*.
+
+    ``analyzed_tree_sha`` is what makes that "this code" rather than "this
+    commit", and it is not redundant with ``commit_sha``.  On a pull request
+    CI checks out GitHub's synthetic merge commit, so the tree actually
+    measured is head-merged-into-base while ``commit_sha`` records the head --
+    the identifier the observation can be joined on, since the merge commit
+    exists nowhere in the repository's history.  Keying only on the head means
+    that when the base branch advances under an unchanged head, a rerun
+    measures genuinely different code and produces the *same* id, and a
+    receiver deduplicating on it discards the newer measurement as though it
+    were a replay.  Including the analyzed tree fixes that in the right
+    direction: identical code still dedupes, different code no longer collides.
     """
     material = json.dumps(
         {
             "schema_version": schema_version,
             "repository": repository,
             "commit_sha": commit_sha,
+            "analyzed_tree_sha": analyzed_tree_sha,
             "target_paths": sorted(target_paths),
         },
         sort_keys=True,

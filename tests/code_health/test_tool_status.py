@@ -89,10 +89,20 @@ def test_a_ruff_syntax_error_is_blocking_even_without_a_code(monkeypatch):
     assert data["by_rule"] == {"syntax-error": 1}
 
 
-def test_missing_reports_are_an_error_not_zero_tests(tmp_path):
+def test_missing_reports_are_never_zero_tests(tmp_path):
+    """The property this test has always been about: absence is not a pass of zero.
+
+    It previously also asserted `status == "error"`, which encoded a belief
+    rather than a requirement -- and that belief was what made a cancelled test
+    leg fail the whole lane (see
+    `test_a_report_that_was_never_produced_is_skipped_not_broken`). The
+    classification changed deliberately; the not-zero guarantee did not.
+    """
     data, tool = tests_cov.collect(junit_path=str(tmp_path / "nope.xml"))
-    assert tool.status == "error"
+    assert tool.status == "skipped"
     assert data["passed"] is None
+    assert data["total"] is None
+    assert data["coverage_percent"] is None
 
 
 def test_no_reports_configured_is_skipped_not_failed():
@@ -202,3 +212,42 @@ def test_an_unrecorded_test_interpreter_is_null_not_guessed(tmp_path):
     report.write_text('<testsuite tests="3" failures="0" errors="0" skipped="0" time="1"/>')
     data, _ = tests_cov.collect(junit_path=str(report))
     assert data["python_version"] is None
+
+
+def test_a_report_that_was_never_produced_is_skipped_not_broken(tmp_path):
+    """A cancelled upstream test leg must not fail the whole lane.
+
+    Codex review on origo#97: with the reports absent the collector returned
+    `error`, `_analyzer_failures` exited 2, and the documented degraded mode
+    ("tests: skipped, structural measurement still lands") never happened.
+    """
+    data, tool = tests_cov.collect(
+        junit_path=str(tmp_path / "junit.xml"), coverage_path=str(tmp_path / "coverage.xml")
+    )
+    assert tool.status == "skipped"
+    assert data["status"] == "skipped"
+    assert data["passed"] is None
+    # The reason is kept, so "not produced" stays distinguishable from
+    # "never configured" when reading the artifact months later.
+    assert "not produced" in data["error"]
+
+
+def test_a_report_that_exists_but_is_broken_is_still_an_error(tmp_path):
+    """The other half of the distinction: a measurement we thought we had."""
+    report = tmp_path / "junit.xml"
+    report.write_text("this is not xml at all <<<")
+    data, tool = tests_cov.collect(junit_path=str(report))
+    assert tool.status == "error"
+    assert data["status"] == "error"
+
+
+def test_one_report_missing_and_one_present_keeps_what_was_read(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text('<testsuite tests="5" failures="0" errors="0" skipped="0" time="1"/>')
+    data, tool = tests_cov.collect(
+        junit_path=str(report), coverage_path=str(tmp_path / "nope.xml")
+    )
+    assert tool.status == "ok"
+    assert data["passed"] == 5
+    assert data["coverage_percent"] is None
+    assert "not produced" in data["error"]

@@ -89,6 +89,12 @@ def collect(
         "repository": repository,
         "repository_url": repository_url,
         "commit_sha": commit_sha,
+        # The tree that was actually measured. On a pull request this is
+        # GitHub's synthetic merge commit, which differs from `commit_sha`
+        # above and exists nowhere in the repository's history -- so it
+        # identifies the measurement without being joinable, which is exactly
+        # the opposite of `commit_sha` and why both are kept.
+        "analyzed_tree_sha": _git(["rev-parse", "HEAD"], cwd=repo_root),
         "branch": branch,
         "default_branch": default_branch,
         "is_default_branch": is_default_branch,
@@ -126,4 +132,5 @@ def finalize_observation_id(run: dict[str, Any], target_paths: list[str]) -> Non
         repository=run["repository"],
         commit_sha=run["commit_sha"],
         target_paths=target_paths,
+        analyzed_tree_sha=run.get("analyzed_tree_sha"),
     )

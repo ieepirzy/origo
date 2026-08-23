@@ -94,3 +94,75 @@ def test_methods_are_qualified_by_class():
     names = {b["qualified_name"] for b in walked}
     assert "_SafeHTTPSConnection.connect" in names
     assert "token" in names
+
+
+def test_per_file_failures_are_reported_by_every_radon_adapter(monkeypatch):
+    """A partial measurement must never be presented as a complete one.
+
+    Codex review on origo#97: radon returns a successful JSON response carrying
+    a per-file `{"error": ...}` entry for a file it could not parse. The raw,
+    MI and Halstead adapters dropped those silently and stayed `ok`, so LOC,
+    file count and density were computed over a subset while claiming
+    completeness. `collect_complexity` already reported them.
+    """
+    import json
+
+    from tools.code_health.analyzers import base, radon_cc
+
+    payload = {
+        "good.py": {"loc": 10, "sloc": 8, "comments": 1, "blank": 1, "lloc": 7},
+        "broken.py": {"error": "invalid syntax (broken.py, line 3)"},
+    }
+    monkeypatch.setattr(radon_cc, "tool_version", lambda command: "6.0.1")
+    monkeypatch.setattr(
+        radon_cc,
+        "run",
+        lambda command, cwd=None: base.Completed(
+            returncode=0, stdout=json.dumps(payload), stderr="", duration=0.1
+        ),
+    )
+    kept, tool = radon_cc.collect_raw(["."])
+    assert kept == {"good.py": payload["good.py"]}, "the parseable file is still measured"
+    assert tool.status == "error"
+    assert "broken.py" in tool.error
+
+
+def test_maintainability_reports_per_file_failures(monkeypatch):
+    import json
+
+    from tools.code_health.analyzers import base, radon_cc
+
+    monkeypatch.setattr(radon_cc, "tool_version", lambda command: "6.0.1")
+    monkeypatch.setattr(
+        radon_cc,
+        "run",
+        lambda command, cwd=None: base.Completed(
+            returncode=0,
+            stdout=json.dumps({"a.py": {"mi": 80.0, "rank": "A"}, "b.py": {"error": "boom"}}),
+            stderr="",
+            duration=0.1,
+        ),
+    )
+    kept, tool = radon_cc.collect_maintainability(["."])
+    assert list(kept) == ["a.py"]
+    assert tool.status == "error"
+
+
+def test_halstead_reports_per_file_failures(monkeypatch):
+    import json
+
+    from tools.code_health.analyzers import base, radon_cc
+
+    monkeypatch.setattr(radon_cc, "tool_version", lambda command: "6.0.1")
+    monkeypatch.setattr(
+        radon_cc,
+        "run",
+        lambda command, cwd=None: base.Completed(
+            returncode=0,
+            stdout=json.dumps({"a.py": {"error": "boom"}}),
+            stderr="",
+            duration=0.1,
+        ),
+    )
+    _, tool = radon_cc.collect_halstead(["."])
+    assert tool.status == "error"

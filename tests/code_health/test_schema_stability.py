@@ -115,3 +115,29 @@ def test_null_is_allowed_everywhere_a_number_is(snapshot_factory):
     for key in ("aggregate", "mean", "p50", "p90", "p95", "max", "density_per_kloc"):
         document["complexity"][key] = None
     schema.validate(document)
+
+
+def test_observation_id_distinguishes_different_analyzed_trees():
+    """The PR merge-commit collision.
+
+    Codex review on origo#97: CI analyzes GitHub's synthetic merge commit while
+    the snapshot records the PR head. Keyed on the head alone, a base branch
+    advancing under an unchanged head produces genuinely different code with
+    the *same* observation id, and a receiver deduplicating on it discards the
+    newer measurement as a replay.
+    """
+    same_head = dict(repository="origo", commit_sha="head123", target_paths=["origo"])
+    first = schema.observation_id(**same_head, analyzed_tree_sha="merge_aaa")
+    second = schema.observation_id(**same_head, analyzed_tree_sha="merge_bbb")
+    assert first != second
+
+
+def test_observation_id_still_dedupes_identical_analyses():
+    """The property the key exists for, unchanged."""
+    args = dict(
+        repository="origo",
+        commit_sha="head123",
+        target_paths=["origo"],
+        analyzed_tree_sha="merge_aaa",
+    )
+    assert schema.observation_id(**args) == schema.observation_id(**args)

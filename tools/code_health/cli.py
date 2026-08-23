@@ -303,7 +303,12 @@ def main(argv: list[str] | None = None) -> int:
     exporter.shutdown_tracing()
 
     if args.emit_http:
-        telemetry["http"] = emit_module.emit(snapshot, blocking=args.blocking_telemetry, log=log)
+        # Never `blocking=True` here: that raises, which escapes main() before
+        # the exit-code policy runs and terminates with a traceback and exit 1
+        # instead of the documented telemetry exit code. The status is enough --
+        # the policy below owns the exit code, which is the whole point of
+        # keeping policy in one place.
+        telemetry["http"] = emit_module.emit(snapshot, log=log)
         log(f"code-health: HTTP emission {telemetry['http']['status']}")
 
     exit_code = 0
@@ -322,8 +327,17 @@ def main(argv: list[str] | None = None) -> int:
         if violations:
             exit_code = max(exit_code, 1)
 
-    if args.blocking_telemetry and telemetry.get("otlp", {}).get("status") == "error":
-        exit_code = max(exit_code, 3)
+    if args.blocking_telemetry:
+        # Both channels, not just OTLP. The HTTP path was documented as exiting
+        # 3 and did not.
+        failed = [
+            channel
+            for channel in ("otlp", "http")
+            if telemetry.get(channel, {}).get("status") == "error"
+        ]
+        if failed:
+            log(f"code-health: telemetry emission failed on {', '.join(failed)} (blocking)")
+            exit_code = max(exit_code, 3)
 
     return exit_code
 

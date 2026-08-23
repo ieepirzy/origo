@@ -71,6 +71,12 @@ hole in the series precisely where the interesting commits are. If a matrix leg
 is cancelled and publishes nothing, the snapshot records `tests: skipped` and
 the structural measurement still lands.
 
+That distinction is in the adapter, not the workflow: a report that was **never
+produced** is `skipped` (with the reason kept, so "not produced" stays
+distinguishable from "never configured"), while a report that **exists and
+cannot be parsed** is an `error` that fails the run. Collapsing the two is what
+originally made a cancelled test leg exit 2.
+
 Only the 3.12 leg's reports are consumed, and `tests.python_version` records
 that. Coverage differs between interpreters wherever a branch is version-gated,
 so a coverage series that silently changed interpreter would not be one series;
@@ -87,7 +93,7 @@ not a failure.
 | 0 | Analysis completed; no gate violations. |
 | 1 | A blocking gate failed (lint in gated paths, failing tests, type errors when gating is enabled). |
 | 2 | A required analyzer failed or is missing. The measurement is incomplete and that is treated as serious. |
-| 3 | Telemetry emission failed **and** `--blocking-telemetry` was passed. Off by default. |
+| 3 | Telemetry emission failed on either channel (OTLP or HTTP) **and** `--blocking-telemetry` was passed. Off by default. |
 
 Telemetry failure is not a build failure by default. Analyzer failure is.
 A CI lane that fails because a metrics endpoint is down teaches people to
@@ -95,7 +101,9 @@ ignore it.
 
 **Required vs optional analyzers.** radon, ruff and the configured type checker
 are required: if one is missing (`unavailable`) or broke (`error`), the run
-exits 2. Without that rule a runner that lost radon would emit a snapshot whose
+exits 2. A radon run that parsed some files and failed on others is an `error`
+too, in every one of its four passes — a partial LOC or density figure
+presented as a complete one is the failure this whole design exists to prevent. Without that rule a runner that lost radon would emit a snapshot whose
 every complexity field is `null`, export no complexity metrics at all, and exit
 0 — the series would simply stop, looking from the outside like a repository
 nobody touched. The test and security adapters are opt-in per invocation, so
@@ -374,10 +382,20 @@ never land. Default-branch runs are the canonical historical series:
 `canonical: true`, full artifact, full symbol and file records retained.
 
 **Deduplication.** `run.observation_id` is `sha256` over `(schema_version,
-repository, commit_sha, target_paths)`. Re-analyzing the same commit yields the
-same id, so a backend can drop a duplicate ingestion; `ci.run_id` and
-`run_attempt` are recorded separately so reruns stay *distinguishable* while
-being *dedupable*.
+repository, commit_sha, analyzed_tree_sha, target_paths)`. Re-analyzing the
+same code yields the same id, so a backend can drop a duplicate ingestion;
+`ci.run_id` and `run_attempt` are recorded separately so reruns stay
+*distinguishable* while being *dedupable*.
+
+`analyzed_tree_sha` is not redundant with `commit_sha`, and the difference is
+load-bearing on pull requests. CI checks out GitHub's synthetic merge commit, so
+the tree actually measured is head-merged-into-base, while `commit_sha` records
+the head — the identifier an observation can be *joined* on, since the merge
+commit exists nowhere in the repository's history. Keyed on the head alone, a
+base branch advancing under an unchanged head produces genuinely different code
+with the same id, and a receiver deduplicating on it would discard the newer
+measurement as a replay. Both are recorded: `commit_sha` to join on,
+`analyzed_tree_sha` to identify what was measured.
 
 ## Endpoint contract
 
