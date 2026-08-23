@@ -7,14 +7,19 @@ the data model.
 
 Two sources, in precedence order:
 
-``code-health.toml``
+``mira-vitals.toml``
     A standalone file with the settings at the top level.  For repositories
-    with no ``pyproject.toml`` -- several of ours are ``requirements.txt``
-    applications rather than packages, and adding a ``pyproject.toml`` purely
-    to hold four settings changes how build and packaging tools see the
-    repository, which is a bigger change than it looks.
+    with no ``pyproject.toml`` -- an application built around
+    ``requirements.txt`` rather than a package, where adding a
+    ``pyproject.toml`` purely to hold a few settings changes how build and
+    packaging tools see the repository, which is a bigger change than it looks.
 ``pyproject.toml``
-    ``[tool.code_health]``, for repositories that already have one.
+    ``[tool.tools.code_health]``, for repositories that already have one.
+
+``code-health.toml`` and ``[tool.code_health]`` are also read, after those:
+the first repositories to adopt this collector did so before it was extracted
+into a package, and breaking them on rename would be a poor advertisement for a
+tool whose entire pitch is not silently redefining things.
 """
 
 from __future__ import annotations
@@ -64,6 +69,19 @@ class Config:
     #: block so a reader knows what governed the run.
     source: str | None = None
 
+    #: Pull request labels that declare an authoring mode, as
+    #: ``{label: mode}``.  Empty by default: applying a label requires write
+    #: access, which is what makes it trustworthy, so the vocabulary has to be
+    #: the repository's rather than this package's.
+    provenance_labels: dict[str, str] = field(default_factory=dict)
+
+    #: Orchestrators whose environment variables carry agent execution
+    #: metadata.  Each entry is ``{"name": ..., "env": {field: ENV_VAR}}``.
+    #: Empty by default: this package knows nothing about any particular
+    #: orchestrator, and hard-coding one vendor's variables into a general tool
+    #: would be exactly the coupling it exists to avoid.
+    provenance_agent_sources: list[dict[str, Any]] = field(default_factory=list)
+
     @property
     def effective_lint_paths(self) -> list[str]:
         return self.lint_paths or self.paths
@@ -86,6 +104,8 @@ class Config:
 #: Where configuration may live, most specific first.  The second element of
 #: each pair is the path to the settings table inside that file.
 CONFIG_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("mira-vitals.toml", ()),
+    ("pyproject.toml", ("tool", "tools.code_health")),
     ("code-health.toml", ()),
     ("pyproject.toml", ("tool", "code_health")),
 )
@@ -127,6 +147,16 @@ def load(repo_root: str = ".") -> Config:
         for key, value in section.items():
             if hasattr(config, key):
                 setattr(config, key, value)
+        # `[provenance]` is nested in the file for readability; flattened here
+        # so the rest of the code sees one object.
+        provenance = section.get("provenance")
+        if isinstance(provenance, dict):
+            labels = provenance.get("labels")
+            if isinstance(labels, dict):
+                config.provenance_labels = {str(k): str(v) for k, v in labels.items()}
+            sources = provenance.get("agent_sources")
+            if isinstance(sources, list):
+                config.provenance_agent_sources = [s for s in sources if isinstance(s, dict)]
         config.source = filename
         break
     return config

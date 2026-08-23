@@ -154,7 +154,10 @@ def collect_snapshot(
         run=run,
         ci=ci,
         target=target,
-        provenance=provenance_module.collect(),
+        provenance=provenance_module.collect(
+            agent_sources=config.provenance_agent_sources,
+            labels=config.provenance_labels,
+        ),
         symbols=symbols,
         raw=raw,
         maintainability=maintainability,
@@ -165,6 +168,7 @@ def collect_snapshot(
         security=security,
         tools=tools,
         complexity_status=radon_tool.status,
+        summary_status=raw_tool.status,
         maintainability_status=mi_tool.status,
         halstead_status=hal_tool.status,
         hotspot_limit=config.hotspot_limit,
@@ -351,3 +355,15 @@ def metrics_resource_stub(stub: dict[str, Any]) -> dict[str, str]:
     from .metrics import context_resource_attributes
 
     return context_resource_attributes({**stub, "target": {"language": "python"}})
+
+
+def run() -> None:
+    """Console-script entry point.
+
+    ``main`` returns the exit code rather than raising, because the exit code
+    *is* the policy and keeping it in one place is the point; this wrapper is
+    the only thing that turns it into a process status.
+    """
+    import sys
+
+    sys.exit(main())

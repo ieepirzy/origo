@@ -104,3 +104,19 @@ type_checker = "pyright"
 # Measured from the first run, gated only once the baseline reaches zero.
 typecheck_blocking = false
 hotspot_limit = 20
+
+# Provenance is configuration, not code: the collector ships knowing about no
+# orchestrator and no label scheme. The *schema* lives here because it is a
+# property of this repository's conventions -- versioned, reviewable in a pull
+# request, identical across runs. The *values* arrive as environment variables
+# at run time, because only whatever launched the run knows them.
+[tool.code_health.provenance.labels]
+"authoring:human" = "human"
+"authoring:human-assisted" = "human_assisted"
+"authoring:agent-supervised" = "agent_supervised"
+"authoring:agent-autonomous" = "agent_autonomous"
+"authoring:mixed" = "mixed"
+
+[[tool.code_health.provenance.agent_sources]]
+name = "mirarun"
+env = { run_id = "MIRARUN_RUN_ID", name = "MIRARUN_AGENT_NAME", provider = "MIRARUN_AGENT_PROVIDER", model = "MIRARUN_MODEL", authoring_mode = "MIRARUN_AUTHORING_MODE", environment_id = "MIRARUN_ENVIRONMENT_ID", routine_id = "MIRARUN_ROUTINE_ID" }
