@@ -79,9 +79,10 @@ nobody touched. The test and security adapters are opt-in per invocation, so
 
 ```toml
 [tool.code_health]
-paths = ["origo"]                 # measured for complexity / LOC / maintainability
-lint_paths = ["origo", "tests"]   # measured for lint
-lint_gate_paths = ["origo"]       # the subset whose lint findings BLOCK
+paths = ["origo"]                          # complexity / LOC / maintainability
+lint_paths = ["origo", "tests", "tools"]   # measured for lint
+lint_gate_paths = ["origo", "tools"]       # the subset whose findings BLOCK
+lint_select = ["E4", "E7", "E9", "F", "W"] # the rule set, explicit
 typecheck_paths = ["origo"]
 type_checker = "pyright"
 typecheck_blocking = false
@@ -157,6 +158,34 @@ count. Interpolating between a function of 9 and one of 12 yields 10.8 — a
 value no function has, which then moves whenever `n` changes even if no
 function changed. Nearest-rank always returns an observed value, keeping a
 percentile comparable across runs of different size.
+
+### Lint
+
+`lint.total` counts findings **under an explicitly declared rule selection**,
+passed to ruff as `--select` and recorded in `lint.select`. It is never left to
+ruff's defaults.
+
+That is not a style preference — it is what makes the number a metric. Caught
+on this lane's first CI run: the same commit measured **12 findings under ruff
+0.15.8 and 153 under ruff 0.16.4**, because 0.16 widened its default selection
+to include UP, I, RUF, BLE, SIM and TRY — and simultaneously dropped E402 from
+the defaults, so the *blocking* count moved 12 → 10 as well. An unpinned
+dependency float had silently redefined the metric by a factor of twelve and
+changed which findings gate the build. With `--select` passed explicitly the
+two versions agree exactly (13 findings, 12 blocking).
+
+The default selection is `E4, E7, E9, F, W`: pyflakes, the syntax/runtime-error
+subset of pycodestyle, and its warnings. It deliberately excludes E1/E2/E3/E5 —
+whitespace and line length — which produce 534 E501 findings here and would
+swamp the number with a signal about line width rather than code health.
+
+Analyzer versions are **pinned exactly** in the `code-health` extra. `--select`
+fixes the rule set; pinning closes the remaining drift, since a rule's
+implementation can change between releases. Upgrading is a deliberate act and
+appears in the series as a step change with the new version recorded beside it.
+
+Changing `lint_select` makes deltas across the change `incomparable`, for the
+same reason a type-checker swap does.
 
 ### LOC
 

@@ -146,3 +146,14 @@ def test_symbol_changes_suppress_noise(snapshot_factory):
 
 def test_symbol_changes_without_a_baseline_are_empty(snapshot_factory):
     assert deltas.symbol_changes(snapshot_factory(), None) == []
+
+
+def test_a_ruff_selection_change_makes_lint_deltas_incomparable(snapshot_factory):
+    """`lint.total` means 'findings under this selection'. A different
+    selection is a different metric, not a movement in the same one."""
+    current, baseline = snapshot_factory(), snapshot_factory()
+    current["lint"]["select"] = ["E4", "E7", "E9", "F", "W"]
+    baseline["lint"]["select"] = ["E", "F"]
+    result = deltas.compute(current, baseline)
+    assert result["status"] == "incomparable"
+    assert "ruff selection" in result["reason"]

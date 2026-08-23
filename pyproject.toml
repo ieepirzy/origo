@@ -44,7 +44,15 @@ dev = ["pytest", "pytest-asyncio", "httpx", "pytest-cov", "fastmcp>=2.12.0"]
 # only what it needs, and so a repository adopting the collector does not
 # inherit origo's test dependencies. The collector core is stdlib-only; these
 # are the analyzers it shells out to.
-code-health = ["radon>=6.0", "ruff>=0.5", "pyright>=1.1.400"]
+# Pinned exactly, not floated. An unpinned `ruff>=0.5` produced 12 findings
+# under 0.15.8 and 153 under 0.16.4 on the same commit -- 0.16 widened its
+# default rule selection and dropped E402 from it, moving the blocking count
+# too. The collector now passes --select explicitly, which fixes the rule set
+# independently of the version; pinning closes the remaining drift (a rule's
+# *implementation* can still change between releases). Upgrading any of these
+# is a deliberate act, and shows up in the series as a step change with the
+# new version recorded alongside it.
+code-health = ["radon==6.0.1", "ruff==0.16.4", "pyright==1.1.408"]
 # OTLP export. Optional on purpose: with these absent the collector still
 # produces the canonical artifact and prints the summary, and records the
 # export as skipped rather than failing.

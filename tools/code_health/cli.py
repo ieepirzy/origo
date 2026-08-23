@@ -106,7 +106,11 @@ def collect_snapshot(
         halstead, hal_tool = radon_cc.collect_halstead(config.paths, cwd=root)
     with exporter.span("code_health.ruff", {"code.health.tool": "ruff"}):
         lint, lint_tool = ruff_lint.collect(
-            config.effective_lint_paths, cwd=root, gate_paths=config.effective_lint_gate_paths
+            config.effective_lint_paths,
+            cwd=root,
+            gate_paths=config.effective_lint_gate_paths,
+            select=config.lint_select,
+            ignore=config.lint_ignore,
         )
     with exporter.span("code_health.typecheck", {"code.health.tool": checker}):
         typing_result, type_tool = typecheck.collect(

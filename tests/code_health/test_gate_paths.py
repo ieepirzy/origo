@@ -76,3 +76,47 @@ def test_lint_blocking_true_does_fail(snapshot_factory):
     document["tests"] = {"status": "ok", "failed": 0, "errors": 0}
     violations = _gate(document, Config(lint_blocking=True), lambda *a: None)
     assert len(violations) == 1
+
+
+def test_the_rule_selection_is_passed_explicitly(monkeypatch, tmp_path):
+    """Never left to ruff's defaults.
+
+    The same commit measured 12 findings under ruff 0.15.8 and 153 under
+    0.16.4, because 0.16 widened its default selection -- an unpinned float
+    silently redefining the metric by 12x.
+    """
+    captured = {}
+
+    monkeypatch.setattr(ruff_lint, "tool_version", lambda command: "ruff 0.16.4")
+
+    def fake_run(command, cwd=None):
+        captured["argv"] = command
+        return base.Completed(returncode=0, stdout="[]", stderr="", duration=0.1)
+
+    monkeypatch.setattr(ruff_lint, "run", fake_run)
+    ruff_lint.collect(["app"], cwd=str(tmp_path), select=["E4", "F"])
+    assert "--select" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--select") + 1] == "E4,F"
+
+
+def test_the_default_selection_is_used_when_unconfigured(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(ruff_lint, "tool_version", lambda command: "ruff 0.16.4")
+    monkeypatch.setattr(
+        ruff_lint, "run",
+        lambda command, cwd=None: (
+            captured.__setitem__("argv", command),
+            base.Completed(returncode=0, stdout="[]", stderr="", duration=0.1),
+        )[1],
+    )
+    data, _ = ruff_lint.collect(["app"], cwd=str(tmp_path))
+    assert captured["argv"][captured["argv"].index("--select") + 1] == "E4,E7,E9,F,W"
+    assert data["select"] == list(ruff_lint.DEFAULT_SELECT)
+
+
+def test_the_selection_travels_with_the_measurement(monkeypatch, tmp_path):
+    """Without it, `lint.total` is uninterpretable across time."""
+    _fake_findings(monkeypatch, "[]")
+    data, _ = ruff_lint.collect(["app"], cwd=str(tmp_path), select=["F"], ignore=["F401"])
+    assert data["select"] == ["F"]
+    assert data["ignore"] == ["F401"]

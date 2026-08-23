@@ -39,6 +39,12 @@ class Config:
     lint_paths: list[str] = field(default_factory=list)
     #: The subset of lint findings that block the build.  Starts narrow.
     lint_gate_paths: list[str] = field(default_factory=list)
+    #: The ruff rule selection, passed as --select.  Explicit on purpose: see
+    #: `analyzers/ruff_lint.py`.  Changing it redefines `lint.total`, so it is
+    #: recorded in every snapshot and makes deltas across the change
+    #: incomparable.
+    lint_select: list[str] = field(default_factory=lambda: ["E4", "E7", "E9", "F", "W"])
+    lint_ignore: list[str] = field(default_factory=list)
     #: Whether lint blocks at all.  A repository adopting the lane with
     #: pre-existing findings sets this false: the findings are still measured
     #: and trended from day one, and the gate is switched on once the baseline

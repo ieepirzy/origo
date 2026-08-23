@@ -10,6 +10,21 @@ Two facts about ruff's JSON output shape this adapter:
   one, findings are split on whether the rule is in the repository's
   *blocking* selection: those are ``errors``, the rest are ``warnings``.  The
   split rule is recorded in the snapshot so the number stays interpretable.
+
+The rule selection is always passed explicitly, never left to ruff's defaults.
+That is not a style preference; it is what makes ``lint.total`` a metric at all.
+
+Caught in CI on the first run of this lane: the same commit measured 12
+findings locally under ruff 0.15.8 and 153 under ruff 0.16.4, because 0.16
+widened its default selection to include UP, I, RUF, BLE, SIM and TRY -- and
+simultaneously dropped E402 from the defaults, so the *blocking* count moved
+12 -> 10 as well.  An unpinned dependency float had silently redefined the
+metric by a factor of twelve and quietly changed which findings gate the build.
+
+With ``--select`` passed explicitly the same two versions agree exactly (13
+findings, 12 of them blocking, on this repository).  The selection travels in
+``lint.select`` so a future change to it is visible in the data rather than
+inferred, and ``deltas`` marks a comparison across such a change incomparable.
 """
 
 from __future__ import annotations
@@ -27,6 +42,13 @@ from .base import ToolRun, run, tool_version, which
 #: complexity (C901), which is only ever *reported* here because the threshold
 #: is configured permissively.  Everything else is measured, not enforced.
 BLOCKING_PREFIXES: tuple[str, ...] = ("F", "E4", "E7", "E9")
+
+#: The default explicit rule selection.  pyflakes (F), the syntax/runtime-error
+#: subset of pycodestyle (E4/E7/E9) and its warnings (W).  Deliberately excludes
+#: E1/E2/E3/E5 -- whitespace and line length -- which on this repository produce
+#: 534 E501 findings that would swamp `lint.total` with a signal about line
+#: width rather than about code health.
+DEFAULT_SELECT: tuple[str, ...] = ("E4", "E7", "E9", "F", "W")
 
 
 def _is_blocking(code: str | None) -> bool:
@@ -58,6 +80,8 @@ def collect(
     *,
     cwd: str | None = None,
     gate_paths: list[str] | None = None,
+    select: list[str] | None = None,
+    ignore: list[str] | None = None,
 ) -> tuple[dict[str, Any], ToolRun]:
     """Run ruff and normalize its findings.
 
@@ -69,7 +93,15 @@ def collect(
     lane is meant not to cause.
     """
     executable = which("ruff") or "ruff"
-    argv = [executable, "check", "--output-format", "json", "--exit-zero", *paths]
+    select = list(select or DEFAULT_SELECT)
+    ignore = list(ignore or [])
+    argv = [executable, "check", "--output-format", "json", "--exit-zero"]
+    # --select replaces ruff's defaults outright, which is the point: the
+    # measurement must not change because ruff shipped a new default.
+    argv += ["--select", ",".join(select)]
+    if ignore:
+        argv += ["--ignore", ",".join(ignore)]
+    argv += list(paths)
     tool = ToolRun(name="ruff", command=argv)
     tool.version = tool_version([executable, "--version"])
     if tool.version is None:
@@ -125,6 +157,10 @@ def collect(
             # The subset of `errors` inside `gate_paths`; this is what blocks.
             "gate_errors": gate_errors,
             "gate_paths": gate_paths,
+            # The rule selection this number was produced under.  Without it
+            # `lint.total` is uninterpretable across time.
+            "select": select,
+            "ignore": ignore,
             "blocking_rule_prefixes": list(BLOCKING_PREFIXES),
             # Bounded by the number of rules ruff has, and genuinely useful for
             # longitudinal work ("which rule class grew?").  Stays in the JSON
@@ -146,6 +182,8 @@ def _empty() -> dict[str, Any]:
         "fixable": None,
         "gate_errors": None,
         "gate_paths": None,
+        "select": None,
+        "ignore": None,
         "blocking_rule_prefixes": list(BLOCKING_PREFIXES),
         "by_rule": {},
     }

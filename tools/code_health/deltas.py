@@ -80,6 +80,12 @@ def comparability(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
         reasons.append(f"type checker {baseline_checker} -> {current_checker}")
     # A checker's error count depends on the interpreter it resolved, so a
     # Python upgrade can move `typing.errors` with no code change at all.
+    # `lint.total` means "findings under this rule selection". A different
+    # selection is a different metric, not a movement in the same one.
+    if _get(current, "lint.select") != _get(baseline, "lint.select"):
+        reasons.append(
+            f"ruff selection {_get(baseline, 'lint.select')} -> {_get(current, 'lint.select')}"
+        )
     current_python = _get(current, "typing.environment.python_version")
     baseline_python = _get(baseline, "typing.environment.python_version")
     if current_python and baseline_python and current_python != baseline_python:
