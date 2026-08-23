@@ -39,6 +39,12 @@ class Config:
     lint_paths: list[str] = field(default_factory=list)
     #: The subset of lint findings that block the build.  Starts narrow.
     lint_gate_paths: list[str] = field(default_factory=list)
+    #: Whether lint blocks at all.  A repository adopting the lane with
+    #: pre-existing findings sets this false: the findings are still measured
+    #: and trended from day one, and the gate is switched on once the baseline
+    #: reaches zero.  Expressing that as an empty `lint_gate_paths` would be
+    #: ambiguous with "not configured", which means "gate everything".
+    lint_blocking: bool = True
     #: Paths type-checked.
     typecheck_paths: list[str] = field(default_factory=list)
     type_checker: str = "pyright"

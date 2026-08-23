@@ -52,3 +52,27 @@ def test_non_blocking_rules_never_gate(monkeypatch, tmp_path):
     data, _ = ruff_lint.collect(["origo"], cwd=str(tmp_path), gate_paths=["origo"])
     assert data["warnings"] == 1
     assert data["gate_errors"] == 0
+
+
+def test_lint_blocking_false_measures_without_failing(snapshot_factory):
+    from tools.code_health.cli import _gate
+    from tools.code_health.config import Config
+
+    document = snapshot_factory()
+    document["lint"] = {"status": "ok", "gate_errors": 19, "gate_paths": ["app"],
+                        "blocking_rule_prefixes": ["F"], "errors": 19}
+    document["tests"] = {"status": "ok", "failed": 0, "errors": 0}
+    violations = _gate(document, Config(lint_blocking=False), lambda *a: None)
+    assert violations == []
+
+
+def test_lint_blocking_true_does_fail(snapshot_factory):
+    from tools.code_health.cli import _gate
+    from tools.code_health.config import Config
+
+    document = snapshot_factory()
+    document["lint"] = {"status": "ok", "gate_errors": 19, "gate_paths": ["app"],
+                        "blocking_rule_prefixes": ["F"], "errors": 19}
+    document["tests"] = {"status": "ok", "failed": 0, "errors": 0}
+    violations = _gate(document, Config(lint_blocking=True), lambda *a: None)
+    assert len(violations) == 1

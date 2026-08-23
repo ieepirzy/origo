@@ -67,3 +67,15 @@ def test_a_pyproject_without_our_table_falls_through_to_defaults(tmp_path):
 def test_unknown_settings_are_ignored_not_fatal(tmp_path):
     (tmp_path / "code-health.toml").write_text('paths = ["a"]\nfuture_setting = 3\n')
     assert load(str(tmp_path)).paths == ["a"]
+
+
+def test_lint_blocking_defaults_on():
+    assert Config().lint_blocking is True
+
+
+def test_lint_can_be_measured_without_blocking(tmp_path):
+    """How a repository with pre-existing findings adopts the lane."""
+    (tmp_path / "code-health.toml").write_text('paths = ["app"]\nlint_blocking = false\n')
+    config = load(str(tmp_path))
+    assert config.lint_blocking is False
+    assert config.effective_lint_gate_paths == ["app"], "still measured against the gate paths"

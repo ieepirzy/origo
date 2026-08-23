@@ -213,7 +213,12 @@ def _gate(snapshot: dict[str, Any], config: Config, log: Any) -> list[str]:
     violations: list[str] = []
 
     lint = snapshot["lint"]
-    if lint.get("status") == "ok" and lint.get("gate_errors"):
+    if lint.get("status") == "ok" and lint.get("gate_errors") and not config.lint_blocking:
+        log(
+            f"code-health: ruff reports {lint['gate_errors']} finding(s) in the gated paths "
+            f"-- measured, not blocking (set lint_blocking = true once the baseline is clean)"
+        )
+    elif lint.get("status") == "ok" and lint.get("gate_errors"):
         violations.append(
             f"ruff: {lint['gate_errors']} blocking finding(s) in {lint.get('gate_paths')} "
             f"({', '.join(lint['blocking_rule_prefixes'])})"
