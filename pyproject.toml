@@ -40,6 +40,31 @@ fastapi = ["fastapi>=0.100.0"]
 # fastmcp is in dev so tests/test_fastmcp_auth.py actually runs in CI —
 # it importorskips, so its absence would silently skip the adapter's tests.
 dev = ["pytest", "pytest-asyncio", "httpx", "pytest-cov", "fastmcp>=2.12.0"]
+# The code-health collector. Split from `dev` so the analysis lane installs
+# only what it needs, and so a repository adopting the collector does not
+# inherit origo's test dependencies. The collector core is stdlib-only; these
+# are the analyzers it shells out to.
+# Pinned exactly, not floated. An unpinned `ruff>=0.5` produced 12 findings
+# under 0.15.8 and 153 under 0.16.4 on the same commit -- 0.16 widened its
+# default rule selection and dropped E402 from it, moving the blocking count
+# too. The collector now passes --select explicitly, which fixes the rule set
+# independently of the version; pinning closes the remaining drift (a rule's
+# *implementation* can still change between releases). Upgrading any of these
+# is a deliberate act, and shows up in the series as a step change with the
+# new version recorded alongside it.
+code-health = ["radon==6.0.1", "ruff==0.16.4", "pyright==1.1.408"]
+# OTLP export. Optional on purpose: with these absent the collector still
+# produces the canonical artifact and prints the summary, and records the
+# export as skipped rather than failing.
+# Pinned, though for a weaker reason than the analyzers: the SDK version
+# changes no recorded value, so it is not a comparability hazard. It is an
+# export-stability one -- `LogRecord` moved out of `opentelemetry.sdk._logs`
+# into `opentelemetry._logs` between releases, and a float across that boundary
+# silently disables the event stream while the job stays green.
+code-health-otel = [
+  "opentelemetry-sdk==1.44.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ieepirzy/origo"
@@ -53,3 +78,45 @@ packages = ["origo"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.code_health]
+# Complexity/LOC/maintainability are measured on the shipped package only.
+# Test-suite complexity is a different quantity -- long parametrised test
+# bodies are not a maintainability problem in the way a CC-34 request handler
+# is -- and mixing them into one series makes both uninterpretable.
+paths = ["origo"]
+# Lint is measured across everything, because an unused import in a test is
+# still a real finding worth trending.
+lint_paths = ["origo", "tests", "tools"]
+# ...but only the package and the collector are gated. As of the baseline
+# commit `origo/` and `tools/` both have zero ruff findings, while `tests/`
+# has 12 (7 F401, 3 F841, 2 E402) -- gating that too would fail the build on
+# day one and force exactly the unrelated cleanup this lane is not supposed
+# to cause. The test-suite findings are still measured and trended.
+lint_gate_paths = ["origo", "tools"]
+typecheck_paths = ["origo"]
+# pyright over mypy: origo is a library other repositories install (mirarun
+# pins origo>=0.2.1), so the errors that matter most are public-API shape
+# errors in `X | None` returns and defaults -- which pyright's inference
+# surfaces more of here (49 vs mypy's 36 over the same package). Recorded in
+# every snapshot as typing.tool, because the two are not interchangeable.
+type_checker = "pyright"
+# Measured from the first run, gated only once the baseline reaches zero.
+typecheck_blocking = false
+hotspot_limit = 20
+
+# Provenance is configuration, not code: the collector ships knowing about no
+# orchestrator and no label scheme. The *schema* lives here because it is a
+# property of this repository's conventions -- versioned, reviewable in a pull
+# request, identical across runs. The *values* arrive as environment variables
+# at run time, because only whatever launched the run knows them.
+[tool.code_health.provenance.labels]
+"authoring:human" = "human"
+"authoring:human-assisted" = "human_assisted"
+"authoring:agent-supervised" = "agent_supervised"
+"authoring:agent-autonomous" = "agent_autonomous"
+"authoring:mixed" = "mixed"
+
+[[tool.code_health.provenance.agent_sources]]
+name = "mirarun"
+env = { run_id = "MIRARUN_RUN_ID", name = "MIRARUN_AGENT_NAME", provider = "MIRARUN_AGENT_PROVIDER", model = "MIRARUN_MODEL", authoring_mode = "MIRARUN_AUTHORING_MODE", environment_id = "MIRARUN_ENVIRONMENT_ID", routine_id = "MIRARUN_ROUTINE_ID" }
