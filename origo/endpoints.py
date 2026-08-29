@@ -548,10 +548,14 @@ async def authorize(request: Request) -> Response:
     allow_private_cimd: bool = request.app.state.allow_private_cimd
 
     if request.method == "GET":
-        params = dict(request.query_params)
+        raw_params = request.query_params
     else:
-        form = await request.form()
-        params = dict(form)
+        raw_params = await request.form()
+
+    if len(raw_params.multi_items()) != len(raw_params.keys()):
+        return JSONResponse({"error": "invalid_request", "error_description": "Multiple parameters with the same name are not allowed."}, status_code=400)
+
+    params = dict(raw_params)
 
     client_id = params.get("client_id")
     redirect_uri = params.get("redirect_uri")
@@ -683,8 +687,11 @@ async def authorize(request: Request) -> Response:
 async def token(request: Request) -> JSONResponse:
     storage: OAuthStorage = request.app.state.storage
 
-    form = await request.form()
-    params = dict(form)
+    raw_params = await request.form()
+    if len(raw_params.multi_items()) != len(raw_params.keys()):
+        return JSONResponse({"error": "invalid_request", "error_description": "Multiple parameters with the same name are not allowed."}, status_code=400)
+
+    params = dict(raw_params)
 
     # Also support Basic auth for client credentials
     client_id = params.get("client_id")

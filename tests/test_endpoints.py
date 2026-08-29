@@ -568,6 +568,31 @@ async def test_authorize_missing_params(client_private):
 
 
 @pytest.mark.asyncio
+async def test_authorize_duplicate_params(client_private):
+    client, _ = client_private
+    # Duplicate client_id in GET
+    resp = await client.get(
+        "/authorize?client_id=test-client&client_id=test-client2&redirect_uri=https://app.example.com/cb&response_type=code&code_challenge=xyz"
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["error"] == "invalid_request"
+    assert "Multiple parameters" in data["error_description"]
+
+    # Duplicate redirect_uri in POST
+    body = "client_id=test-client&redirect_uri=https://app.example.com/cb&redirect_uri=https://app.example.com/cb&response_type=code&code_challenge=xyz&csrf_token=fake"
+    resp = await client.post(
+        "/authorize",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        content=body
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["error"] == "invalid_request"
+    assert "Multiple parameters" in data["error_description"]
+
+
+@pytest.mark.asyncio
 async def test_authorize_post_denial_redirects_error(client_public):
     # Register a client first
     from origo import OAuthProvider
@@ -759,6 +784,21 @@ async def test_token_missing_params(client_private):
     client, _ = client_private
     resp = await client.post("/token", data={"grant_type": "authorization_code"})
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_token_duplicate_params(client_private):
+    client, _ = client_private
+    body = "grant_type=authorization_code&client_id=test-client&client_id=test-client2&code=xyz&code_verifier=xyz&redirect_uri=https://app.example.com/cb"
+    resp = await client.post(
+        "/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        content=body
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["error"] == "invalid_request"
+    assert "Multiple parameters" in data["error_description"]
 
 
 @pytest.mark.asyncio
