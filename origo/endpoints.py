@@ -548,10 +548,14 @@ async def authorize(request: Request) -> Response:
     allow_private_cimd: bool = request.app.state.allow_private_cimd
 
     if request.method == "GET":
-        params = dict(request.query_params)
+        raw_params = request.query_params
     else:
-        form = await request.form()
-        params = dict(form)
+        raw_params = await request.form()
+
+    if len(raw_params.multi_items()) != len(raw_params.keys()):
+        return JSONResponse({"error": "invalid_request", "error_description": "Duplicate parameters are not allowed."}, status_code=400)
+
+    params = dict(raw_params)
 
     client_id = params.get("client_id")
     redirect_uri = params.get("redirect_uri")
@@ -684,6 +688,9 @@ async def token(request: Request) -> JSONResponse:
     storage: OAuthStorage = request.app.state.storage
 
     form = await request.form()
+    if len(form.multi_items()) != len(form.keys()):
+        return JSONResponse({"error": "invalid_request", "error_description": "Duplicate parameters are not allowed."}, status_code=400)
+
     params = dict(form)
 
     # Also support Basic auth for client credentials

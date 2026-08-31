@@ -91,3 +91,24 @@ def test_verify_token():
     meta3 = {"client_id": "test"}
     provider.storage.verify_token = lambda token: meta3
     assert provider.verify_token("valid_token", resource="res1") == meta3
+
+@pytest.mark.asyncio
+async def test_authorize_duplicate_parameters(client_public):
+    """Test that requests with duplicate parameters are rejected."""
+    client, provider = client_public
+    # Duplicate code_challenge
+    response = await client.get("/authorize?client_id=c&redirect_uri=https://example.com/cb&response_type=code&code_challenge=xyz&code_challenge=abc&code_challenge_method=S256")
+    assert response.status_code == 400
+    assert response.json()["error_description"] == "Duplicate parameters are not allowed."
+
+@pytest.mark.asyncio
+async def test_token_duplicate_parameters(client_public):
+    """Test that token requests with duplicate parameters are rejected."""
+    client, provider = client_public
+    response = await client.post(
+        "/token",
+        content=b"grant_type=authorization_code&code=testcode&redirect_uri=https://example.com/cb&client_id=c&client_id=c2",
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error_description"] == "Duplicate parameters are not allowed."
