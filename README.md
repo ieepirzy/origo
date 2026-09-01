@@ -274,6 +274,45 @@ the suffixed form first. Both return the same document.
 | `GET/POST /userinfo` | Lightweight OIDC userinfo endpoint for `openid` tokens |
 
 
+## Debugging
+
+`OAuthMiddleware` accepts `debug=True`, for tracking down a request that's
+getting an unexpected 401/400, or a downstream app that 400s right after auth
+passes it through:
+
+```python
+app.add_middleware(OAuthMiddleware, provider=auth, debug=True)
+```
+
+With `debug=True`, every request through the middleware logs, at `DEBUG`
+level on the `"origo"` logger, the decision it made and why:
+
+- which header names were present on the request, and how many `Authorization`
+  headers were seen (more than one is rejected outright — see below)
+- the auth scheme prefix, if the `Bearer ...` check failed
+- why token verification failed: no such token / expired, vs. a **resource
+  mismatch** (a token that's otherwise valid but was issued for a different
+  `resource_identifier` than this server expects) — these look identical from
+  the outside but are different bugs, so debug mode tells them apart
+- the authenticated `client_id`/`scope` once a request passes
+- the downstream app's response status once it responds — so if your app
+  passes auth and then 400s/500s on its own, `debug=True` shows that too,
+  without needing to add logging inside the app itself
+
+Bearer tokens and header values are never logged in full — only short,
+non-reconstructable previews (e.g. `8f3a91c2…b7e4 (71 chars)`), enough to
+tell two requests apart without exposing the credential.
+
+If nothing has configured the `"origo"` logger yet, `debug=True` attaches a
+`StreamHandler` so output is visible on stderr by default; if your app
+already configures logging, that configuration is left alone and origo's
+`DEBUG` records flow through it like any other logger.
+
+`debug=True` is meant for a live investigation, not for leaving on
+permanently in production — it logs at high volume (one or more lines per
+request).
+
+
 ## OpenAI platform compatibility
 
 `origo` includes the OAuth behavior needed by OpenAI platform MCP clients that connect to protected MCP servers:

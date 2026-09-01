@@ -307,3 +307,92 @@ async def test_security_multiple_auth_headers_smuggling(provider):
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_request"
     assert "Multiple Authorization headers" in resp.json()["error_description"]
+
+
+# --- debug mode ---
+
+def test_debug_defaults_off(provider):
+    mw = OAuthMiddleware(lambda scope, receive, send: None, provider=provider)
+    assert mw.debug is False
+
+
+@pytest.mark.asyncio
+async def test_debug_off_emits_no_log_records(provider, caplog):
+    app = _make_app(provider)  # debug not passed -> False
+    with caplog.at_level("DEBUG", logger="origo"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            await client.get("/mcp", headers={"Authorization": "Bearer bogus-token"})
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_debug_logs_authenticated_request(provider, caplog):
+    token = provider.storage.store_token("c", scope="bookings:write")
+    inner = Starlette(routes=[Route("/mcp", _protected)])
+    inner.add_middleware(OAuthMiddleware, provider=provider, debug=True)
+    with caplog.at_level("DEBUG", logger="origo"):
+        async with AsyncClient(transport=ASGITransport(app=inner), base_url="http://testserver") as client:
+            resp = await client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "AUTHENTICATED client_id=c" in joined
+    assert "scope='bookings:write'" in joined
+    assert "downstream app responded 200" in joined
+    # the raw token must never appear in full in a log line
+    assert token not in joined
+
+
+@pytest.mark.asyncio
+async def test_debug_logs_multiple_auth_headers_without_leaking_tokens(provider, caplog):
+    token = provider.storage.store_token("c")
+    inner = Starlette(routes=[Route("/mcp", _protected)])
+    inner.add_middleware(OAuthMiddleware, provider=provider, debug=True)
+    with caplog.at_level("DEBUG", logger="origo"):
+        async with AsyncClient(transport=ASGITransport(app=inner), base_url="http://testserver") as client:
+            resp = await client.get("/mcp", headers=[
+                ("Authorization", "Bearer ADMIN_FORGED_TOKEN_123456789"),
+                ("Authorization", f"Bearer {token}"),
+            ])
+    assert resp.status_code == 400
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "multiple_authorization_headers" in joined
+    assert "ADMIN_FORGED_TOKEN_123456789" not in joined
+    assert token not in joined
+
+
+@pytest.mark.asyncio
+async def test_debug_diagnoses_resource_mismatch(provider, caplog):
+    token = provider.storage.store_token("c", resource="https://wrong.example/mcp")
+    inner = Starlette(routes=[Route("/mcp", _protected)])
+    inner.add_middleware(OAuthMiddleware, provider=provider, debug=True)
+    with caplog.at_level("DEBUG", logger="origo"):
+        async with AsyncClient(transport=ASGITransport(app=inner), base_url="http://testserver") as client:
+            resp = await client.get("/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 401
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "resource mismatch" in joined
+    assert "https://wrong.example/mcp" in joined
+    assert token not in joined
+
+
+@pytest.mark.asyncio
+async def test_debug_diagnoses_no_such_token(provider, caplog):
+    inner = Starlette(routes=[Route("/mcp", _protected)])
+    inner.add_middleware(OAuthMiddleware, provider=provider, debug=True)
+    with caplog.at_level("DEBUG", logger="origo"):
+        async with AsyncClient(transport=ASGITransport(app=inner), base_url="http://testserver") as client:
+            resp = await client.get("/mcp", headers={"Authorization": "Bearer nope-not-a-real-token"})
+    assert resp.status_code == 401
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "no such token, or expired" in joined
+
+
+def test_redact_never_returns_full_short_secret():
+    from origo.middleware import _redact
+    assert _redact("") == "<empty>"
+    assert _redact("short") == "<5 chars>"
+    long_token = "a" * 71
+    preview = _redact(long_token)
+    assert long_token not in preview
+    assert "71 chars" in preview
+    assert _redact(b"\xff\xfe\x00") .startswith("<")  # undecodable bytes handled
