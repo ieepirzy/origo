@@ -1604,3 +1604,36 @@ async def test_authorize_post_consent_form_includes_response_type(client_public)
         post_resp = await c.post("/authorize", data=post_data, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
         assert post_resp.status_code == 302
         assert "code=" in post_resp.headers["Location"]
+
+async def test_authorize_rejects_duplicate_parameters(client_private):
+    client, provider = client_private
+    # Duplicate client_id
+    response = await client.get("/authorize?client_id=c&client_id=c2&redirect_uri=https://example.com/cb&response_type=code&code_challenge=xyz")
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+    # Duplicate state (even if harmless, should reject to enforce strict parsing)
+    response = await client.get("/authorize?client_id=c&redirect_uri=https://example.com/cb&response_type=code&code_challenge=xyz&state=1&state=2")
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+async def test_authorize_post_rejects_duplicate_parameters(client_private):
+    client, provider = client_private
+    # Pass duplicate parameters using a list of tuples which Starlette's TestClient supports
+    response = await client.post(
+        "/authorize",
+        content="client_id=c&redirect_uri=https://example.com/cb&response_type=code&code_challenge=xyz&code_challenge=abc",
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
+
+async def test_token_rejects_duplicate_parameters(client_private):
+    client, provider = client_private
+    response = await client.post(
+        "/token",
+        content="grant_type=authorization_code&client_id=c&client_secret=s&code=somecode&code_verifier=someverifier&redirect_uri=https://example.com/cb&redirect_uri=https://example.com/other",
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_request"
