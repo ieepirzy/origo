@@ -755,6 +755,31 @@ async def test_token_wrong_grant_type(client_private):
 
 
 @pytest.mark.asyncio
+async def test_authorize_duplicate_params(client_public):
+    client, _ = client_public
+    # Test GET
+    resp = await client.get("/authorize?client_id=test-client&client_id=other&redirect_uri=https://example.com/cb&response_type=code&code_challenge=123&code_challenge_method=S256")
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    assert "Duplicate" in resp.json()["error_description"]
+
+    # Test POST
+    resp = await client.post("/authorize", content="client_id=test-client&client_id=other&redirect_uri=https://example.com/cb&response_type=code&code_challenge=123&code_challenge_method=S256", headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    assert "Duplicate" in resp.json()["error_description"]
+
+
+@pytest.mark.asyncio
+async def test_token_duplicate_params(client_private):
+    client, _ = client_private
+    resp = await client.post("/token", content="grant_type=authorization_code&client_id=test-client&client_id=other&code=123&code_verifier=123&redirect_uri=https://example.com/cb", headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    assert "Duplicate" in resp.json()["error_description"]
+
+
+@pytest.mark.asyncio
 async def test_token_missing_params(client_private):
     client, _ = client_private
     resp = await client.post("/token", data={"grant_type": "authorization_code"})
