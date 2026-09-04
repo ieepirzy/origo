@@ -1604,3 +1604,44 @@ async def test_authorize_post_consent_form_includes_response_type(client_public)
         post_resp = await c.post("/authorize", data=post_data, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
         assert post_resp.status_code == 302
         assert "code=" in post_resp.headers["Location"]
+
+@pytest.mark.asyncio
+async def test_duplicate_parameters(client_public):
+    client, provider = client_public
+    # Test GET /authorize with duplicate parameters
+    res = await client.get("/authorize?client_id=c&client_id=c2&redirect_uri=https://example.com/cb&response_type=code&code_challenge=xyz&code_challenge_method=S256")
+    assert res.status_code == 400
+    assert res.json()["error"] == "invalid_request"
+    assert "Duplicate parameters" in res.json()["error_description"]
+
+    import urllib.parse
+
+    # Test POST /authorize with duplicate parameters
+    body_authorize = urllib.parse.urlencode([
+        ("client_id", "c"),
+        ("client_id", "c2"),
+        ("redirect_uri", "https://example.com/cb"),
+        ("response_type", "code"),
+        ("code_challenge", "xyz"),
+        ("code_challenge_method", "S256"),
+        ("csrf_token", "fake"),
+    ])
+
+    res = await client.post("/authorize", content=body_authorize.encode("utf-8"), headers={"Content-Type": "application/x-www-form-urlencoded"}, cookies={"__Host-origo_csrf": "fake"})
+    assert res.status_code == 400
+    assert res.json()["error"] == "invalid_request"
+    assert "Duplicate parameters" in res.json()["error_description"]
+
+    # Test POST /token with duplicate parameters
+    body_token = urllib.parse.urlencode([
+        ("client_id", "c"),
+        ("client_id", "c2"),
+        ("grant_type", "authorization_code"),
+        ("code", "xyz"),
+        ("code_verifier", "xyz"),
+        ("redirect_uri", "https://example.com/cb"),
+    ])
+    res = await client.post("/token", content=body_token.encode("utf-8"), headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert res.status_code == 400
+    assert res.json()["error"] == "invalid_request"
+    assert "Duplicate parameters" in res.json()["error_description"]
