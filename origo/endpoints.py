@@ -174,10 +174,11 @@ class _SafeHTTPSConnection(http.client.HTTPSConnection):
         except OSError:
             pass
 
-        if self._tunnel_host:
+        tunnel_host = getattr(self, '_tunnel_host', None)
+        if tunnel_host:
             self._tunnel()
 
-        server_hostname = self._tunnel_host if self._tunnel_host else self.host
+        server_hostname = tunnel_host if tunnel_host else self.host
         self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
 
 
