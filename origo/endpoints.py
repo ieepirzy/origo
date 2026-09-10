@@ -156,7 +156,8 @@ class _SafeHTTPSConnection(http.client.HTTPSConnection):
 
             try:
                 self.sock = socket.socket(family, type, proto)
-                self.sock.settimeout(self.timeout)
+                if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    self.sock.settimeout(self.timeout)
                 if self.source_address:
                     self.sock.bind(self.source_address)
                 self.sock.connect(sockaddr)
