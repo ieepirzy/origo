@@ -31,6 +31,17 @@ logger = logging.getLogger("origo")
 _SUPPORTED_AUTH_METHODS = {"none", "client_secret_post", "client_secret_basic"}
 _SUPPORTED_CIMD_AUTH_METHODS = {"none"}
 
+async def _read_body_limited(request: Request, max_bytes: int) -> None:
+    """Read request body into request._body to cache it for framework parsers, enforcing a max size limit."""
+    if hasattr(request, "_body"):
+        return
+    body_bytes = bytearray()
+    async for chunk in request.stream():
+        body_bytes.extend(chunk)
+        if len(body_bytes) > max_bytes:
+            raise ValueError("Payload too large")
+    request._body = bytes(body_bytes)
+
 
 @dataclass
 class UserClaims:
@@ -390,6 +401,7 @@ async def register(request: Request) -> JSONResponse:
     custom_redirect_uri_schemes: frozenset[str] = request.app.state.custom_redirect_uri_schemes
 
     try:
+        await _read_body_limited(request, 65536)  # 64KB max for registration
         body = await request.json()
         if not isinstance(body, dict):
             raise ValueError("JSON body must be an object")
@@ -554,6 +566,10 @@ async def authorize(request: Request) -> Response:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         params = dict(request.query_params)
     else:
+        try:
+            await _read_body_limited(request, 1048576)  # 1MB max for forms
+        except Exception:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
         form = await request.form()
         if len(form.multi_items()) != len(form.keys()):
             return JSONResponse({"error": "invalid_request"}, status_code=400)
@@ -688,6 +704,11 @@ async def authorize(request: Request) -> Response:
 
 async def token(request: Request) -> JSONResponse:
     storage: OAuthStorage = request.app.state.storage
+
+    try:
+        await _read_body_limited(request, 1048576)  # 1MB max for forms
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     form = await request.form()
     if len(form.multi_items()) != len(form.keys()):
