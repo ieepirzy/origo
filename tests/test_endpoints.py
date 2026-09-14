@@ -568,6 +568,19 @@ async def test_authorize_missing_params(client_private):
 
 
 @pytest.mark.asyncio
+async def test_authorize_post_invalid_multipart_form_data(client_private):
+    # A malformed multipart body should fail gracefully with 400 Bad Request
+    client, provider = client_private
+    resp = await client.post(
+        "/authorize",
+        headers={"Content-Type": "multipart/form-data; boundary=invalid"},
+        content=b"invalid body"
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_authorize_post_denial_redirects_error(client_public):
     # Register a client first
     from origo import OAuthProvider
@@ -620,6 +633,18 @@ async def test_authorize_preserves_state(client_private):
 
 
 # --- Token ---
+
+@pytest.mark.asyncio
+async def test_token_invalid_multipart_form_data(client_private):
+    client, provider = client_private
+    resp = await client.post(
+        "/token",
+        headers={"Content-Type": "multipart/form-data; boundary=invalid"},
+        content=b"invalid body"
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
 
 @pytest.mark.asyncio
 async def test_token_exchange_s256(client_private):
