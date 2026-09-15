@@ -113,3 +113,7 @@
 **Vulnerability:** In Starlette, `request.json()` and `request.form()` read the entire request body into memory without applying any default size bounds. An attacker could exploit this by sending arbitrarily large payloads to endpoints like `/register`, `/authorize`, or `/token`, leading to a memory exhaustion Denial of Service (OOM DoS) that crashes the server.
 **Learning:** Framework-provided body parsing methods often prioritize convenience over safety and do not enforce default size limits. This allows large payloads to crash the application if left unchecked.
 **Prevention:** Always implement a body size limit mechanism (e.g., by reading `request.stream()` and explicitly checking bytes read against a predefined threshold like 64KB for JSON and 1MB for forms) before passing untrusted input to JSON or form parsers.
+## 2024-05-24 - Handle exceptions from await request.form() securely
+**Vulnerability:** Unhandled exceptions from `await request.form()` due to malformed multipart/form-data causing a 500 Internal Server Error (Denial of Service).
+**Learning:** `python_multipart.exceptions.MultipartParseError` will be thrown if `await request.form()` encounters malformed form body such as missing boundaries.
+**Prevention:** Always wrap `await request.form()` inside a `try...except Exception` block and return a safe HTTP 400 Bad Request to fail securely.
