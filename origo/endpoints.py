@@ -568,9 +568,9 @@ async def authorize(request: Request) -> Response:
     else:
         try:
             await _read_body_limited(request, 1048576)  # 1MB max for forms
+            form = await request.form()
         except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
-        form = await request.form()
         if len(form.multi_items()) != len(form.keys()):
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         params = dict(form)
@@ -707,10 +707,10 @@ async def token(request: Request) -> JSONResponse:
 
     try:
         await _read_body_limited(request, 1048576)  # 1MB max for forms
+        form = await request.form()
     except Exception:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    form = await request.form()
     if len(form.multi_items()) != len(form.keys()):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
     params = dict(form)
