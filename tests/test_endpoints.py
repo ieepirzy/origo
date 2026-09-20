@@ -1604,3 +1604,29 @@ async def test_authorize_post_consent_form_includes_response_type(client_public)
         post_resp = await c.post("/authorize", data=post_data, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
         assert post_resp.status_code == 302
         assert "code=" in post_resp.headers["Location"]
+
+@pytest.mark.asyncio
+async def test_authorize_post_malformed_multipart(client_private):
+    from httpx import ASGITransport, AsyncClient
+    _, provider = client_private
+    async with AsyncClient(transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver") as client:
+        resp = await client.post(
+            "/authorize",
+            content=b"--boundary\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--boundary--\r\n",
+            headers={"Content-Type": "multipart/form-data; boundary=bound"}
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_request"
+
+@pytest.mark.asyncio
+async def test_token_post_malformed_multipart(client_private):
+    from httpx import ASGITransport, AsyncClient
+    _, provider = client_private
+    async with AsyncClient(transport=ASGITransport(app=provider.asgi_app()), base_url="http://testserver") as client:
+        resp = await client.post(
+            "/token",
+            content=b"--boundary\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--boundary--\r\n",
+            headers={"Content-Type": "multipart/form-data; boundary=bound"}
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_request"
