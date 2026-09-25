@@ -553,6 +553,8 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     response.headers["Content-Security-Policy"] = (
         f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; frame-ancestors 'none';"
     )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     return response
 
 
@@ -697,14 +699,14 @@ async def authorize(request: Request) -> Response:
                 redirect_url = _build_redirect(redirect_uri, {"error": "access_denied", "state": state})
             except ValueError:
                 return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
-            return RedirectResponse(redirect_url, status_code=302)
+            return RedirectResponse(redirect_url, status_code=302, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
     code = storage.store_code(client_id, redirect_uri, code_challenge, code_challenge_method, resource=resource, scope=scope)
     try:
         redirect_url = _build_redirect(redirect_uri, {"code": code, "state": state})
     except ValueError:
         return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
-    return RedirectResponse(redirect_url, status_code=302)
+    return RedirectResponse(redirect_url, status_code=302, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
 
 
 # --- Token ---

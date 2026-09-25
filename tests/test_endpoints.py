@@ -469,6 +469,8 @@ async def test_authorize_auto_approve_redirects(client_private):
         "state": "mystate",
     }, follow_redirects=False)
     assert resp.status_code == 302
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     location = resp.headers["location"]
     assert "code=" in location
     assert "state=mystate" in location
@@ -497,6 +499,8 @@ async def test_authorize_shows_consent_page(client_public):
     assert b"<form" in resp.content
     assert resp.headers.get("X-Frame-Options") == "DENY"
     assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     # form-action must include the (already allowlist-validated) redirect
     # origin: Chromium enforces form-action against the redirect following
     # the form submission, so 'self' alone dead-ends the consent flow.
@@ -601,6 +605,8 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "csrf_token": csrf_token,
         }, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     assert "error=access_denied" in resp.headers["location"]
 
 
@@ -616,6 +622,8 @@ async def test_authorize_preserves_state(client_private):
         "response_type": "code",
         "state": "unique-state-xyz",
     }, follow_redirects=False)
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     assert "state=unique-state-xyz" in resp.headers["location"]
 
 
@@ -1603,4 +1611,6 @@ async def test_authorize_post_consent_form_includes_response_type(client_public)
 
         post_resp = await c.post("/authorize", data=post_data, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
         assert post_resp.status_code == 302
+        assert post_resp.headers.get("Cache-Control") == "no-store"
+        assert post_resp.headers.get("Pragma") == "no-cache"
         assert "code=" in post_resp.headers["Location"]
