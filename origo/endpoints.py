@@ -582,6 +582,9 @@ async def authorize(request: Request) -> Response:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         if len(form.multi_items()) != len(form.keys()):
             return JSONResponse({"error": "invalid_request"}, status_code=400)
+        for _, v in form.multi_items():
+            if not isinstance(v, str):
+                return JSONResponse({"error": "invalid_request"}, status_code=400)
         params = dict(form)
 
     client_id = params.get("client_id")
@@ -727,6 +730,9 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
     if len(form.multi_items()) != len(form.keys()):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
+    for _, v in form.multi_items():
+        if not isinstance(v, str):
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
     params = dict(form)
 
     # Also support Basic auth for client credentials
