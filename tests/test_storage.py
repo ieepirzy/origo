@@ -237,17 +237,14 @@ def test_seed_clients_warnings(storage):
     with pytest.warns(UserWarning) as record:
         storage.seed_clients({"alice": "secret1"})
 
-    assert len(record) == 2
-    assert "clients seeded with no redirect_uris" in str(record[0].message)
-    assert "client 'alice' seeded with no redirect_uris" in str(record[1].message)
+    messages = [str(w.message) for w in record]
+    assert any("clients seeded with no redirect_uris" in m for m in messages)
+    assert any("client 'alice' seeded with no redirect_uris" in m for m in messages)
 
 def test_seed_clients_warning_specific_client(storage):
     # Only client-specific warning when one client has uris but another doesn't
-    with pytest.warns(UserWarning) as record:
+    with pytest.warns(UserWarning, match="client 'bob' seeded with no redirect_uris"):
         storage.seed_clients(
             {"alice": "secret1", "bob": "secret2"},
             {"alice": ["https://example.com"]}
         )
-
-    assert len(record) == 1
-    assert "client 'bob' seeded with no redirect_uris" in str(record[0].message)

@@ -195,6 +195,37 @@ async def test_well_known_non_public_paths_require_auth(provider, path):
 
 
 # ---------------------------------------------------------------------------
+# RFC 9728 §3.1 path-inserted metadata URL
+#
+# Not in _PUBLIC_PATHS because it depends on the provider's configurable
+# mcp_path; matched separately against provider.protected_resource_metadata_path.
+# Discovery metadata that requires a token to read tells a client to
+# authenticate in order to learn how to authenticate, which is what production
+# was doing before this bypass existed.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rfc9728_path_inserted_metadata_bypasses_auth(provider):
+    app = _make_app(provider)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.get(provider.protected_resource_metadata_path)
+        assert resp.status_code == 200, (
+            "the RFC 9728 §3.1 metadata URL must be readable without a token"
+        )
+
+
+@pytest.mark.asyncio
+async def test_path_inserted_bypass_is_exact_not_prefix(provider):
+    """The extra comparison must not open the whole subtree beneath it."""
+    app = _make_app(provider)
+    base = provider.protected_resource_metadata_path
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        for path in (f"{base}/extra", f"{base}x", f"{base}/../secret"):
+            resp = await client.get(path)
+            assert resp.status_code == 401, f"{path!r} must still require auth"
+
+
+# ---------------------------------------------------------------------------
 # Substring / embedded public-path strings — must require auth
 #
 # Verifies that matching is anchored to the full path, not "contains".
@@ -282,61 +313,111 @@ async def test_invalid_token_returns_401_with_www_authenticate(provider):
 
 
 # ---------------------------------------------------------------------------
-# RFC 9728: the path-suffixed protected-resource metadata URL
+# Application-declared public paths
 #
-# RFC 9728 builds the metadata URL by INSERTING the well-known segment into the
-# resource path: a resource at https://host/mcp is described at
-# https://host/.well-known/oauth-protected-resource/mcp. Clients try that form
-# first (Claude does), and origo used to 401 it, because _PUBLIC_PATHS is an
-# exact-match set and only held the bare path.
-#
-# The suffix depends on mcp_path, so it cannot be a static member of the set. It
-# is matched exactly all the same -- these tests pin that the fix did NOT
-# reintroduce prefix matching.
+# The middleware protects everything it wraps, which is right for the MCP
+# endpoint and wrong for a landing document or a liveness probe. Without a way
+# to say so, an origo-protected service answers a bare 401 at its root to every
+# visitor and every scanner.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_rfc9728_suffixed_metadata_path_is_public(provider):
-    app = _make_app(provider)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
-        resp = await client.get(f"/.well-known/oauth-protected-resource{provider.mcp_path}")
-        assert resp.status_code == 200  # 200 = middleware passed it through
+async def test_declared_public_path_bypasses_auth():
+    from origo import OAuthProvider
 
-
-@pytest.mark.asyncio
-async def test_bare_metadata_path_still_public(provider):
-    app = _make_app(provider)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
-        assert (await client.get("/.well-known/oauth-protected-resource")).status_code == 200
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/.well-known/oauth-protected-resource/evil",
-        "/.well-known/oauth-protected-resource/mcp/evil",
-        "/.well-known/oauth-protected-resource-decoy",
-        "/.well-known/oauth-protected-resourcex",
-    ],
-)
-async def test_only_the_exact_suffix_is_public(provider, path):
-    """Anything other than the exact mcp_path suffix must still require a token."""
-    app = _make_app(provider)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
-        assert (await client.get(path)).status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_suffixed_path_follows_a_custom_mcp_path():
-    """An SSE deployment advertises /sse, so that is the path that must be public."""
-    p = OAuthProvider(
-        base_url="http://testserver",
-        clients={"cid": "secret"},
-        mcp_path="/sse",
-    )
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={"/"})
     app = _make_app(p)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
-        assert (await client.get("/.well-known/oauth-protected-resource/sse")).status_code == 200
-        # ...and the /mcp form is NOT public for this provider.
-        assert (await client.get("/.well-known/oauth-protected-resource/mcp")).status_code == 401
+        assert (await client.get("/")).status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_declared_public_paths_are_exact_not_prefixes():
+    """Same anchoring as _PUBLIC_PATHS: a prefix rule would turn "/docs" into a
+    bypass for "/docs/../secret" and for anything merely starting with it."""
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={"/docs"})
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        for path in ("/docs/extra", "/docsx", "/docs/../secret", "/adocs"):
+            assert (await client.get(path)).status_code == 401, f"{path!r} must still require auth"
+
+
+@pytest.mark.asyncio
+async def test_undeclared_paths_still_require_auth():
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={"/"})
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get("/anything-else")).status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", ["/health/", "/health", "/a/b/", "/"])
+async def test_declared_public_paths_are_stored_and_matched_exactly(declared):
+    """ASGI puts the raw path in scope["path"], so "/health/" and "/health" are
+    different requests. Trimming the trailing slash at configuration time
+    exempted the wrong one — a provider given "/health/" answered 401 to
+    "/health/", which is the only path its route table actually serves."""
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={declared})
+    assert p.public_paths == frozenset({declared}), "the configured path must be stored verbatim"
+
+    app = _make_app(p)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        assert (await client.get(declared)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_declaring_one_slash_variant_does_not_exempt_the_other():
+    """Exact matching in both directions: declaring "/health" must not open
+    "/health/", and vice versa. An application that wants both says both."""
+    from origo import OAuthProvider
+
+    for declared, other in (("/health", "/health/"), ("/health/", "/health")):
+        p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={declared})
+        app = _make_app(p)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+            assert (await client.get(declared)).status_code == 200
+            assert (await client.get(other)).status_code == 401, (
+                f"declaring {declared!r} must not exempt {other!r}"
+            )
+
+
+def test_public_paths_refuses_the_mcp_endpoint():
+    """The one genuinely dangerous entry: exempting the MCP path would serve
+    the whole protected resource unauthenticated."""
+    from origo import OAuthProvider
+
+    with pytest.raises(ValueError, match="protected resource"):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"},
+                      mcp_path="/mcp", public_paths={"/mcp"})
+    # Also caught when written with a trailing slash.
+    with pytest.raises(ValueError, match="protected resource"):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"},
+                      mcp_path="/mcp", public_paths={"/mcp/"})
+
+
+@pytest.mark.parametrize("bad", ["relative", "", "no-slash/x"])
+def test_public_paths_requires_absolute_paths(bad):
+    from origo import OAuthProvider
+
+    with pytest.raises(ValueError, match="absolute"):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={bad})
+
+
+def test_public_paths_rejects_non_strings():
+    from origo import OAuthProvider
+
+    with pytest.raises(TypeError):
+        OAuthProvider(base_url="http://testserver", clients={"c": "s"}, public_paths={42})
+
+
+def test_public_paths_defaults_to_empty():
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"})
+    assert p.public_paths == frozenset()

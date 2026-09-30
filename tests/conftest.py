@@ -9,6 +9,20 @@ from httpx import ASGITransport, AsyncClient
 from origo import OAuthProvider
 
 
+@pytest.fixture(autouse=True)
+def _default_storage_off(monkeypatch):
+    """origo now persists by default when storage_path is omitted, namespaced
+    by base_url+mcp_path — and this suite's fixtures below construct many
+    providers that share the same base_url/mcp_path across unrelated tests
+    (by design, to test the same "deployment" shape repeatedly). Without this,
+    every test in the suite would share one SQLite file on disk and leak
+    client/token state across tests. ORIGO_STORAGE_PATH="" restores in-memory
+    storage for any provider built without an explicit storage_path; tests
+    that want to exercise real persistence pass storage_path explicitly,
+    which always overrides this."""
+    monkeypatch.setenv("ORIGO_STORAGE_PATH", "")
+
+
 @pytest.fixture
 def provider_private():
     return OAuthProvider(

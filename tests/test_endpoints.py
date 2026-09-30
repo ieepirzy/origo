@@ -146,18 +146,70 @@ async def test_protected_resource_metadata(client_private):
 
 
 @pytest.mark.asyncio
-async def test_protected_resource_metadata_at_the_rfc9728_suffixed_path(client_private):
-    """RFC 9728 inserts the well-known segment into the resource path.
+async def test_protected_resource_metadata_at_rfc9728_path_inserted_url(client_private):
+    """RFC 9728 §3.1: a resource identifier with a path component means the
+    metadata is at the well-known URI with that path inserted after it.
 
-    A resource at https://host/mcp is described at
-    https://host/.well-known/oauth-protected-resource/mcp. Clients try this form
-    before the bare one, so it must serve the same document.
+    That is the URL a client builds from the resource identifier it was
+    challenged with, so it has to serve the same document as the un-suffixed
+    one. It previously 404'd through to the mounted app and came back 401.
     """
     client, provider = client_private
-    resp = await client.get(f"/.well-known/oauth-protected-resource{provider.mcp_path}")
+    suffixed = await client.get("/.well-known/oauth-protected-resource/mcp")
+    plain = await client.get("/.well-known/oauth-protected-resource")
+
+    assert suffixed.status_code == 200
+    # Same document, not merely a second 200 — one metadata fact, two addresses.
+    assert suffixed.json() == plain.json()
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_path_follows_mcp_path():
+    """The suffix is derived from mcp_path, not hardcoded to "mcp"."""
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/api/v2/mcp")
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource/api/v2/mcp"
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/oauth-protected-resource/api/v2/mcp")
     assert resp.status_code == 200
-    assert resp.json() == (await client.get("/.well-known/oauth-protected-resource")).json()
-    assert resp.json()["resource"] == provider.resource_identifier
+    assert resp.json()["resource"] == "http://testserver/api/v2/mcp"
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_path_preserves_a_trailing_slash():
+    """A trailing slash is part of the resource identifier, so it is part of
+    the URL a client derives from it.
+
+    With mcp_path="/mcp/" the resource is https://host/mcp/ and the §3.1 URL is
+    …/oauth-protected-resource/mcp/. Normalising the slash away made the bare
+    app answer 307 and an OAuthMiddleware-wrapped one answer 401, because the
+    middleware compares the request path exactly and rejects before routing.
+    """
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/mcp/")
+    assert p.resource_identifier == "http://testserver/mcp/"
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource/mcp/"
+
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/.well-known/oauth-protected-resource/mcp/")
+    assert resp.status_code == 200
+    assert resp.json()["resource"] == "http://testserver/mcp/"
+
+
+@pytest.mark.asyncio
+async def test_protected_resource_metadata_no_duplicate_route_for_root_mcp_path():
+    """A resource identifier with no path component has no §3.1 variant, so the
+    suffixed path collapses onto the plain one and must not be registered twice."""
+    from origo import OAuthProvider
+
+    p = OAuthProvider(base_url="http://testserver", clients={"c": "s"}, mcp_path="/")
+    paths = [r.path for r in p.asgi_app().routes]
+    assert p.protected_resource_metadata_path == "/.well-known/oauth-protected-resource"
+    assert paths.count("/.well-known/oauth-protected-resource") == 1
 
 
 # --- Registration ---
@@ -417,6 +469,8 @@ async def test_authorize_auto_approve_redirects(client_private):
         "state": "mystate",
     }, follow_redirects=False)
     assert resp.status_code == 302
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     location = resp.headers["location"]
     assert "code=" in location
     assert "state=mystate" in location
@@ -443,6 +497,37 @@ async def test_authorize_shows_consent_page(client_public):
         })
     assert resp.status_code == 200
     assert b"<form" in resp.content
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
+    # form-action must include the (already allowlist-validated) redirect
+    # origin: Chromium enforces form-action against the redirect following
+    # the form submission, so 'self' alone dead-ends the consent flow.
+    assert resp.headers.get("Content-Security-Policy") == "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://example.com; frame-ancestors 'none';"
+
+
+@pytest.mark.asyncio
+async def test_consent_page_form_action_for_custom_scheme_redirect():
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"}, client_redirect_uris={"c": ["myapp://callback"]},
+        custom_redirect_uri_schemes=["myapp"],
+        auto_approve=False,
+    )
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "myapp://callback",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+        })
+    assert resp.status_code == 200
+    assert "form-action 'self' myapp://callback;" in resp.headers.get("Content-Security-Policy", "")
 
 
 @pytest.mark.asyncio
@@ -520,6 +605,8 @@ async def test_authorize_post_denial_redirects_error(client_public):
             "csrf_token": csrf_token,
         }, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
     assert resp.status_code == 302
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     assert "error=access_denied" in resp.headers["location"]
 
 
@@ -535,6 +622,8 @@ async def test_authorize_preserves_state(client_private):
         "response_type": "code",
         "state": "unique-state-xyz",
     }, follow_redirects=False)
+    assert resp.headers.get("Cache-Control") == "no-store"
+    assert resp.headers.get("Pragma") == "no-cache"
     assert "state=unique-state-xyz" in resp.headers["location"]
 
 
@@ -1499,3 +1588,43 @@ async def test_authorize_rejects_cimd_when_public_registration_false(monkeypatch
         }, follow_redirects=False)
     assert resp.status_code == 401
     assert resp.json()["error"] == "unauthorized_client"
+
+@pytest.mark.asyncio
+async def test_authorize_post_consent_form_includes_response_type(client_public):
+    # Ensure the manual consent form correctly passes response_type so it doesn't fail with 400
+    from origo import OAuthProvider
+    from httpx import ASGITransport, AsyncClient
+    import re
+
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"c": "s"}, client_redirect_uris={"c": ["https://example.com/cb"]},
+        auto_approve=False,
+    )
+    verifier, challenge = make_pkce_pair()
+    async with AsyncClient(transport=ASGITransport(app=p.asgi_app()), base_url="http://testserver") as c:
+        get_resp = await c.get("/authorize", params={
+            "client_id": "c",
+            "redirect_uri": "https://example.com/cb",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "response_type": "code",
+            "state": "s1",
+        })
+        assert get_resp.status_code == 200
+
+        csrf_token = get_resp.cookies.get("__Host-origo_csrf")
+
+        # Extract inputs from HTML
+        inputs = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', get_resp.text))
+        assert "response_type" in inputs
+        assert inputs["response_type"] == "code"
+
+        post_data = inputs.copy()
+        post_data["approved"] = "true"
+
+        post_resp = await c.post("/authorize", data=post_data, cookies={"__Host-origo_csrf": csrf_token}, follow_redirects=False)
+        assert post_resp.status_code == 302
+        assert post_resp.headers.get("Cache-Control") == "no-store"
+        assert post_resp.headers.get("Pragma") == "no-cache"
+        assert "code=" in post_resp.headers["Location"]

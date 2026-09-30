@@ -18,7 +18,7 @@ Origo is an OAuth/OIDC and bearer-token protection layer for ASGI applications. 
 | --- | --- | --- |
 | [#21 CIMD support](https://github.com/ieepirzy/origo/issues/21) | Implemented for public PKCE clients | HTTPS `client_id` values can be fetched as Client ID Metadata Documents, validated, and registered as `token_endpoint_auth_method=none` public PKCE clients. |
 | [#22 SSE support for deployments that want a `/sse` endpoint](https://github.com/ieepirzy/origo/issues/22) | Documented as deployment/framework responsibility | Origo can protect `/sse` by setting `mcp_path="/sse"` and wrapping the SSE ASGI app with `OAuthMiddleware`. Origo should not invent the MCP SSE transport because it does not own MCP tool execution or session semantics. |
-| [#23 OpenID support](https://github.com/ieepirzy/origo/issues/23) | Lightweight support implemented | OIDC discovery, unsigned `id_token` issuance for `openid` requests, and `/userinfo` for configured `user_email` are available for simple connector/domain-claiming flows. |
+| [#23 OpenID support](https://github.com/ieepirzy/origo/issues/23) | Lightweight support implemented | OIDC discovery, RS256-signed `id_token` issuance for `openid` requests, and `/userinfo` for configured `user_email` are available for simple connector/domain-claiming flows. |
 | [#24 Client-supplied callback URLs](https://github.com/ieepirzy/origo/issues/24) | Improved | DCR and CIMD clients are restricted to registered `redirect_uris`; pre-registered private clients can now use `client_redirect_uris` to avoid the historical unrestricted redirect behavior. |
 | [#25 OpenAI/ChatGPT secure tunnels](https://github.com/ieepirzy/origo/issues/25) | OAuth side supported; tunnel transport remains external | OpenAI Secure MCP Tunnel is provided by OpenAI's `tunnel-client`. Origo supports the OAuth metadata, resource binding, `WWW-Authenticate` `resource_metadata`, and protected-resource configuration that the tunnel path preserves. |
 | [#26 Grok-style MCP servers using `/sse`](https://github.com/ieepirzy/origo/issues/26) | Documented usage pattern | The README now includes `/sse` guidance. Actual Grok auth characteristics were not publicly documented in the issue, so Origo exposes the generic pattern: protect the MCP SSE ASGI app and advertise `/sse` as the protected resource. |
@@ -42,6 +42,13 @@ app = Starlette(routes=[
 ```
 
 With that setup, `/.well-known/oauth-protected-resource` advertises `https://mcp.yourdomain.com/sse`, and middleware validates bearer tokens for the protected SSE MCP route.
+
+## Connector callback URLs
+
+Connector surfaces frequently fail at `/authorize` because their OAuth callback URL is undocumented or changes. Two mechanisms exist for this (see "Redirect URIs for pre-registered clients" in the README):
+
+- Every rejected `redirect_uri` is logged with its `client_id` on the `origo` logger, so the exact value to allowlist is in the server log after one failed connection attempt.
+- A pre-registered confidential client can be seeded with the `ANY_REDIRECT_URI` sentinel to skip exact matching entirely (scheme validation still applies; the client secret still gates `/token`). This trades away the RFC 9700 exact-match layer and is meant for single-operator deployments — it is refused for secret-less clients and unavailable to dynamically registered ones.
 
 ## Remaining follow-ups
 

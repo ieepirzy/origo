@@ -168,7 +168,9 @@ resource, run separate `OAuthProvider` instances on separate base URLs.
 
 Traditional OAuth deployments separate the authorization server from the resource server — the MCP server asks a dedicated auth service "is this token valid?" on every request (RFC 7662 token introspection). This is correct for multi-tenant systems where tokens need to be revoked instantly across many services.
 
-`origo` collapses this into a single process. Token validation is an in-memory lookup. Fast, zero network overhead, no second service to run. The tradeoff is that token revocation requires a server restart, and there's no centralized auth service to share across multiple resource servers. This also introduce a single point of failure and security relies on the shared memory with the application it is authenticating for.
+`origo` collapses this into a single process. Token validation is an in-process lookup. Fast, zero network overhead, no second service to run. The tradeoff is that there's no centralized auth service to share across multiple resource servers. This also introduces a single point of failure, and security relies on sharing a process with the application it is authenticating for.
+
+By default, origo persists state to a local SQLite file, so tokens survive restarts and redeploys — revocation means deleting rows from (or simply deleting) that file, not restarting. Pass `storage_path=None` for the old in-memory-only behavior instead, where a restart revokes everything (and forces every client through interactive re-authorization). See [Token persistence](#token-persistence) for the default file location and how to relocate or disable it.
 
 **Use this when:**
 
@@ -212,7 +214,32 @@ DCR clients that cannot keep a secret should register with
 `"token_endpoint_auth_method": "none"` and use PKCE. Origo then returns a
 `client_id` without issuing a `client_secret`.
 
-Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) have no such restriction — any redirect URI is accepted, since the operator controls both sides.
+Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) get their allowlist from `client_redirect_uris` and are held to the same exact-match, fail-closed rule: a pre-registered client with no configured URIs rejects every `redirect_uri`.
+
+### Redirect URIs for pre-registered clients
+
+Every rejected `redirect_uri` is logged on the `origo` logger (WARNING level) together with its `client_id`, so when a connector with an undocumented callback URL fails at `/authorize`, the exact value to add to `client_redirect_uris` is one log line away.
+
+A pre-registered **confidential** client (one with a real secret) can opt out of exact matching entirely with the `ANY_REDIRECT_URI` sentinel, as the whole allowlist:
+
+```python
+from origo import ANY_REDIRECT_URI, OAuthProvider
+
+auth = OAuthProvider(
+    base_url="https://mcp.yourdomain.com",
+    clients={"my-client-id": "my-client-secret"},
+    client_redirect_uris={"my-client-id": ANY_REDIRECT_URI},  # or [ANY_REDIRECT_URI]
+)
+```
+
+This exists for single-operator deployments facing connector surfaces (ChatGPT, Grok, …) whose callback URLs are undocumented or change, where the alternative would be the strictly more open `public_registration=True`. Know what it trades away before using it:
+
+- **What still holds:** the client secret gates `/token`, so an authorization code that leaks to an attacker's redirect URI cannot be exchanged for a token; scheme validation still applies (`https` only, plus the loopback exemption and any `custom_redirect_uri_schemes`, never `javascript:`/`data:`); PKCE and `state` work unchanged; every wildcard-accepted URI is logged at INFO with its `client_id`, so you can harvest real connector callbacks and later pin them down to an exact list.
+- **What it gives up:** exact redirect URI matching is a defense-in-depth layer required by the OAuth Security BCP (RFC 9700) — with it off, everything rests on the secret staying secret, and `/authorize` will bounce a browser to any `https` URL for anyone who knows the public `client_id` (with `auto_approve=True`, without even a consent page in between).
+
+The sentinel is rejected at startup for clients without a secret, when mixed with explicit URIs, and is never available to dynamically registered clients.
+
+Redirect URIs are validated for header safety independently of the fronting server: a `redirect_uri` containing a C0 control character (CR/LF response-splitting, NUL, tab, …), DEL, or a lone surrogate is rejected at `/authorize` (and at dynamic registration) rather than reflected into a `Location` header or allowed to raise an encoding error. `origo` does not rely on the ASGI server in front of it to strip such input.
 
 By default, dynamically registered `redirect_uris` must use `https` (or `http://localhost`/`127.0.0.1`/`::1` for the RFC 8252 §7.3 native-app loopback exemption). Native/mobile app clients that use a private-use URI scheme instead (RFC 8252 §7.1, e.g. `myapp://callback`) are rejected unless the operator explicitly opts in:
 
@@ -226,33 +253,73 @@ auth = OAuthProvider(
 
 Only schemes listed here are accepted — arbitrary `foo://` schemes are always rejected, since an unclaimed scheme could be registered by another app on the same device.
 
+## Token persistence
+
+**origo persists OAuth state to SQLite by default.** Every restart, redeploy, or crash used to silently log out every connected client — each one had to go through interactive re-authorization, which for long-lived MCP connectors presented as "auth randomly breaks". As of this version, that's no longer the default: with no code changes at all, an existing `OAuthProvider(...)` call now writes tokens to a SQLite file instead of keeping them only in memory. It stays a drop-in: same process, no extra service.
+
+```python
+auth = OAuthProvider(
+    base_url="https://mcp.yourdomain.com",
+    clients={os.getenv("MCP_CLIENT_ID"): os.getenv("MCP_CLIENT_SECRET")},
+    # storage_path omitted -> persists automatically, see below
+)
+```
+
+**Where it persists to.** With `storage_path` omitted, origo writes to `./.origo/<hash>.db` relative to the process's working directory, where `<hash>` is derived from `base_url` + `mcp_path` (so multiple `OAuthProvider` instances, or restarts of the same deployment, land on the same file without a collision). Two ways to change that without touching code:
+
+- **`ORIGO_STORAGE_PATH=/data/origo`** (env var) — persists under that directory instead. Point this at a mounted volume so tokens survive a full redeploy, not just an in-process restart — `./.origo` under an ephemeral container filesystem only survives a crash/reload of the *same* container.
+- **`ORIGO_STORAGE_PATH=`** (set to the empty string) — forces in-memory storage, restoring the pre-persistence behavior without editing code. Useful for test suites and CI.
+
+And two ways in code:
+
+- `storage_path=None` — the permanent, explicit opt-out: always in-memory, regardless of `ORIGO_STORAGE_PATH`.
+- `storage_path="/exact/path/to/origo.db"` — persist to that exact file, ignoring the auto-derived default and `ORIGO_STORAGE_PATH`.
+
+If the default path can't be created or opened (read-only filesystem, permission error), origo warns and falls back to in-memory storage for that run rather than failing to start — persistence quietly degrading to the old behavior is the safe failure mode for something that was never explicitly requested. An **explicit** `storage_path` that can't be opened raises instead, since a caller who asked for persistence by name should find out immediately if they didn't get it.
+
+What persists: access tokens, refresh tokens, pending auth codes, and dynamically-registered (DCR/CIMD) clients. What doesn't: pre-registered `clients=` (your config re-seeds them every boot, so they are never written to disk) and the per-process RSA signing key (ID tokens are verified at delivery, so a restart only rotates the JWKS).
+
+Security properties of the file:
+
+- Every credential — auth codes, access tokens, refresh tokens, dynamic client secrets — is stored **only as a SHA-256 hash**. A copy of the database file yields no replayable credential. (This works because origo generates all of these as high-entropy random values; there is nothing guessable to attack offline.)
+- The file is created with `0600` permissions, and SQLite's WAL sidecar files inherit that mode.
+- Because dynamic client secrets are hashed, they exist in plaintext only in the one `/register` response that delivered them.
+
+Two operational consequences worth knowing:
+
+- **Revocation**: with in-memory storage a restart revoked everything; with persistence it deliberately doesn't. To revoke, delete rows from the SQLite file (or delete the file) — tokens are keyed by SHA-256 hash of the token value.
+- **Registration flooding**: dynamically-registered clients also survive restarts, so on a `public_registration=True` deployment the `max_dynamic_clients` cap can now fill up permanently instead of being cleared by the next restart. Set `client_ttl` so abandoned registrations expire; origo warns at startup if you don't.
+
+If you run multiple workers/processes against the same file, SQLite's WAL mode plus origo's transactional single-use exchanges (including reuse-detection's revoked-family marker) keep codes and refresh tokens atomic across processes — but note each process still generates its own RSA signing key unless you pass the same `private_key` to every one, so otherwise run a single process if you rely on ID tokens.
+
+**Upgrading from an in-memory-only origo version:** if your test suite constructs more than one `OAuthProvider` with the *same* `base_url`/`mcp_path` pair across different test cases and expects each to start with an empty store (a common pattern — reusing a fixed test `base_url` everywhere), those instances now share one persisted file by default and will leak state between tests. Set `ORIGO_STORAGE_PATH=""` for your test run (a single environment variable, e.g. in your test suite's setup or CI env) to keep the old fully-isolated-in-memory behavior; individual tests that want to exercise real persistence can still pass `storage_path=` explicitly, which always overrides the environment variable.
+
 ## Options
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `base_url` | `str` | required | Public base URL, no trailing slash |
 | `clients` | `dict` | `None` | Pre-registered `{client_id: client_secret}` |
-| `client_redirect_uris` | `dict` | `None` | Optional redirect URI allowlist for pre-registered clients |
+| `client_redirect_uris` | `dict` | `None` | Optional redirect URI allowlist for pre-registered clients (exact-match, fail-closed). A confidential client may map to `ANY_REDIRECT_URI` instead of a list — see [Redirect URIs for pre-registered clients](#redirect-uris-for-pre-registered-clients) |
 | `public_registration` | `bool` | `False` | Allow dynamic client registration |
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
-| `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request |
+| `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request; replaying a used one revokes the whole token family |
+| `storage_path` | `str` | auto (`./.origo/<hash>.db`, or `$ORIGO_STORAGE_PATH`) | Path to a SQLite file for persistent storage (see [Token persistence](#token-persistence)). Pass `None` explicitly to force in-memory storage |
 | `client_ttl` | `int` | `None` | Lifetime in seconds for dynamically-registered clients (DCR `/register` or CIMD). `None` means no expiration. Pre-registered `clients=` are always permanent |
-| `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept in memory; oldest is evicted on overflow. Pre-registered `clients=` don't count against this cap |
+| `max_dynamic_clients` | `int` | `1000` | Max number of dynamically-registered clients (DCR/CIMD) kept at once; registrations past the cap are rejected (HTTP 429) until existing ones expire via `client_ttl`. Pre-registered `clients=` don't count against this cap |
 | `mcp_path` | `str` | `"/mcp"` | Path where MCP endpoint is mounted |
 | `scopes_supported` | `list[str]` | `[]` | OAuth/OIDC scopes advertised in metadata |
 | `resource_documentation` | `str` | `None` | Optional URL added to protected resource metadata |
 | `user_email` | `str` | `None` | Optional static email claim returned by lightweight OIDC `/userinfo` |
 | `allow_private_cimd` | `bool` | `False` | Allow CIMD `client_id` documents to be fetched from private/loopback/link-local hosts (see [CIMD and SSRF hardening](#cimd-and-ssrf-hardening)) |
 | `custom_redirect_uri_schemes` | `list[str]` | `None` | Private-use URI schemes (RFC 8252 §7.1, e.g. `["myapp"]`) accepted as `redirect_uris` during dynamic registration, for native app clients |
-| `storage` | `OAuthStorage` | in-memory instance | Injectable authorization storage. Supply a shared implementation before routing clients across multiple replicas |
+| `storage` | `OAuthStorage` | `None` (built from `storage_path`) | Injectable authorization storage, used as-is. Supply a shared implementation before routing clients across multiple replicas. Mutually exclusive with `storage_path` |
 | `private_key` | `RSAPrivateKey` | generated at startup | Injectable persistent RSA key used for ID-token signing and JWKS |
 
-The default storage and signing key are process-local. MCP's sessionless
-transport does not change that OAuth state: restarts invalidate opaque tokens,
-authorization codes, dynamic registrations, and the generated signing key. A
-multi-replica deployment must inject shared storage and the same persistent key
-into every replica.
+The default SQLite storage is local to one host, and the default signing key is
+generated per process, so a restart rotates it. A multi-replica deployment must
+inject shared storage and the same persistent key into every replica.
 
 ## OAuth Endpoints
 
@@ -322,7 +389,7 @@ request).
 - Dynamic client registration accepts `token_endpoint_auth_method=none` for clients that should exchange authorization codes without a client secret.
 - CIMD clients can use an HTTPS metadata document URL as `client_id`; `origo` fetches it, validates redirect URIs, and treats it as a public PKCE client when the document requests `token_endpoint_auth_method=none`.
 - The optional OAuth `resource` parameter is preserved from `/authorize` to `/token` and stored with the issued access token metadata, so applications can verify which MCP resource the token was minted for.
-- `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced.
+- `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced. Replaying an already-used refresh token is treated as theft (per the OAuth 2.1 rotation guidance): the entire token family descended from that grant — live refresh tokens and access tokens both — is revoked on the spot, so a stolen-and-rotated chain dies the moment the legitimate holder's token resurfaces. (Corollary: a client that retries a `/token` refresh call after losing the response will trigger this and must re-authorize interactively.)
 - `WWW-Authenticate` challenges include `resource_metadata` and configured scopes so clients can discover the authorization requirements after an unauthenticated tool call.
 - Authorization responses include the RFC 9207 `iss` parameter, and discovery advertises support for it.
 - Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an RS256-signed `id_token` for `openid` requests, publishes its key through JWKS, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.

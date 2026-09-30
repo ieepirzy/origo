@@ -40,6 +40,12 @@ def _is_client_disconnect(exc: BaseException) -> bool:
 # This is an exact-match set derived directly from the route table in OAuthProvider.
 # Using exact matching (not prefix/startswith) prevents prefix-confusion attacks
 # where a path like /token_info or /.well-known-decoy/x would bypass auth.
+#
+# RFC 9728's path-inserted variant (/.well-known/oauth-protected-resource/<mcp_path>)
+# is not listed here because it depends on the provider's mcp_path, which is
+# configurable. It is matched separately in __call__ against
+# provider.protected_resource_metadata_path — still an exact comparison, so it
+# opens exactly one more path and inherits the same prefix-confusion immunity.
 _PUBLIC_PATHS = {
     "/register",
     "/authorize",
@@ -98,13 +104,6 @@ class OAuthMiddleware:
                 handler = logging.StreamHandler()
                 handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
                 logger.addHandler(handler)
-        # RFC 9728's path-suffixed metadata URL, e.g.
-        # /.well-known/oauth-protected-resource/mcp. It depends on mcp_path, so it
-        # cannot live in the static _PUBLIC_PATHS set. Still matched exactly, so
-        # the prefix-confusion protection below is preserved.
-        self._resource_metadata_path = (
-            f"/.well-known/oauth-protected-resource{provider.mcp_path}"
-        )
 
     def _www_authenticate(self, error: str | None = None) -> bytes:
         parts = [
@@ -129,7 +128,14 @@ class OAuthMiddleware:
         path = scope.get("path", "")
         method = scope.get("method", scope["type"])
 
-        if path in _PUBLIC_PATHS or path == self._resource_metadata_path:
+        if (
+            path in _PUBLIC_PATHS
+            or path == self.provider.protected_resource_metadata_path
+            # Application-declared, validated in OAuthProvider: absolute, exact,
+            # and never the MCP endpoint itself. getattr keeps a provider from
+            # an older origo working rather than raising on every request.
+            or path in getattr(self.provider, "public_paths", frozenset())
+        ):
             self._log(method, path, "public path, bypassing auth")
             await self.app(scope, receive, send)
             return

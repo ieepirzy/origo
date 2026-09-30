@@ -1,6 +1,9 @@
 import functools
+import hashlib
+import os
+import sqlite3
 import warnings
-from typing import Optional
+from typing import Iterable, Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -17,7 +20,37 @@ from .endpoints import (
     userinfo,
 )
 from .middleware import OAuthMiddleware
+from .sqlite_storage import SQLiteOAuthStorage
 from .storage import OAuthStorage
+
+# Distinguishes "storage_path not passed" (persist by default, at an
+# automatically-derived path) from the explicit, permanent opt-out
+# storage_path=None (always in-memory). A plain default of None could not
+# make that distinction.
+_AUTO_STORAGE_PATH = object()
+
+
+def _default_storage_dir() -> Optional[str]:
+    """Directory persistent storage defaults into when storage_path isn't
+    passed. ORIGO_STORAGE_PATH overrides it; set to the empty string, it
+    forces in-memory storage without touching code (an operational opt-out
+    alongside the code-level storage_path=None one)."""
+    if "ORIGO_STORAGE_PATH" in os.environ:
+        env_value = os.environ["ORIGO_STORAGE_PATH"]
+        return env_value or None
+    return ".origo"
+
+
+def _default_storage_path(base_url: str, mcp_path: str) -> Optional[str]:
+    """A default per-deployment file path, namespaced by the one pair of
+    values that already identifies an OAuthProvider instance. Hashed rather
+    than used verbatim so the path never embeds a public URL directly on
+    disk, and so it's filesystem-safe regardless of what base_url looks like."""
+    base_dir = _default_storage_dir()
+    if base_dir is None:
+        return None
+    digest = hashlib.sha256(f"{base_url}|{mcp_path}".encode()).hexdigest()[:16]
+    return os.path.join(base_dir, f"{digest}.db")
 
 
 class OAuthProvider:
@@ -28,7 +61,16 @@ class OAuthProvider:
         base_url:            Public base URL of your server (no trailing slash).
         clients:             Pre-registered {client_id: client_secret} dict.
                              Required when public_registration=False.
-        client_redirect_uris: Optional {client_id: [redirect_uri, ...]} allowlist for pre-registered clients.
+        client_redirect_uris: Optional {client_id: [redirect_uri, ...]} allowlist for
+                             pre-registered clients. Exact-match, fail-closed. A
+                             confidential (secret-holding) client may instead map to
+                             the ANY_REDIRECT_URI sentinel ("any", as the bare string
+                             or sole list element) to accept every redirect URI that
+                             passes scheme validation — see the sentinel's docs in
+                             origo.storage for the security trade-off. Rejected and
+                             wildcard-accepted redirect URIs are logged on the
+                             "origo" logger so their exact values can be collected
+                             into an allowlist.
         public_registration: Allow dynamic client registration (DCR).
                              Default False.
         auto_approve:        Skip consent page, approve all valid clients.
@@ -37,15 +79,28 @@ class OAuthProvider:
         refresh_token_ttl:   Refresh token lifetime in seconds. Default 30 days.
                              Refresh tokens are single-use and rotated on every
                              /token request (a new one is issued each time).
+                             Replaying an already-used refresh token revokes
+                             every token descended from the same grant.
+        storage_path:        Path to a SQLite database file for persistent storage
+                             (tokens, refresh tokens, and dynamically-registered
+                             clients survive restarts — stored hashed, in a
+                             0600-mode file — instead of living in memory; still
+                             in-process, no extra service). When omitted (the
+                             default), origo persists automatically to a path
+                             derived from base_url/mcp_path under ./.origo (see
+                             ORIGO_STORAGE_PATH in the README to relocate or
+                             disable this without a code change). Pass
+                             storage_path=None explicitly to force in-memory
+                             storage regardless of that default.
         client_ttl:          Lifetime in seconds for dynamically-registered clients
                              (via DCR /register or CIMD auto-registration). Default
                              None (no expiration). Pre-registered clients passed via
                              `clients=` are always permanent and unaffected.
         max_dynamic_clients: Maximum number of dynamically-registered clients (DCR
-                             and CIMD) kept in memory at once; the oldest is evicted
-                             when a new one would exceed this cap. Default 1000.
-                             Pre-registered clients passed via `clients=` don't count
-                             against this cap.
+                             and CIMD) kept at once; registration attempts past the
+                             cap are rejected (HTTP 429) until existing ones expire
+                             via client_ttl. Default 1000. Pre-registered clients
+                             passed via `clients=` don't count against this cap.
         mcp_path:            Path where MCP endpoint is mounted. Default "/mcp".
         scopes_supported:    OAuth scopes advertised to clients.
         resource_documentation: Optional protected resource documentation URL.
@@ -63,8 +118,11 @@ class OAuthProvider:
                              be claimed by another app on the same device, so schemes
                              must be declared explicitly by the operator.
         storage:             Optional storage instance. Inject a shared implementation
-                             before running multiple replicas; the default OAuthStorage
-                             is process-local memory.
+                             before running multiple replicas. When given, it is used
+                             as-is (even if it is falsey, e.g. an empty store that
+                             defines __len__) and storage_path must not also be
+                             passed; the TTL/cap arguments then have no effect, since
+                             the injected instance carries its own configuration.
         private_key:         Optional persistent RSA signing key. The default is generated
                              per process and is therefore unsuitable for interchangeable
                              replicas.
@@ -88,6 +146,10 @@ class OAuthProvider:
         user_subject: Optional[str] = None,
         allow_private_cimd: bool = False,
         custom_redirect_uri_schemes: Optional[list[str]] = None,
+        # New parameters go at the end: inserting one mid-signature would
+        # silently rebind existing callers' positional arguments.
+        storage_path: Optional[str] = _AUTO_STORAGE_PATH,
+        public_paths: Optional[Iterable[str]] = None,
         storage: Optional[OAuthStorage] = None,
         private_key: Optional[RSAPrivateKey] = None,
     ):
@@ -114,12 +176,73 @@ class OAuthProvider:
                 schemes.append(sanitized)
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
-        self.storage = storage or OAuthStorage(
-            token_ttl=token_ttl,
-            refresh_token_ttl=refresh_token_ttl,
-            client_ttl=client_ttl,
-            max_dynamic_clients=max_dynamic_clients,
-        )
+        is_auto = storage_path is _AUTO_STORAGE_PATH
+        if storage and not is_auto:
+            raise TypeError("pass either storage or storage_path, not both")
+        resolved_path = _default_storage_path(self.base_url, self.mcp_path) if is_auto else storage_path
+
+        def _memory_storage() -> OAuthStorage:
+            return OAuthStorage(
+                token_ttl=token_ttl,
+                refresh_token_ttl=refresh_token_ttl,
+                client_ttl=client_ttl,
+                max_dynamic_clients=max_dynamic_clients,
+            )
+
+        if storage:
+            self.storage = storage
+        elif resolved_path is None:
+            # Either an explicit storage_path=None (permanent code-level
+            # opt-out) or the ORIGO_STORAGE_PATH="" operational opt-out.
+            self.storage = _memory_storage()
+        else:
+            try:
+                storage_dir = os.path.dirname(resolved_path)
+                if storage_dir:
+                    os.makedirs(storage_dir, exist_ok=True)
+                self.storage = SQLiteOAuthStorage(
+                    resolved_path,
+                    token_ttl=token_ttl,
+                    refresh_token_ttl=refresh_token_ttl,
+                    client_ttl=client_ttl,
+                    max_dynamic_clients=max_dynamic_clients,
+                )
+            except (OSError, sqlite3.Error) as exc:
+                # OSError: can't create the directory, or open/create the
+                # file (permissions, read-only fs). sqlite3.Error: the file
+                # exists but isn't a usable database -- e.g. corrupt, a
+                # non-SQLite file sitting at that path, or a locked file
+                # SQLite can't get a handle on (sqlite3.DatabaseError /
+                # OperationalError are not OSError subclasses).
+                if not is_auto:
+                    # storage_path was passed explicitly: persistence was
+                    # requested, not merely defaulted, so a failure to
+                    # provide it must not be silently downgraded.
+                    raise
+                warnings.warn(
+                    f"OAuthProvider: could not initialize persistent storage at "
+                    f"'{resolved_path}' ({exc}) — falling back to in-memory "
+                    f"storage for this run (tokens will not survive a restart). "
+                    f"Pass storage_path=None to choose in-memory storage "
+                    f"deliberately and silence this warning, or fix/relocate the "
+                    f"path via the ORIGO_STORAGE_PATH environment variable.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.storage = _memory_storage()
+            else:
+                if public_registration and client_ttl is None:
+                    warnings.warn(
+                        "OAuthProvider: public_registration=True with persistent storage "
+                        "and no client_ttl — dynamically-registered clients now survive "
+                        "restarts, so once max_dynamic_clients is reached registration "
+                        "stays blocked forever (a restart no longer clears it). Set "
+                        "client_ttl so abandoned registrations expire.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
+        self.public_paths = self._normalize_public_paths(public_paths)
 
         if clients:
             self.storage.seed_clients(clients, client_redirect_uris)
@@ -134,28 +257,38 @@ class OAuthProvider:
         self._app = self._build_app()
 
     def _build_app(self) -> Starlette:
-        app = Starlette(
-            routes=[
-                Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
-                Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
-                Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
-                # RFC 9728 builds the metadata URL by INSERTING the well-known
-                # segment into the resource path: a resource at https://host/mcp
-                # is described at https://host/.well-known/oauth-protected-resource/mcp.
-                # Clients (Claude among them) try this form first, so serve it as
-                # well as the bare path.
-                Route(
-                    f"/.well-known/oauth-protected-resource{self.mcp_path}",
-                    protected_resource_metadata,
-                    methods=["GET"],
-                ),
-                Route("/.well-known/jwks.json", jwks, methods=["GET"]),
-                Route("/register", register, methods=["POST"]),
-                Route("/authorize", authorize, methods=["GET", "POST"]),
-                Route("/token", token, methods=["POST"]),
-                Route("/userinfo", userinfo, methods=["GET", "POST"]),
-            ],
-        )
+        routes = [
+            Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+            Route("/.well-known/openid-configuration", oauth_metadata, methods=["GET"]),
+            Route("/.well-known/oauth-protected-resource", protected_resource_metadata, methods=["GET"]),
+            Route("/.well-known/jwks.json", jwks, methods=["GET"]),
+            Route("/register", register, methods=["POST"]),
+            Route("/authorize", authorize, methods=["GET", "POST"]),
+            Route("/token", token, methods=["POST"]),
+            Route("/userinfo", userinfo, methods=["GET", "POST"]),
+        ]
+
+        # RFC 9728 §3.1: when the resource identifier has a path component, the
+        # metadata lives at the well-known URI with that path *inserted after*
+        # it — https://host/.well-known/oauth-protected-resource/mcp for a
+        # resource at https://host/mcp. That is the URL a client constructs
+        # from the resource identifier it was challenged with. Without this
+        # route the request fell through to the mounted application and came
+        # back 401 from OAuthMiddleware, so a client following the challenge
+        # correctly was told to authenticate in order to discover how to
+        # authenticate. Observed in production at
+        # https://mcp.muutto365.fi/.well-known/oauth-protected-resource/mcp.
+        #
+        # Same handler and same document as the un-suffixed route: this adds a
+        # spec-mandated address for the metadata, not a second version of it.
+        if self._protected_resource_metadata_path != "/.well-known/oauth-protected-resource":
+            routes.append(Route(
+                self._protected_resource_metadata_path,
+                protected_resource_metadata,
+                methods=["GET"],
+            ))
+
+        app = Starlette(routes=routes)
         app.state.base_url = self.base_url
         app.state.mcp_path = self.mcp_path
         app.state.storage = self.storage
@@ -183,8 +316,88 @@ class OAuthProvider:
             return None
         return meta
 
+    def _normalize_public_paths(self, public_paths: Optional[Iterable[str]]) -> frozenset[str]:
+        """Validate application-declared paths that skip token validation.
+
+        The middleware protects everything it wraps, which is correct for the
+        MCP endpoint and wrong for anything an unauthenticated caller is
+        supposed to reach — a landing document at "/", a liveness probe, a
+        machine-readable index. Without this the application has no way to say
+        so, and its root answers a bare 401 to every visitor and every scanner.
+
+        Matched exactly, never as a prefix, for the same reason _PUBLIC_PATHS
+        is: a prefix rule turns "/x" into a bypass for "/x/../secret" and for
+        anything that merely starts with it.
+
+        Declaring a path here only *removes* authentication from it — it grants
+        nothing and cannot widen a token's reach. The one genuinely dangerous
+        mistake is naming the MCP endpoint itself, which would serve the whole
+        protected resource unauthenticated, so that is refused outright rather
+        than trusted to review.
+        """
+        if not public_paths:
+            return frozenset()
+
+        declared: set[str] = set()
+        protected = self.mcp_path.strip("/")
+        for raw in public_paths:
+            if not isinstance(raw, str):
+                raise TypeError(f"public_paths entries must be strings; got {type(raw).__name__}")
+            if not raw.startswith("/"):
+                raise ValueError(f"public_paths entries must be absolute paths starting with '/'; got {raw!r}")
+            # Stored EXACTLY as configured, trailing slash and all. ASGI puts
+            # the raw path in scope["path"], so "/health/" and "/health" are
+            # different requests and the middleware compares them exactly.
+            # Trimming the slash here silently exempted the wrong one: a
+            # provider given "/health/" answered 401 to "/health/". The
+            # application knows which of the two its route table actually
+            # serves; this is not the place to guess, and normalising is how
+            # the same mistake was made once already for mcp_path.
+            #
+            # The MCP guard below is the one comparison that ignores the
+            # slash, because "/mcp" and "/mcp/" are the same resource for the
+            # purpose of "do not exempt it".
+            if protected and raw.strip("/") == protected:
+                raise ValueError(
+                    f"public_paths must not contain the MCP endpoint ({raw!r}) — that is the "
+                    f"protected resource this middleware exists to guard, and exempting it would "
+                    f"serve it to unauthenticated callers."
+                )
+            declared.add(raw)
+        return frozenset(declared)
+
+    @property
+    def _protected_resource_metadata_path(self) -> str:
+        """RFC 9728 §3.1 path-inserted metadata path, e.g. /.well-known/oauth-protected-resource/mcp.
+
+        Only the *leading* separator is removed, so the two segments cannot
+        concatenate into a double slash. A trailing slash is deliberately
+        preserved: it is part of resource_identifier, so a client deriving
+        this URL from a resource of https://host/mcp/ asks for
+        …/oauth-protected-resource/mcp/, and a route registered without the
+        slash does not answer it. Stripping both ends produced exactly that —
+        307 from the bare app, and 401 from an OAuthMiddleware-wrapped one,
+        which rejects on its exact `==` comparison before routing ever runs.
+
+        When mcp_path is empty or "/" the resource identifier has no path
+        component, RFC 9728 §3.1 does not apply, and this collapses to the
+        un-suffixed path — _build_app checks for that and does not register a
+        duplicate route.
+        """
+        suffix = self.mcp_path.lstrip("/")
+        return f"/.well-known/oauth-protected-resource/{suffix}" if suffix else "/.well-known/oauth-protected-resource"
+
+    @property
+    def protected_resource_metadata_path(self) -> str:
+        """Public alias of the above, used by OAuthMiddleware to leave this path unauthenticated."""
+        return self._protected_resource_metadata_path
+
     @property
     def protected_resource_metadata_url(self) -> str:
+        # Kept pointing at the un-suffixed URL: it is what this provider has
+        # always advertised, both routes serve the same document, and changing
+        # what goes into WWW-Authenticate is a behavioural change for existing
+        # clients rather than the bug fix this is.
         return f"{self.base_url}/.well-known/oauth-protected-resource"
 
     @property
