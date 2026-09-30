@@ -356,7 +356,10 @@ level on the `"origo"` logger, the decision it made and why:
 
 - which header names were present on the request, and how many `Authorization`
   headers were seen (more than one is rejected outright — see below)
-- the auth scheme prefix, if the `Bearer ...` check failed
+- the auth scheme name, if the `Bearer ...` check failed (only recognized
+  scheme names such as `Basic` or a lowercase `bearer` are shown; anything
+  else in that position might be a credential and is logged as
+  `<unrecognized>`)
 - why token verification failed: no such token / expired, vs. a **resource
   mismatch** (a token that's otherwise valid but was issued for a different
   `resource_identifier` than this server expects) — these look identical from
@@ -366,9 +369,12 @@ level on the `"origo"` logger, the decision it made and why:
   passes auth and then 400s/500s on its own, `debug=True` shows that too,
   without needing to add logging inside the app itself
 
-Bearer tokens and header values are never logged in full — only short,
-non-reconstructable previews (e.g. `8f3a91c2…b7e4 (71 chars)`), enough to
-tell two requests apart without exposing the credential.
+Bearer tokens and header values are never logged, not even in part — only a
+keyed fingerprint and the length (e.g. `<fp=3f9a1c0e, 71 chars>`), enough to
+tell the same token retried apart from a second, different one without
+exposing any of the credential. The fingerprint key is generated per process,
+so fingerprints correlate within one run and cannot be checked offline
+against guesses of the value.
 
 If nothing has configured the `"origo"` logger yet, `debug=True` attaches a
 `StreamHandler` so output is visible on stderr by default; if your app

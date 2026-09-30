@@ -390,9 +390,64 @@ async def test_debug_diagnoses_no_such_token(provider, caplog):
 def test_redact_never_returns_full_short_secret():
     from origo.middleware import _redact
     assert _redact("") == "<empty>"
-    assert _redact("short") == "<5 chars>"
+    assert "5 chars" in _redact("short")
+    assert "short" not in _redact("short")
     long_token = "a" * 71
     preview = _redact(long_token)
     assert long_token not in preview
     assert "71 chars" in preview
     assert _redact(b"\xff\xfe\x00") .startswith("<")  # undecodable bytes handled
+
+
+# Uppercase letters outside A-F: none of them can appear in a lowercase-hex
+# fingerprint or in the fixed wording of the preview, so any of them showing
+# up in the output is a character of the secret leaking through.
+_NON_HEX_ALPHABET = "GHJKLMNPQRSTUVWXYZ"
+
+
+@pytest.mark.parametrize("length", [1, 4, 12, 13, 14, 16, 20, 32, 71, 200])
+def test_redact_reveals_no_characters_of_the_value_at_any_length(length):
+    """A 13-char value used to come back with 12 of its characters showing
+    (8 leading + 4 trailing), leaving one to guess. Nothing of the value may
+    appear in the preview, at any length."""
+    from origo.middleware import _redact
+    secret = (_NON_HEX_ALPHABET * 20)[:length]
+    for value in (secret, secret.encode()):
+        preview = _redact(value)
+        leaked = sorted({c for c in preview if c in _NON_HEX_ALPHABET})
+        assert leaked == [], f"{length}-char value leaked {leaked!r} into {preview!r}"
+        assert f"{length} chars" in preview
+
+
+def test_redact_fingerprint_correlates_equal_values_and_separates_different_ones():
+    """What debug mode needs from a preview: tell "the same token retried"
+    apart from "a second, different token" -- including two values that share
+    their first 8 and last 4 characters, which the old preview conflated."""
+    from origo.middleware import _redact
+    a = "GHJKLMNP" + "QRST" + "WXYZ"
+    b = "GHJKLMNP" + "UVQR" + "WXYZ"
+    assert _redact(a) == _redact(a)
+    assert _redact(a) == _redact(a.encode())
+    assert _redact(a) != _redact(b)
+
+
+@pytest.mark.asyncio
+async def test_debug_logs_non_bearer_scheme_without_the_credential(provider, caplog):
+    """The scheme name is the useful part of a rejected non-Bearer header; the
+    credential after it must not be logged."""
+    inner = Starlette(routes=[Route("/mcp", _protected)])
+    inner.add_middleware(OAuthMiddleware, provider=provider, debug=True)
+    with caplog.at_level("DEBUG", logger="origo"):
+        async with AsyncClient(transport=ASGITransport(app=inner), base_url="http://testserver") as client:
+            resp = await client.get("/mcp", headers={"Authorization": "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="})
+            resp2 = await client.get("/mcp", headers={"Authorization": "SECRETVALUEXYZ QWxhZGRpbjpv"})
+            resp3 = await client.get("/mcp", headers={"Authorization": "bearer QWxhZGRpbjpv"})
+    assert resp.status_code == resp2.status_code == resp3.status_code == 401
+    joined = "\n".join(r.message for r in caplog.records)
+    assert "scheme=Basic" in joined
+    # Logged as sent: the wrong case is the whole diagnosis here.
+    assert "scheme=bearer" in joined
+    assert "QWxh" not in joined
+    # An unrecognized first word may itself be a secret: never echoed.
+    assert "SECRET" not in joined
+    assert "scheme=<unrecognized>" in joined

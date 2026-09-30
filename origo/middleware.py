@@ -1,5 +1,8 @@
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 
 import anyio
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -7,24 +10,56 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 logger = logging.getLogger("origo")
 
 
-def _redact(value, keep_start: int = 8, keep_end: int = 4) -> str:
-    """Preview a secret-bearing value for logs without exposing it.
+# Per-process key for _redact() fingerprints. Keyed, not a bare hash, so a
+# fingerprint in a log cannot be checked offline against guesses of a short or
+# low-entropy value. The price is that fingerprints only correlate within one
+# process lifetime, which is the span a debugging session looks at anyway.
+_FINGERPRINT_KEY = secrets.token_bytes(32)
 
-    Never returns enough of `value` to reconstruct or brute-force it — just
-    enough to correlate log lines with a specific token/header across a
-    request flow (e.g. "is this the same bearer token retried, or a second,
-    different one?").
+# Authorization schemes whose *name* is safe and useful to log when a request
+# is rejected for not being Bearer. Anything else in that position might be a
+# bare credential, so it is never echoed.
+_KNOWN_AUTH_SCHEMES = frozenset(
+    name.lower()
+    for name in ("Bearer", "Basic", "Digest", "DPoP", "Token", "Negotiate", "NTLM",
+                 "HOBA", "Mutual", "AWS4-HMAC-SHA256", "SCRAM-SHA-256", "GNAP")
+)
+
+
+def _redact(value) -> str:
+    """Identify a secret-bearing value in logs without revealing any of it.
+
+    Returns a keyed fingerprint plus the length, e.g. "<fp=3f9a1c0e, 71 chars>":
+    enough to correlate log lines across a request flow ("is this the same
+    bearer token retried, or a second, different one?") and to spot a
+    truncated token, while no character of the value itself is ever included,
+    whatever its length.
     """
     if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
         try:
-            value = value.decode("utf-8")
+            length = len(raw.decode("utf-8"))
         except UnicodeDecodeError:
-            return f"<{len(value)} bytes, undecodable>"
-    if not value:
+            return f"<{len(raw)} bytes, undecodable>"
+    else:
+        raw = value.encode("utf-8", "surrogatepass")
+        length = len(value)
+    if not raw:
         return "<empty>"
-    if len(value) <= keep_start + keep_end:
-        return f"<{len(value)} chars>"
-    return f"{value[:keep_start]}…{value[-keep_end:]} ({len(value)} chars)"
+    fp = hmac.new(_FINGERPRINT_KEY, raw, hashlib.sha256).hexdigest()[:8]
+    return f"<fp={fp}, {length} chars>"
+
+
+def _auth_scheme(header: bytes) -> str:
+    """The scheme name of an Authorization header, exactly as sent (so a
+    lowercase "bearer" shows up as the reason it was rejected), if it is a
+    recognized scheme name."""
+    first, sep, _ = header.partition(b" ")
+    if not sep:
+        # No separator: the whole header may be a bare credential.
+        return "<none>"
+    name = first.decode("latin-1")
+    return name if name.lower() in _KNOWN_AUTH_SCHEMES else "<unrecognized>"
 
 
 def _is_client_disconnect(exc: BaseException) -> bool:
@@ -86,8 +121,8 @@ class OAuthMiddleware:
     such token/expired vs. resource mismatch), the authenticated client_id/
     scope on success, and the downstream app's response status once it
     responds. Secret values (bearer tokens, header contents) are never
-    logged in full — only short, non-reconstructable previews via
-    `_redact()` (e.g. "8f3a91c2…b7e4 (71 chars)"), enough to tell two
+    logged, not even in part — only a keyed fingerprint and length via
+    `_redact()` (e.g. "<fp=3f9a1c0e, 71 chars>"), enough to tell two
     requests apart without exposing the credential. If no handler is
     configured on the "origo" logger yet, debug=True attaches a StreamHandler
     so output is visible by default; if your app already configures logging,
@@ -166,7 +201,8 @@ class OAuthMiddleware:
 
         if not auth_bytes.startswith(b"Bearer "):
             self._log(
-                method, path, "REJECTED 401 missing_bearer_scheme: header=%s",
+                method, path, "REJECTED 401 missing_bearer_scheme: scheme=%s header=%s",
+                _auth_scheme(auth_bytes) if auth_bytes else "<none>",
                 _redact(auth_bytes) if auth_bytes else "<no Authorization header>",
             )
             if scope["type"] == "websocket":
