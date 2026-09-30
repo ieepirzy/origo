@@ -163,7 +163,13 @@ class OAuthProvider:
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
 
-        self.private_key = private_key or rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        # `is None`, not `or`, for the same reason as `storage` below: an
+        # injected value is used exactly as given.
+        self.private_key = (
+            private_key
+            if private_key is not None
+            else rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        )
 
         if isinstance(custom_redirect_uri_schemes, str):
             raise TypeError("custom_redirect_uri_schemes must be a list of strings, not a single string")
@@ -177,7 +183,7 @@ class OAuthProvider:
         self.custom_redirect_uri_schemes = frozenset(schemes)
 
         is_auto = storage_path is _AUTO_STORAGE_PATH
-        if storage and not is_auto:
+        if storage is not None and not is_auto:
             raise TypeError("pass either storage or storage_path, not both")
         resolved_path = _default_storage_path(self.base_url, self.mcp_path) if is_auto else storage_path
 
@@ -189,7 +195,11 @@ class OAuthProvider:
                 max_dynamic_clients=max_dynamic_clients,
             )
 
-        if storage:
+        if storage is not None:
+            # Injected storage is used exactly as given. `is not None`, never a
+            # truthiness test: a shared store that defines __len__ is falsey
+            # while empty, and discarding it for process-local memory would
+            # silently split OAuth state across replicas.
             self.storage = storage
         elif resolved_path is None:
             # Either an explicit storage_path=None (permanent code-level
