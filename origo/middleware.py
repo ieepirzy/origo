@@ -123,10 +123,12 @@ class OAuthMiddleware:
     responds. Secret values (bearer tokens, header contents) are never
     logged, not even in part — only a keyed fingerprint and length via
     `_redact()` (e.g. "<fp=3f9a1c0e, 71 chars>"), enough to tell two
-    requests apart without exposing the credential. If no handler is
-    configured on the "origo" logger yet, debug=True attaches a StreamHandler
-    so output is visible by default; if your app already configures logging,
-    that configuration is left alone.
+    requests apart without exposing the credential. If no handler would
+    receive the "origo" logger's records -- neither its own nor, through
+    propagation, an ancestor's such as the root logger's -- debug=True
+    attaches a StreamHandler so output is visible by default; if your app
+    already configures logging, that configuration is left alone and each
+    record is emitted once, through it.
     """
 
     def __init__(self, app: ASGIApp, provider, debug: bool = False):
@@ -135,7 +137,11 @@ class OAuthMiddleware:
         self.debug = debug
         if debug:
             logger.setLevel(logging.DEBUG)
-            if not logger.handlers:
+            # hasHandlers(), not `logger.handlers`: it also sees handlers the
+            # records would reach by propagation (e.g. root's, from
+            # logging.basicConfig). Adding our own on top of those would emit
+            # every record twice and bypass the app's formatting/destination.
+            if not logger.hasHandlers():
                 handler = logging.StreamHandler()
                 handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
                 logger.addHandler(handler)

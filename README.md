@@ -376,10 +376,12 @@ exposing any of the credential. The fingerprint key is generated per process,
 so fingerprints correlate within one run and cannot be checked offline
 against guesses of the value.
 
-If nothing has configured the `"origo"` logger yet, `debug=True` attaches a
-`StreamHandler` so output is visible on stderr by default; if your app
-already configures logging, that configuration is left alone and origo's
-`DEBUG` records flow through it like any other logger.
+If no handler would receive the `"origo"` logger's records — neither one on
+that logger nor one it propagates to, such as the root handler installed by
+`logging.basicConfig()` — `debug=True` attaches a `StreamHandler` so output is
+visible on stderr by default. If your app already configures logging, that
+configuration is left alone and origo's `DEBUG` records flow through it once,
+like any other logger's.
 
 `debug=True` is meant for a live investigation, not for leaving on
 permanently in production — it logs at high volume (one or more lines per

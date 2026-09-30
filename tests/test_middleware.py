@@ -1,4 +1,6 @@
+import contextlib
 import json
+import logging
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -451,3 +453,79 @@ async def test_debug_logs_non_bearer_scheme_without_the_credential(provider, cap
     # An unrecognized first word may itself be a secret: never echoed.
     assert "SECRET" not in joined
     assert "scheme=<unrecognized>" in joined
+
+
+@contextlib.contextmanager
+def _isolated_logging():
+    """Snapshot and restore every piece of global logging state debug mode
+    touches, so these tests neither see nor leave behind other tests' setup.
+
+    Used inside the test body, not as a fixture: pytest attaches its capture
+    handlers to the root logger per phase (setup/call/teardown), so a
+    fixture's snapshot would be of the wrong phase's handlers.
+    """
+    origo_logger = logging.getLogger("origo")
+    root = logging.getLogger()
+    saved_origo = (list(origo_logger.handlers), origo_logger.level, origo_logger.propagate)
+    saved_root = (list(root.handlers), root.level)
+    for h in saved_origo[0]:
+        origo_logger.removeHandler(h)
+    origo_logger.setLevel(logging.NOTSET)
+    origo_logger.propagate = True
+    # Detach pytest's handlers so "the app configured the root logger" is the
+    # test's own handler alone, and "nothing is configured" really is nothing.
+    for h in saved_root[0]:
+        root.removeHandler(h)
+    try:
+        yield origo_logger, root
+    finally:
+        for h in list(origo_logger.handlers):
+            origo_logger.removeHandler(h)
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        for h in saved_origo[0]:
+            origo_logger.addHandler(h)
+        origo_logger.setLevel(saved_origo[1])
+        origo_logger.propagate = saved_origo[2]
+        for h in saved_root[0]:
+            root.addHandler(h)
+        root.setLevel(saved_root[1])
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@pytest.mark.asyncio
+async def test_debug_respects_handlers_inherited_from_the_root_logger(provider):
+    """An app that configures logging on the root logger (logging.basicConfig)
+    and nothing on "origo" must get each debug record once, through its own
+    handler -- not a second copy from a StreamHandler debug mode bolted on."""
+    with _isolated_logging() as (origo_logger, root):
+        app_handler = _ListHandler()
+        root.addHandler(app_handler)
+
+        inner = Starlette(routes=[Route("/mcp", _protected)])
+        inner.add_middleware(OAuthMiddleware, provider=provider, debug=True)
+        async with AsyncClient(transport=ASGITransport(app=inner), base_url="http://testserver") as client:
+            await client.get("/mcp", headers={"Authorization": "Bearer nope-not-a-real-token"})
+
+        assert origo_logger.handlers == [], "debug mode must not add a handler when root already has one"
+        rejected = [r for r in app_handler.records if "REJECTED 401 invalid_token" in r.getMessage()]
+        assert len(rejected) == 1
+
+
+def test_debug_installs_fallback_handler_only_when_nothing_is_configured(provider):
+    with _isolated_logging() as (origo_logger, root):
+        assert not origo_logger.hasHandlers()
+        OAuthMiddleware(lambda scope, receive, send: None, provider=provider, debug=True)
+        fallback = [h for h in origo_logger.handlers if isinstance(h, logging.StreamHandler)]
+        assert len(fallback) == 1
+        # A second debug middleware in the same process does not stack another one.
+        OAuthMiddleware(lambda scope, receive, send: None, provider=provider, debug=True)
+        assert origo_logger.handlers == fallback
