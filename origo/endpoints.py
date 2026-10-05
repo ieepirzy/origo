@@ -493,6 +493,8 @@ def _form_action_source(redirect_uri: str) -> str:
         source = f"{parts.scheme}:"
     else:
         return ""
+    if any(c in source for c in ("'", ";", ",", " ")):
+        return ""
     return source if source.isascii() else ""
 
 
