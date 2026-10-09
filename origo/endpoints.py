@@ -493,7 +493,15 @@ def _form_action_source(redirect_uri: str) -> str:
         source = f"{parts.scheme}:"
     else:
         return ""
-    return source if source.isascii() else ""
+
+    if not source.isascii():
+        return ""
+
+    for char in (";", "'", ",", " "):
+        if char in source:
+            return ""
+
+    return source
 
 
 def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
