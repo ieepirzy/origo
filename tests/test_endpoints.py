@@ -21,6 +21,18 @@ def test_safe_compare_digest_type_error():
     assert _safe_compare_digest(None, "abc") is False
     assert _safe_compare_digest("abc", None) is False
 
+def test_form_action_source_csp_injection():
+    """Test that _form_action_source rejects CSP injection delimiters."""
+    from origo.endpoints import _form_action_source
+    assert _form_action_source("https://example.com/cb") == "https://example.com"
+    assert _form_action_source("myapp://callback") == "myapp://callback"
+    assert _form_action_source("myapp:") == "myapp:"
+    assert _form_action_source("https://example.com; frame-ancestors *") == ""
+    assert _form_action_source("https://example.com' form-action") == ""
+    assert _form_action_source("https://example.com,") == ""
+    assert _form_action_source("https://example.com foo") == ""
+
+
 def test_build_redirect_invalid_url():
     """Test that _build_redirect raises ValueError on invalid URL."""
     with pytest.raises(ValueError, match="Invalid redirect URI:"):
