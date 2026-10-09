@@ -3,9 +3,11 @@ from starlette.testclient import TestClient
 from origo.provider import OAuthProvider
 
 def test_csp_injection_prevention():
+    # Use explicit storage_path=None to avoid cross-test state leakage
     provider = OAuthProvider(
         base_url="https://example.com",
-        public_registration=True
+        public_registration=True,
+        storage_path=None
     )
     client = TestClient(provider.asgi_app())
 
