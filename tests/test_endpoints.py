@@ -782,6 +782,21 @@ async def test_token_missing_params(client_private):
 
 
 @pytest.mark.asyncio
+async def test_token_rejects_multiple_auth_methods(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    credentials = base64.b64encode(b"test-client:test-secret").decode()
+    resp = await client.post("/token",
+        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": "https://example.com/cb", "client_id": "test-client"},
+        headers={"Authorization": f"Basic {credentials}"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    assert "Multiple client authentication methods are not allowed" in resp.json()["error_description"]
+
+
+@pytest.mark.asyncio
 async def test_token_basic_auth_malformed_base64(client_private):
     client, _ = client_private
     # b"\xff\xfe" is valid base64 but not valid UTF-8, triggering the except branch
