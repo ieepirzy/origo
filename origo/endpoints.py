@@ -744,11 +744,16 @@ async def token(request: Request) -> JSONResponse:
     client_id = params.get("client_id")
     client_secret = params.get("client_secret")
 
+    auth_list = request.headers.getlist("Authorization")
+    if len(auth_list) > 1:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    auth = auth_list[0] if auth_list else ""
+
+    # Reject if both form body credentials and HTTP Basic Authentication are present
+    if auth.startswith("Basic ") and (client_id or client_secret):
+        return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed."}, status_code=400)
+
     if not client_id:
-        auth_list = request.headers.getlist("Authorization")
-        if len(auth_list) > 1:
-            return JSONResponse({"error": "invalid_request"}, status_code=400)
-        auth = auth_list[0] if auth_list else ""
         if auth.startswith("Basic "):
             try:
                 decoded = base64.b64decode(auth[6:]).decode()
