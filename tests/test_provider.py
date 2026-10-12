@@ -3,9 +3,11 @@ import warnings
 
 import pytest
 from starlette.applications import Starlette
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from origo.provider import OAuthProvider
 from origo.middleware import OAuthMiddleware
+from origo.storage import OAuthStorage
 
 
 def test_provider_initialization_warnings():
@@ -53,6 +55,58 @@ def test_asgi_app():
     app = provider.asgi_app()
     assert isinstance(app, Starlette)
     assert app is provider._app
+
+
+def test_provider_accepts_shared_storage_and_persistent_signing_key():
+    storage = OAuthStorage()
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    provider = OAuthProvider(
+        base_url="http://example.com",
+        public_registration=True,
+        storage=storage,
+        private_key=private_key,
+    )
+    assert provider.storage is storage
+    assert provider.private_key is private_key
+
+
+class _FalseyStorage(OAuthStorage):
+    """A shared store that is falsey while empty, as any storage defining
+    __len__ over its contents would be."""
+
+    def __len__(self):
+        return 0
+
+
+def test_provider_keeps_falsey_injected_storage():
+    """An injected store must be used even when it is falsey. Replacing it with
+    process-local memory would split OAuth state across replicas silently."""
+    storage = _FalseyStorage()
+    assert not storage
+    provider = OAuthProvider(base_url="http://example.com", public_registration=True, storage=storage)
+    assert provider.storage is storage
+
+
+def test_provider_rejects_falsey_injected_storage_with_explicit_storage_path(tmp_path):
+    """The storage/storage_path exclusivity check must not be bypassed by a
+    falsey store either -- that would silently ignore one of the two."""
+    with pytest.raises(TypeError, match="storage or storage_path"):
+        OAuthProvider(
+            base_url="http://example.com",
+            public_registration=True,
+            storage=_FalseyStorage(),
+            storage_path=str(tmp_path / "origo.db"),
+        )
+
+
+def test_provider_rejects_storage_together_with_storage_path(tmp_path):
+    with pytest.raises(TypeError, match="storage or storage_path"):
+        OAuthProvider(
+            base_url="http://example.com",
+            public_registration=True,
+            storage=OAuthStorage(),
+            storage_path=str(tmp_path / "origo.db"),
+        )
 
 
 def test_middleware():

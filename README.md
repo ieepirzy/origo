@@ -46,6 +46,39 @@ root = Starlette(routes=[
 ])
 ```
 
+### Single-app deployments (one router)
+
+Mounting works when OAuth and your app can be separate ASGI apps. Some setups
+instead need everything on **one** router — a FastMCP `http_app()` owns the
+lifespan, so it is easier to add OAuth to it than to nest it. In that case, take
+origo's routes **and its state** from `auth.asgi_app()`:
+
+```python
+mcp_app = mcp.http_app(path="/mcp", transport="http", stateless_http=True)
+
+oauth_app = auth.asgi_app()
+for route in reversed(oauth_app.routes):
+    mcp_app.router.routes.insert(0, route)   # OAuth routes must match first
+
+mcp_app.add_middleware(OAuthMiddleware, provider=auth)
+
+# Adopt origo's state. Do not hand-write this.
+for key, value in vars(oauth_app.state)["_state"].items():
+    setattr(mcp_app.state, key, value)
+
+app = mcp_app
+```
+
+> **Do not re-declare origo's routes and copy a few `app.state` attributes by
+> hand.** origo's endpoints read state off `request.app.state`, that set is
+> internal, and it **grows between releases** — 0.1.9 added `allow_private_cimd`
+> with the CGNAT/IPv4-mapped-IPv6 SSRF fix. A hand-written subset imports and
+> starts cleanly, then raises `AttributeError` and returns **HTTP 500 from
+> `/authorize` at request time** — so the build and the deploy look perfectly
+> healthy until the first client tries to authorise. Sourcing routes and state
+> from `auth.asgi_app()` keeps that contract origo's problem, not yours, and also
+> gives you `/userinfo` and `/.well-known/openid-configuration` for free.
+
 ### FastAPI
 
 ```python
@@ -91,18 +124,45 @@ auth = OAuthProvider(
 
 mcp = FastMCP("my-server")
 
-# Use your MCP framework's SSE ASGI app here. The exact constructor varies by
-# framework/version; for FastMCP this may be `sse_app()` in SSE deployments.
-sse_app = mcp.sse_app()
+# On FastMCP 3.x, both transports come from http_app():
+#   mcp.http_app(path="/sse", transport="sse")
+sse_app = mcp.http_app(path="/sse", transport="sse")
 sse_app.add_middleware(OAuthMiddleware, provider=auth)
 
 app = Starlette(routes=[
-    Mount("/sse", app=sse_app),       # protected SSE MCP endpoint
+    Mount("/sse", app=sse_app),      # protected SSE MCP endpoint
     Mount("/", app=auth.asgi_app()), # OAuth and /.well-known/ discovery
 ])
 ```
 
-If your server exposes both `/mcp` and `/sse`, create the protected-resource metadata for the endpoint your connector is configured to call. For multiple public MCP resources on one host, use separate `OAuthProvider` instances or deploy separate base URLs so each provider advertises one canonical `resource` value.
+#### Serving `/mcp` and `/sse` together
+
+One `OAuthProvider` can protect both transports. Build both apps from the same
+`FastMCP`, put their routes on one router, and apply the middleware once — the
+single-app recipe above, with the SSE routes appended:
+
+```python
+app = mcp.http_app(path="/mcp", transport="http", stateless_http=True)
+sse_app = mcp.http_app(path="/sse", transport="sse")
+
+for route in sse_app.routes:          # /sse plus its /messages endpoint
+    app.router.routes.append(route)
+
+# ... then insert origo's routes, add OAuthMiddleware, adopt state (as above).
+```
+
+`OAuthMiddleware` protects every path except origo's own public ones, so `/mcp`,
+`/sse` and `/messages` are all covered by that single `add_middleware` call. Both
+transports need their lifespans run — the streamable-HTTP and SSE apps each carry
+a session manager — so chain them if you take this route.
+
+A token is verified against the provider's single `resource_identifier`
+(`base_url + mcp_path`), so **discovery advertises one canonical resource and a
+token minted for it works on both endpoints.** The one thing to watch: a client
+that derives its own `resource` from the URL it happens to call, rather than
+reading `/.well-known/oauth-protected-resource`, will present a `resource` that
+does not match and get a 401. If you need each transport to advertise its own
+resource, run separate `OAuthProvider` instances on separate base URLs.
 
 ## How this differs from enterprise OAuth
 
@@ -149,6 +209,10 @@ auth = OAuthProvider(
     public_registration=True,
 )
 ```
+
+DCR clients that cannot keep a secret should register with
+`"token_endpoint_auth_method": "none"` and use PKCE. Origo then returns a
+`client_id` without issuing a `client_secret`.
 
 Dynamically registered clients must supply `redirect_uris` at registration time. The `/authorize` endpoint validates the `redirect_uri` parameter against that registered list and rejects any URI not on it. Pre-registered clients (supplied via `clients=`) get their allowlist from `client_redirect_uris` and are held to the same exact-match, fail-closed rule: a pre-registered client with no configured URIs rejects every `redirect_uri`.
 
@@ -226,7 +290,7 @@ Two operational consequences worth knowing:
 - **Revocation**: with in-memory storage a restart revoked everything; with persistence it deliberately doesn't. To revoke, delete rows from the SQLite file (or delete the file) — tokens are keyed by SHA-256 hash of the token value.
 - **Registration flooding**: dynamically-registered clients also survive restarts, so on a `public_registration=True` deployment the `max_dynamic_clients` cap can now fill up permanently instead of being cleared by the next restart. Set `client_ttl` so abandoned registrations expire; origo warns at startup if you don't.
 
-If you run multiple workers/processes against the same file, SQLite's WAL mode plus origo's transactional single-use exchanges (including reuse-detection's revoked-family marker) keep codes and refresh tokens atomic across processes — but note each process still generates its own RSA signing key, so run a single process if you rely on ID tokens.
+If you run multiple workers/processes against the same file, SQLite's WAL mode plus origo's transactional single-use exchanges (including reuse-detection's revoked-family marker) keep codes and refresh tokens atomic across processes — but note each process still generates its own RSA signing key unless you pass the same `private_key` to every one, so otherwise run a single process if you rely on ID tokens.
 
 **Upgrading from an in-memory-only origo version:** if your test suite constructs more than one `OAuthProvider` with the *same* `base_url`/`mcp_path` pair across different test cases and expects each to start with an empty store (a common pattern — reusing a fixed test `base_url` everywhere), those instances now share one persisted file by default and will leak state between tests. Set `ORIGO_STORAGE_PATH=""` for your test run (a single environment variable, e.g. in your test suite's setup or CI env) to keep the old fully-isolated-in-memory behavior; individual tests that want to exercise real persistence can still pass `storage_path=` explicitly, which always overrides the environment variable.
 
@@ -250,8 +314,20 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | `user_email` | `str` | `None` | Optional static email claim returned by lightweight OIDC `/userinfo` |
 | `allow_private_cimd` | `bool` | `False` | Allow CIMD `client_id` documents to be fetched from private/loopback/link-local hosts (see [CIMD and SSRF hardening](#cimd-and-ssrf-hardening)) |
 | `custom_redirect_uri_schemes` | `list[str]` | `None` | Private-use URI schemes (RFC 8252 §7.1, e.g. `["myapp"]`) accepted as `redirect_uris` during dynamic registration, for native app clients |
+| `storage` | `OAuthStorage` | `None` (built from `storage_path`) | Injectable authorization storage, used as-is. Supply a shared implementation before routing clients across multiple replicas. Mutually exclusive with `storage_path` |
+| `private_key` | `RSAPrivateKey` | generated at startup | Injectable persistent RSA key used for ID-token signing and JWKS |
+
+The default SQLite storage is local to one host, and the default signing key is
+generated per process, so a restart rotates it. A multi-replica deployment must
+inject shared storage and the same persistent key into every replica.
 
 ## OAuth Endpoints
+
+`/.well-known/oauth-protected-resource` is served at **two** paths: the bare one,
+and the RFC 9728 form that inserts the well-known segment into the resource path
+(`/.well-known/oauth-protected-resource/mcp` when `mcp_path="/mcp"`). Clients try
+the suffixed form first. Both return the same document.
+
 
 | Endpoint | Description |
 | --- | --- |
@@ -265,6 +341,53 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | `GET/POST /userinfo` | Lightweight OIDC userinfo endpoint for `openid` tokens |
 
 
+## Debugging
+
+`OAuthMiddleware` accepts `debug=True`, for tracking down a request that's
+getting an unexpected 401/400, or a downstream app that 400s right after auth
+passes it through:
+
+```python
+app.add_middleware(OAuthMiddleware, provider=auth, debug=True)
+```
+
+With `debug=True`, every request through the middleware logs, at `DEBUG`
+level on the `"origo"` logger, the decision it made and why:
+
+- which header names were present on the request, and how many `Authorization`
+  headers were seen (more than one is rejected outright — see below)
+- the auth scheme name, if the `Bearer ...` check failed (only recognized
+  scheme names such as `Basic` or a lowercase `bearer` are shown; anything
+  else in that position might be a credential and is logged as
+  `<unrecognized>`)
+- why token verification failed: no such token / expired, vs. a **resource
+  mismatch** (a token that's otherwise valid but was issued for a different
+  `resource_identifier` than this server expects) — these look identical from
+  the outside but are different bugs, so debug mode tells them apart
+- the authenticated `client_id`/`scope` once a request passes
+- the downstream app's response status once it responds — so if your app
+  passes auth and then 400s/500s on its own, `debug=True` shows that too,
+  without needing to add logging inside the app itself
+
+Bearer tokens and header values are never logged, not even in part — only a
+keyed fingerprint and the length (e.g. `<fp=3f9a1c0e, 71 chars>`), enough to
+tell the same token retried apart from a second, different one without
+exposing any of the credential. The fingerprint key is generated per process,
+so fingerprints correlate within one run and cannot be checked offline
+against guesses of the value.
+
+If no handler would receive the `"origo"` logger's records — neither one on
+that logger nor one it propagates to, such as the root handler installed by
+`logging.basicConfig()` — `debug=True` attaches a `StreamHandler` so output is
+visible on stderr by default. If your app already configures logging, that
+configuration is left alone and origo's `DEBUG` records flow through it once,
+like any other logger's.
+
+`debug=True` is meant for a live investigation, not for leaving on
+permanently in production — it logs at high volume (one or more lines per
+request).
+
+
 ## OpenAI platform compatibility
 
 `origo` includes the OAuth behavior needed by OpenAI platform MCP clients that connect to protected MCP servers:
@@ -275,8 +398,9 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 - CIMD clients can use an HTTPS metadata document URL as `client_id`; `origo` fetches it, validates redirect URIs, and treats it as a public PKCE client when the document requests `token_endpoint_auth_method=none`.
 - The optional OAuth `resource` parameter is preserved from `/authorize` to `/token` and stored with the issued access token metadata, so applications can verify which MCP resource the token was minted for.
 - `/token` issues a `refresh_token` alongside every access token. Long-lived MCP clients can exchange it (`grant_type=refresh_token`) for a new access token without a full interactive re-authorization once `token_ttl` expires. Refresh tokens are single-use — each `/token` call rotates in a new one — and are scoped to the same `client_id`/`resource` as the token they replaced. Replaying an already-used refresh token is treated as theft (per the OAuth 2.1 rotation guidance): the entire token family descended from that grant — live refresh tokens and access tokens both — is revoked on the spot, so a stolen-and-rotated chain dies the moment the legitimate holder's token resurfaces. (Corollary: a client that retries a `/token` refresh call after losing the response will trigger this and must re-authorize interactively.)
-- `WWW-Authenticate` challenges include `resource_metadata` so ChatGPT can discover OAuth metadata when an unauthenticated tool call reaches the server.
-- Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an unsigned `id_token` for `openid` requests, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
+- `WWW-Authenticate` challenges include `resource_metadata` and configured scopes so clients can discover the authorization requirements after an unauthenticated tool call.
+- Authorization responses include the RFC 9207 `iss` parameter, and discovery advertises support for it.
+- Optional lightweight OIDC support exposes `/.well-known/openid-configuration`, returns an RS256-signed `id_token` for `openid` requests, publishes its key through JWKS, and serves `/userinfo` with `sub` plus `email` when `user_email` is configured and the token has the `email` scope.
 
 For ChatGPT connectors, register the redirect URI shown in ChatGPT (for example, `https://chatgpt.com/connector/oauth/{callback_id}`) and use your public MCP endpoint as the `resource` value, typically `https://your-domain.example/mcp`.
 
