@@ -744,8 +744,15 @@ async def token(request: Request) -> JSONResponse:
     client_id = params.get("client_id")
     client_secret = params.get("client_secret")
 
+    auth_list = request.headers.getlist("Authorization")
+    has_basic_auth = any(a.startswith("Basic ") for a in auth_list)
+
+    # Reject requests that use multiple client authentication methods simultaneously
+    # to prevent credential confusion (RFC 6749 Section 2.3.1)
+    if client_id and has_basic_auth:
+        return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed"}, status_code=400)
+
     if not client_id:
-        auth_list = request.headers.getlist("Authorization")
         if len(auth_list) > 1:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         auth = auth_list[0] if auth_list else ""
