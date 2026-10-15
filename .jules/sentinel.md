@@ -130,3 +130,8 @@
 **Vulnerability:** A Medium severity vulnerability existed in `origo/endpoints.py` where parsed components of a user-provided `redirect_uri` were reflected directly into the `Content-Security-Policy` header's `form-action` directive. An attacker could supply a `redirect_uri` containing CSP delimiters (like `;` or spaces) to inject arbitrary directives (e.g., `frame-ancestors *` or `script-src`) into the consent page's CSP.
 **Learning:** `urllib.parse.urlparse` allows certain delimiters in the netloc or path. When reflecting parts of parsed URLs into HTTP security headers like CSP, the output must be strictly validated against the syntax rules of the target context.
 **Prevention:** Explicitly reject URL components that contain CSP delimiters (such as semicolons, single quotes, commas, and spaces) before including them in a CSP directive.
+
+## 2024-05-30 - Fix Credential Confusion in Token Endpoint
+**Vulnerability:** The OAuth token endpoint allowed clients to authenticate by simultaneously supplying both HTTP Basic Authentication (via the `Authorization` header) and form-body client credentials (`client_id` and `client_secret` in the POST body).
+**Learning:** Accepting multiple mutually exclusive authentication methods simultaneously in the token endpoint violates RFC 6749 Section 2.3.1 ("The authorization server MUST NOT use more than one authentication method in each request") and introduces a credential confusion vulnerability, where different layers might validate different credentials.
+**Prevention:** Implement strict validation to explicitly reject requests that include both an `Authorization: Basic ...` header and form-body credentials (`client_id` or `client_secret`), returning a 400 Bad Request error.
