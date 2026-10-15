@@ -749,18 +749,21 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
     auth = auth_list[0] if auth_list else ""
 
-    # Reject if both form body credentials and HTTP Basic Authentication are present
-    if auth.startswith("Basic ") and (client_id or client_secret):
-        return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed."}, status_code=400)
+    if auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode()
+            if ":" in decoded:
+                basic_client_id, basic_client_secret = decoded.split(":", 1)
 
-    if not client_id:
-        if auth.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(auth[6:]).decode()
-                if ":" in decoded:
-                    client_id, client_secret = decoded.split(":", 1)
-            except Exception:
-                return JSONResponse({"error": "invalid_request"}, status_code=400)
+                if client_secret:
+                    return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed."}, status_code=400)
+                if client_id and client_id != basic_client_id:
+                    return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed."}, status_code=400)
+
+                client_id = basic_client_id
+                client_secret = basic_client_secret
+        except Exception:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     grant_type = params.get("grant_type")
     redirect_uri = params.get("redirect_uri")
