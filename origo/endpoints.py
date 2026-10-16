@@ -749,7 +749,10 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
     auth = auth_list[0] if auth_list else ""
     if auth.startswith("Basic "):
-        if client_id or client_secret:
+        # Check if auth values were provided in body. Empty string does not slip through if we check isnon-None
+        has_body_id = "client_id" in params
+        has_body_secret = "client_secret" in params
+        if has_body_id or has_body_secret:
             # RFC 6749 Section 2.3.1: The authorization server MUST reject requests
             # utilizing multiple client authentication methods.
             return JSONResponse({"error": "invalid_request"}, status_code=400)
