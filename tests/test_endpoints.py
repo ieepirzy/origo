@@ -801,14 +801,38 @@ async def test_token_rejects_multiple_auth_methods(client_private):
     code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
     credentials = base64.b64encode(b"test-client:test-secret").decode()
 
-    # Send both Basic auth header and body client_id
+    # Send both Basic auth header and body client_secret
     resp = await client.post("/token",
         data={
             "grant_type": "authorization_code",
             "code": code,
             "code_verifier": verifier,
             "redirect_uri": "https://example.com/cb",
-            "client_id": "test-client"
+            "client_id": "test-client",
+            "client_secret": "test-secret"
+        },
+        headers={"Authorization": f"Basic {credentials}"},
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["error"] == "invalid_request"
+    assert "Multiple client authentication methods are not allowed" in data["error_description"]
+
+@pytest.mark.asyncio
+async def test_token_rejects_multiple_auth_methods_mismatched_client_id(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    credentials = base64.b64encode(b"other-client:other-secret").decode()
+
+    # Send both Basic auth header and mismatched body client_id
+    resp = await client.post("/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
+            "client_id": "test-client",
         },
         headers={"Authorization": f"Basic {credentials}"},
     )
