@@ -762,6 +762,8 @@ async def token(request: Request) -> JSONResponse:
 
                 client_id = basic_client_id
                 client_secret = basic_client_secret
+            else:
+                return JSONResponse({"error": "invalid_request", "error_description": "Malformed Basic authentication header."}, status_code=400)
         except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
 
