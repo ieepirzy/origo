@@ -1626,3 +1626,41 @@ async def test_authorize_post_consent_form_includes_response_type(client_public)
         assert post_resp.headers.get("Cache-Control") == "no-store"
         assert post_resp.headers.get("Pragma") == "no-cache"
         assert "code=" in post_resp.headers["Location"]
+
+from httpx import AsyncClient, ASGITransport
+
+@pytest.mark.asyncio
+async def test_token_rejects_multiple_auth_methods(provider_public):
+    provider = provider_public
+    """
+    RFC 6749 Section 2.3.1 requires that the authorization server MUST NOT
+    process multiple authentication credentials in the same request.
+    """
+    import base64
+    app = provider.asgi_app()
+    client_id = "test_client_multi"
+    client_secret = "test_secret_multi"
+    provider.storage.seed_clients({client_id: client_secret})
+
+    # Prepare Basic Auth header
+    auth_str = f"{client_id}:{client_secret}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    headers = {"Authorization": f"Basic {b64_auth}"}
+
+    # Prepare form data including credentials (violates RFC 6749)
+    data = {
+        "grant_type": "authorization_code",
+        "code": "dummy",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": "https://example.com/cb",
+        "code_verifier": "dummy",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+        resp = await client.post("/token", data=data, headers=headers)
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"] == "invalid_request"
+        assert "Multiple client authentication methods provided." in body["error_description"]
