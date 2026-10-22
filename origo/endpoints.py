@@ -744,8 +744,16 @@ async def token(request: Request) -> JSONResponse:
     client_id = params.get("client_id")
     client_secret = params.get("client_secret")
 
+    auth_list = request.headers.getlist("Authorization")
+
+    # SECURITY: RFC 6749 Section 2.3.1 mandates that a client MUST NOT use more than one
+    # authentication method in each request. If multiple mutually exclusive methods
+    # (e.g., both form body and HTTP Basic Auth) are detected, reject the request
+    # to prevent credential confusion or bypass attacks.
+    if (client_id or client_secret) and any(a.startswith("Basic ") for a in auth_list):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
     if not client_id:
-        auth_list = request.headers.getlist("Authorization")
         if len(auth_list) > 1:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         auth = auth_list[0] if auth_list else ""
