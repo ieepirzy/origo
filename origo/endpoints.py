@@ -747,7 +747,7 @@ async def token(request: Request) -> JSONResponse:
     auth_list = request.headers.getlist("Authorization")
     auth = auth_list[0] if auth_list else ""
     if auth.startswith("Basic "):
-        if client_id or client_secret:
+        if client_secret:
             # RFC 6749 Section 2.3.1: must not use multiple authentication methods
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         if len(auth_list) > 1:
@@ -755,7 +755,11 @@ async def token(request: Request) -> JSONResponse:
         try:
             decoded = base64.b64decode(auth[6:]).decode()
             if ":" in decoded:
-                client_id, client_secret = decoded.split(":", 1)
+                basic_client_id, basic_client_secret = decoded.split(":", 1)
+                if client_id and client_id != basic_client_id:
+                    return JSONResponse({"error": "invalid_request"}, status_code=400)
+                client_id = basic_client_id
+                client_secret = basic_client_secret
         except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
 

@@ -1646,11 +1646,9 @@ async def test_token_multiple_auth_methods():
     response = client.post(
         "/token",
         data={
-            "grant_type": "authorization_code",
-            "code": "test_code_123",
-            "redirect_uri": "http://localhost/cb",
-            "code_verifier": "verifier_challenge",
-            "client_id": "client_test"
+            "grant_type": "client_credentials",
+            "client_id": "client_test",
+            "client_secret": "secret_test"
         },
         headers={"Authorization": "Basic Y2xpZW50X3Rlc3Q6c2VjcmV0X3Rlc3Q="} # base64 for client_test:secret_test
     )
