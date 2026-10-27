@@ -744,18 +744,28 @@ async def token(request: Request) -> JSONResponse:
     client_id = params.get("client_id")
     client_secret = params.get("client_secret")
 
-    if not client_id:
-        auth_list = request.headers.getlist("Authorization")
-        if len(auth_list) > 1:
+    auth_list = request.headers.getlist("Authorization")
+    if len(auth_list) > 1:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    auth = auth_list[0] if auth_list else ""
+    if auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode()
+            if ":" in decoded:
+                h_client_id, h_client_secret = decoded.split(":", 1)
+
+                # Reject if multiple client authentications are provided
+                if client_secret is not None:
+                    return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+                # Reject if body client_id conflicts with header client_id
+                if client_id is not None and client_id != h_client_id:
+                    return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+                client_id = h_client_id
+                client_secret = h_client_secret
+        except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
-        auth = auth_list[0] if auth_list else ""
-        if auth.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(auth[6:]).decode()
-                if ":" in decoded:
-                    client_id, client_secret = decoded.split(":", 1)
-            except Exception:
-                return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     grant_type = params.get("grant_type")
     redirect_uri = params.get("redirect_uri")
