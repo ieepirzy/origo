@@ -749,12 +749,21 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
     auth = auth_list[0] if auth_list else ""
     if auth.startswith("Basic "):
-        if client_id is not None or client_secret is not None:
-            return JSONResponse({"error": "invalid_request"}, status_code=400)
         try:
             decoded = base64.b64decode(auth[6:]).decode()
             if ":" in decoded:
-                client_id, client_secret = decoded.split(":", 1)
+                h_client_id, h_client_secret = decoded.split(":", 1)
+
+                # Reject if multiple client authentications are provided
+                if client_secret is not None:
+                    return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+                # Reject if body client_id conflicts with header client_id
+                if client_id is not None and client_id != h_client_id:
+                    return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+                client_id = h_client_id
+                client_secret = h_client_secret
         except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
 
