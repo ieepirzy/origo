@@ -744,18 +744,24 @@ async def token(request: Request) -> JSONResponse:
     client_id = params.get("client_id")
     client_secret = params.get("client_secret")
 
-    if not client_id:
-        auth_list = request.headers.getlist("Authorization")
-        if len(auth_list) > 1:
+    auth_list = request.headers.getlist("Authorization")
+    if len(auth_list) > 1:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    auth = auth_list[0] if auth_list else ""
+    is_basic_auth = auth.startswith("Basic ")
+
+    if is_basic_auth:
+        if client_id or client_secret:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "Multiple client authentication methods provided."},
+                status_code=400,
+            )
+        try:
+            decoded = base64.b64decode(auth[6:]).decode()
+            if ":" in decoded:
+                client_id, client_secret = decoded.split(":", 1)
+        except Exception:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
-        auth = auth_list[0] if auth_list else ""
-        if auth.startswith("Basic "):
-            try:
-                decoded = base64.b64decode(auth[6:]).decode()
-                if ":" in decoded:
-                    client_id, client_secret = decoded.split(":", 1)
-            except Exception:
-                return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     grant_type = params.get("grant_type")
     redirect_uri = params.get("redirect_uri")
