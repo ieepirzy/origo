@@ -832,7 +832,7 @@ async def test_token_rejects_multiple_authorization_headers(client_private):
     code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
     credentials = base64.b64encode(b"test-client:test-secret").decode()
     resp = await client.post("/token",
-        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": "https://example.com/cb"},
+        data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": "https://example.com/cb", "client_id": "test-client", "client_secret": "test-secret"},
         headers=[("Authorization", f"Basic {credentials}"), ("Authorization", f"Basic {credentials}")],
     )
     assert resp.status_code == 400

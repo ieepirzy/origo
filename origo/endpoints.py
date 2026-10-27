@@ -749,15 +749,17 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
     auth = auth_list[0] if auth_list else ""
 
-    if auth.startswith("Basic "):
+    if auth.startswith("Basic ") or auth.lower().startswith("basic "):
         try:
-            decoded = base64.b64decode(auth[6:]).decode()
+            # Re-check case-insensitively before parsing length, just in case
+            prefix_len = 6 if auth.lower().startswith("basic ") else 0
+            decoded = base64.b64decode(auth[prefix_len:]).decode()
             if ":" in decoded:
                 basic_client_id, basic_client_secret = decoded.split(":", 1)
 
-                if client_secret:
+                if "client_secret" in params:
                     return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed."}, status_code=400)
-                if client_id and client_id != basic_client_id:
+                if "client_id" in params and client_id != basic_client_id:
                     return JSONResponse({"error": "invalid_request", "error_description": "Multiple client authentication methods are not allowed."}, status_code=400)
 
                 client_id = basic_client_id
