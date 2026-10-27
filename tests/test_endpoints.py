@@ -1626,3 +1626,32 @@ async def test_authorize_post_consent_form_includes_response_type(client_public)
         assert post_resp.headers.get("Cache-Control") == "no-store"
         assert post_resp.headers.get("Pragma") == "no-cache"
         assert "code=" in post_resp.headers["Location"]
+
+@pytest.mark.asyncio
+async def test_token_multiple_auth_methods():
+    from origo import OAuthProvider
+    from starlette.testclient import TestClient
+
+    p = OAuthProvider(
+        base_url="http://testserver",
+        clients={"client_test": "secret_test"},
+        client_redirect_uris={"client_test": ["http://localhost/cb"]}
+    )
+    client = TestClient(p.asgi_app())
+
+    # Store a code so the authorization_code grant logic can proceed
+    p.storage.store_code("test_code_123", "client_test", "http://localhost/cb", "scope1", "S256", "verifier_challenge_abc")
+
+    # Provide BOTH form credentials and Basic auth
+    response = client.post(
+        "/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": "client_test",
+            "client_secret": "secret_test"
+        },
+        headers={"Authorization": "Basic Y2xpZW50X3Rlc3Q6c2VjcmV0X3Rlc3Q="} # base64 for client_test:secret_test
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid_request"}
