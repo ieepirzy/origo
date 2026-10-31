@@ -154,7 +154,7 @@ auth = OAuthProvider(
 
 The flow, per authorization:
 
-1. The client identifies itself as before (pre-registered, DCR, or CIMD) and its `redirect_uri` is checked.
+1. The client identifies itself as before (pre-registered, DCR, or CIMD) and its `redirect_uri` is checked. Setting `cimd_allowed_clients` limits self-registered clients to the listed CIMD documents and turns DCR off: an IdP sign-in screen that any app can trigger is a phishing aid, and a person with a live IdP session may not even see a prompt.
 2. origo parks the request and redirects to the IdP's authorization endpoint (found by discovery at `<issuer>/.well-known/openid-configuration`) using the code flow with PKCE, `state` and `nonce`. A `__Host-origo_login` cookie binds the sign-in to the browser that started it.
 3. The IdP redirects back to **`{base_url}/authorize/callback`**. origo exchanges the code and verifies the `id_token`: signature against the IdP's JWKS (asymmetric algorithms only; `none` and HMAC are refused), `iss`, `aud`/`azp`, `exp` and `nonce`.
 4. The allow gate runs: every configured gate must pass. `allowed_email_domains` matches the **verified** email's domain exactly (no subdomains); `allowed_groups` needs at least one exact match in the `groups_claim` claim (default `groups`; a dotted path such as `realm_access.roles` reaches nested claims). A refused or failed sign-in returns `error=access_denied` to the client and issues no code.
@@ -314,7 +314,7 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients. Only honoured with `allow_unauthenticated_consent`; ignored with an `identity_provider` |
 | `identity_provider` | `IdentityProvider` | `None` | Upstream OIDC sign-in for every authorization — see [Per-user sign-in](#per-user-sign-in-upstream-oidc) |
 | `allow_unauthenticated_consent` | `bool` | `None` (reads `$ORIGO_ALLOW_UNAUTHENTICATED_CONSENT`) | Without an IdP, allow the approve-only consent page instead of failing closed — see [Approve-only consent](#approve-only-consent-no-identity-provider) |
-| `cimd_allowed_clients` | `list[str]` | `None` (any) | CIMD clients allowed to authorize: exact `client_id` URLs and/or host patterns (`"claude.ai"`, `"*.example.com"`). Applies to already-registered CIMD clients too |
+| `cimd_allowed_clients` | `list[str]` | `None` (any) | CIMD clients allowed to authorize: exact `client_id` URLs and/or host patterns (`"claude.ai"`, `"*.example.com"`). Applies to already-registered CIMD clients too. When set, DCR (`/register`) is disabled, since it would otherwise register unlisted clients |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
 | `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request; replaying a used one revokes the whole token family |
 | `storage_path` | `str` | auto (`./.origo/<hash>.db`, or `$ORIGO_STORAGE_PATH`) | Path to a SQLite file for persistent storage (see [Token persistence](#token-persistence)). Pass `None` explicitly to force in-memory storage |

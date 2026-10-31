@@ -740,6 +740,26 @@ async def test_cimd_allowlist_cuts_off_already_registered_clients(fake, http, ci
     assert (await _cimd_authorize(await http(after), "https://evil.example/meta")).status_code == 401
 
 
+async def test_cimd_allowlist_turns_dcr_off(fake, http):
+    """DCR would mint an unlisted client with any redirect_uri, walking
+    around the allowlist — so the allowlist closes it."""
+    provider = OAuthProvider(base_url=BASE, public_registration=True, storage_path=None,
+                             identity_provider=make_idp(fake), cimd_allowed_clients=["claude.ai"])
+    client = await http(provider)
+    resp = await client.post("/register", json={"redirect_uris": ["https://attacker.example/cb"]})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "access_denied"
+    meta = (await client.get("/.well-known/oauth-authorization-server")).json()
+    assert "registration_endpoint" not in meta
+
+    # Without the allowlist DCR stays as it was.
+    open_provider = OAuthProvider(base_url=BASE, public_registration=True, storage_path=None,
+                                  identity_provider=make_idp(fake))
+    client = await http(open_provider)
+    resp = await client.post("/register", json={"redirect_uris": ["https://app.example/cb"]})
+    assert resp.status_code == 201
+
+
 # --- Config validation ---
 
 def test_identity_provider_config_validation():

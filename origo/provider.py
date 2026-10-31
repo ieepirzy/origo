@@ -151,8 +151,11 @@ class OAuthProvider:
                              exact client_id URLs ("https://claude.ai/oauth/...")
                              and/or host patterns ("claude.ai", "*.example.com").
                              None (default) accepts any CIMD client when
-                             public_registration is on. Pre-registered clients are
-                             unaffected; DCR (/register) clients are not covered.
+                             public_registration is on. When set, dynamic client
+                             registration (/register) is turned off as well — it
+                             would otherwise mint unlisted clients at will — and
+                             already-registered CIMD clients not on the list are
+                             refused. Pre-registered clients are unaffected.
     """
 
     def __init__(

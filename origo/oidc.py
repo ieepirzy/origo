@@ -34,6 +34,7 @@ the tests replace with a fake IdP; nothing else here touches the network.
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import time
@@ -79,6 +80,8 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 # keys), but not more often than this — otherwise a stream of forged kids
 # becomes a stream of requests to the IdP.
 _JWKS_REFETCH_INTERVAL = 60
+
+_USER_AGENT = "origo (+https://github.com/ieepirzy/origo)"
 
 
 class IdentityError(Exception):
@@ -240,7 +243,10 @@ class IdentityProvider:
         Redirects are refused. Runs synchronously; callers use a worker thread.
         """
         _require_secure_url(url, "IdP endpoint")
-        request_headers = {"Accept": "application/json", **(headers or {})}
+        # An explicit User-Agent: Cloudflare's default bot rules answer 403 to
+        # urllib's "Python-urllib/x.y" (observed in front of the first
+        # Keycloak this was deployed against), which would fail every sign-in.
+        request_headers = {"Accept": "application/json", "User-Agent": _USER_AGENT, **(headers or {})}
         data = None
         if form is not None:
             data = urlencode(form).encode()
@@ -258,7 +264,9 @@ class IdentityProvider:
             except Exception:
                 detail = ""
             raise IdentityError(f"IdP returned HTTP {exc.code} from {url}: {detail}", error="server_error") from exc
-        except (OSError, urllib.error.URLError, ValueError) as exc:
+        except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as exc:
+            # HTTPException: a truncated or malformed response (IncompleteRead,
+            # BadStatusLine) must become a server_error redirect, not a 500.
             raise IdentityError(f"IdP request to {url} failed: {exc}", error="server_error") from exc
         if len(body) > _MAX_RESPONSE_BYTES:
             raise IdentityError(f"IdP response from {url} exceeds {_MAX_RESPONSE_BYTES} bytes", error="server_error")

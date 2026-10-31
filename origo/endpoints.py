@@ -378,7 +378,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
     }
     if scopes_supported:
         data["scopes_supported"] = scopes_supported
-    if public_registration:
+    if public_registration and request.app.state.cimd_allowed_clients is None:
         data["registration_endpoint"] = f"{base_url}/register"
     data["jwks_uri"] = f"{base_url}/.well-known/jwks.json"
     return JSONResponse(data)
@@ -460,6 +460,16 @@ async def register(request: Request) -> JSONResponse:
         # Better: just reject.
         return JSONResponse(
             {"error": "access_denied", "error_description": "Dynamic registration is disabled."},
+            status_code=400,
+        )
+
+    if request.app.state.cimd_allowed_clients is not None:
+        # DCR hands out a fresh client_id with whatever redirect_uris the
+        # caller asks for, which would walk straight around the CIMD
+        # allowlist. An operator who restricted self-registered clients to
+        # named CIMD documents gets exactly those, and no anonymous ones.
+        return JSONResponse(
+            {"error": "access_denied", "error_description": "Dynamic registration is disabled; this server accepts listed CIMD clients only."},
             status_code=400,
         )
 
