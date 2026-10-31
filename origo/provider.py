@@ -449,6 +449,11 @@ class OAuthProvider:
                 raise TypeError("cimd_allowed_clients entries must be non-empty strings")
             if "://" in entry and not entry.startswith("https://"):
                 raise ValueError(f"cimd_allowed_clients URL entries must be https; got {entry!r}")
+            if entry.startswith("*.") and len([label for label in entry[2:].rstrip(".").split(".") if label]) < 2:
+                raise ValueError(
+                    f"cimd_allowed_clients entry {entry!r} is a wildcard over a top-level domain; "
+                    f"name a registrable domain (e.g. '*.example.com') or an exact host."
+                )
             if entry.startswith("*.") and entry[2:].lower().rstrip(".") in _SHARED_HOSTING_SUFFIXES:
                 raise ValueError(
                     f"cimd_allowed_clients entry {entry!r} admits every tenant of a shared hosting "

@@ -797,10 +797,20 @@ def _dynamic_client_permitted(app_state, client_id: str) -> bool:
     CIMD clients may authorize or refresh. Every other self-registered client
     — a DCR client, an unlisted CIMD document, one persisted before the list
     existed — is refused: with an IdP behind origo, any such client could
-    otherwise collect codes for whoever has a live IdP session."""
-    allowed: frozenset[str] | None = app_state.cimd_allowed_clients
-    if allowed is None or client_id in app_state.seeded_client_ids:
+    otherwise collect codes for whoever has a live IdP session.
+
+    With an IdP and no allowlist, the allowlist counts as empty: only
+    pre-registered clients pass. That case is public_registration=False
+    (construction refuses the other), where the only self-registered
+    clients are leftovers persisted by an earlier public deployment — and
+    those must not start receiving silent SSO codes."""
+    if client_id in app_state.seeded_client_ids:
         return True
+    allowed: frozenset[str] | None = app_state.cimd_allowed_clients
+    if allowed is None:
+        if app_state.identity_provider is None:
+            return True
+        allowed = frozenset()
     try:
         is_https = urlparse(client_id).scheme == "https"
     except ValueError:

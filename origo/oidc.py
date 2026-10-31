@@ -86,6 +86,11 @@ _JWKS_REFETCH_INTERVAL = 60
 _JWKS_TTL = 3600
 _DISCOVERY_TTL = 24 * 3600
 
+# After a failed refresh with a cached copy in hand, wait this long before
+# trying again. Otherwise, during an IdP outage, every sign-in would spend up
+# to the fetch timeout retrying before falling back to the cache.
+_REFRESH_BACKOFF = 60
+
 _USER_AGENT = "origo (+https://github.com/ieepirzy/origo)"
 
 
@@ -244,8 +249,10 @@ class IdentityProvider:
 
         self._metadata: Optional[dict] = None
         self._metadata_fetched_at = 0.0
+        self._metadata_retry_after = 0.0
         self._jwks: Optional[dict] = None
         self._jwks_fetched_at = 0.0
+        self._jwks_retry_after = 0.0
 
     # --- HTTP (the one seam tests replace) ---
 
@@ -302,13 +309,17 @@ class IdentityProvider:
         A failed refresh keeps serving the cached document (logged) rather
         than failing sign-ins over a transient outage of the discovery URL.
         """
-        if self._metadata is not None and time.time() - self._metadata_fetched_at < _DISCOVERY_TTL:
+        now = time.time()
+        if self._metadata is not None and (
+            now - self._metadata_fetched_at < _DISCOVERY_TTL or now < self._metadata_retry_after
+        ):
             return self._metadata
         try:
             document = await self._fetch_metadata()
         except IdentityError as exc:
             if self._metadata is None:
                 raise
+            self._metadata_retry_after = now + _REFRESH_BACKOFF
             logger.warning("IdP discovery refresh failed, keeping the cached document: %s", exc)
             return self._metadata
         self._metadata = document
@@ -394,15 +405,17 @@ class IdentityProvider:
         once per _JWKS_REFETCH_INTERVAL."""
         now = time.time()
         age = now - self._jwks_fetched_at
-        if self._jwks is None or age >= _JWKS_TTL or (
-            self._find_jwk(self._jwks, kid, kty) is None and age >= _JWKS_REFETCH_INTERVAL
-        ):
+        if self._jwks is None or (now >= self._jwks_retry_after and (
+            age >= _JWKS_TTL
+            or (self._find_jwk(self._jwks, kid, kty) is None and age >= _JWKS_REFETCH_INTERVAL)
+        )):
             try:
                 self._jwks = await self._fetch((await self.metadata())["jwks_uri"])
                 self._jwks_fetched_at = now
             except IdentityError:
                 if self._jwks is None:
                     raise
+                self._jwks_retry_after = now + _REFRESH_BACKOFF
                 logger.warning("IdP JWKS refresh failed, keeping the cached keys.")
         jwk = self._find_jwk(self._jwks, kid, kty)
         if jwk is None:

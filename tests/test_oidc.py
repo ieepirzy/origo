@@ -779,6 +779,47 @@ async def test_cimd_allowlist_refuses_refresh_for_excluded_clients(fake, http, c
     assert resp.json()["error"] == "invalid_client"
 
 
+async def test_idp_without_allowlist_admits_only_seeded_clients(fake, http, cimd_documents, tmp_path):
+    """public_registration=False + IdP + no allowlist: self-registered clients
+    persisted by an earlier public deployment must not get silent SSO codes,
+    nor refresh grants they already hold."""
+    path = str(tmp_path / "o.db")
+    before = OAuthProvider(base_url=BASE, public_registration=True, storage_path=path, client_ttl=3600,
+                           auto_approve=True, allow_unauthenticated_consent=True)
+    client = await http(before)
+    assert (await _cimd_authorize(client, "https://evil.example/meta")).status_code == 302
+    dcr = (await client.post("/register", json={"redirect_uris": [CLIENT_REDIRECT], "token_endpoint_auth_method": "none"})).json()
+    verifier, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
+        "response_type": "code", "client_id": dcr["client_id"], "redirect_uri": CLIENT_REDIRECT,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": "s",
+    })
+    tokens = (await client.post("/token", data={
+        "grant_type": "authorization_code", "client_id": dcr["client_id"], "code": client_redirect_params(resp)["code"],
+        "code_verifier": verifier, "redirect_uri": CLIENT_REDIRECT,
+    })).json()
+
+    after = make_provider(fake, storage_path=path, client_ttl=3600)  # IdP, public_registration=False
+    client = await http(after)
+    for client_id in ("https://evil.example/meta", dcr["client_id"]):
+        assert after.storage.client_exists(client_id)
+        assert (await _cimd_authorize(client, client_id)).status_code == 401
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token", "client_id": dcr["client_id"], "refresh_token": tokens["refresh_token"],
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_client"
+    # The seeded client still signs in.
+    assert (await full_sign_in(client, fake))["access_token"]
+
+
+@pytest.mark.parametrize("entry", ["*.app", "*.com.", "*."])
+def test_single_label_wildcards_are_refused(entry):
+    with pytest.raises(ValueError, match="top-level"):
+        OAuthProvider(base_url=BASE, public_registration=True, storage_path=None, cimd_allowed_clients=[entry])
+    OAuthProvider(base_url=BASE, public_registration=True, storage_path=None, cimd_allowed_clients=["*.example.com"])
+
+
 def test_idp_with_public_registration_requires_the_allowlist(fake):
     """No consent screen + a silent SSO session = any self-registered client
     collects codes for the victim. Refused at construction."""
@@ -902,6 +943,38 @@ async def test_discovery_refetched_after_ttl_and_kept_on_failure(fake, http):
 
     provider.identity_provider.fetch_json = flaky
     await full_sign_in(client, fake)
+
+
+async def test_failed_refreshes_back_off(fake, http):
+    """During an IdP outage with cached copies in hand, each sign-in must not
+    re-try (and wait out) the failing fetch: one attempt per backoff window."""
+    provider = make_provider(fake)
+    client = await http(provider)
+    await full_sign_in(client, fake)
+    idp = provider.identity_provider
+    discovery = f"{ISSUER}/.well-known/openid-configuration"
+    certs = f"{ISSUER}/protocol/openid-connect/certs"
+    attempts = {discovery: 0, certs: 0}
+    real_fetch = fake.fetch_json
+
+    def outage(url, form=None, headers=None):
+        if url in attempts:
+            attempts[url] += 1
+            raise IdentityError("down", error="server_error")
+        return real_fetch(url, form, headers)
+
+    idp.fetch_json = outage
+    idp._metadata_fetched_at -= 24 * 3600 + 1
+    idp._jwks_fetched_at -= 3601
+    for _ in range(3):
+        await full_sign_in(client, fake)
+    assert attempts == {discovery: 1, certs: 1}
+
+    # After the backoff window, one more attempt each.
+    idp._metadata_retry_after = 0
+    idp._jwks_retry_after = 0
+    await full_sign_in(client, fake)
+    assert attempts == {discovery: 2, certs: 2}
 
 
 async def test_nbf_in_the_future_is_refused(fake, http):
