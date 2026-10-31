@@ -1,3 +1,4 @@
+import copy
 import functools
 import hashlib
 import logging
@@ -36,6 +37,18 @@ logger = logging.getLogger("origo")
 # Operational switch for the approve-only consent page; see
 # allow_unauthenticated_consent in OAuthProvider's docstring.
 CONSENT_ENV_VAR = "ORIGO_ALLOW_UNAUTHENTICATED_CONSENT"
+
+
+# Domains where anyone can get a subdomain. A "*.<one of these>" CIMD pattern
+# admits every tenant, i.e. anyone, so it is refused. Not exhaustive (the
+# Public Suffix List is the full story); the README says so.
+_SHARED_HOSTING_SUFFIXES = frozenset({
+    "vercel.app", "github.io", "netlify.app", "pages.dev", "workers.dev",
+    "herokuapp.com", "azurewebsites.net", "cloudfront.net", "appspot.com",
+    "web.app", "firebaseapp.com", "onrender.com", "fly.dev", "glitch.me",
+    "ngrok.io", "ngrok-free.app", "trycloudflare.com", "repl.co",
+    "amplifyapp.com", "gitlab.io", "deno.dev", "railway.app", "up.railway.app",
+})
 
 
 def _env_allows_unauthenticated_consent() -> bool:
@@ -90,9 +103,12 @@ class OAuthProvider:
                              consent is allowed (see allow_unauthenticated_consent);
                              ignored with an identity_provider.
         token_ttl:           Access token lifetime in seconds. Default 3600.
-                             With an identity_provider, keep this short: a person
-                             disabled at the IdP keeps access until their access
-                             token expires (refresh does not re-ask the IdP yet).
+                             With an identity_provider, keep this short: refresh
+                             does not ask the IdP again, so a person disabled at
+                             the IdP keeps their current access token until it
+                             expires, and can refresh until the identity
+                             provider's max_grant_age (counted from sign-in) runs
+                             out or they fail its allow gate.
         refresh_token_ttl:   Refresh token lifetime in seconds. Default 30 days.
                              Refresh tokens are single-use and rotated on every
                              /token request (a new one is issued each time).
@@ -202,6 +218,19 @@ class OAuthProvider:
             else bool(allow_unauthenticated_consent)
         )
         self.cimd_allowed_clients = self._normalize_cimd_allowed_clients(cimd_allowed_clients)
+        if identity_provider is not None and public_registration and self.cimd_allowed_clients is None:
+            # Refused, not warned: there is no consent screen behind an IdP,
+            # and an IdP with a live SSO session signs the person in without
+            # a click. Any self-registered client — DCR, or a CIMD document
+            # the attacker hosts — could then send a victim an /authorize
+            # link and collect a code carrying the victim's identity.
+            raise ValueError(
+                "OAuthProvider: identity_provider with public_registration=True requires "
+                "cimd_allowed_clients — otherwise any self-registered client can collect "
+                "codes for whoever has a live session at your IdP, without a click. List "
+                "the connector platforms you use (e.g. ['claude.ai']), or pre-register "
+                "clients with clients= and turn public_registration off."
+            )
         self._seeded_client_ids = frozenset(clients or {})
         self._log_authorization_mode()
 
@@ -369,7 +398,8 @@ class OAuthProvider:
         if claims:
             for key in ("sub", "email", "name", "groups"):
                 if key in claims:
-                    result[key] = claims[key]
+                    # A copy: the caller may mutate what it is handed.
+                    result[key] = copy.deepcopy(claims[key])
         elif self.identity_provider is not None:
             # Issued before the IdP was configured (approve-only consent, read
             # back from persistent storage). Once people sign in, a token that
@@ -388,13 +418,6 @@ class OAuthProvider:
                 logger.warning(
                     "OAuthProvider: identity_provider is configured, so /authorize always "
                     "requires upstream sign-in; %s ignored.", " and ".join(ignored),
-                )
-            if self.public_registration and self.cimd_allowed_clients is None:
-                logger.warning(
-                    "OAuthProvider: identity_provider with public_registration and no "
-                    "cimd_allowed_clients — any third-party app can put your sign-in "
-                    "screen in front of your users. Set cimd_allowed_clients to the "
-                    "connector platforms you use."
                 )
         elif self.allow_unauthenticated_consent:
             logger.warning(
@@ -426,6 +449,12 @@ class OAuthProvider:
                 raise TypeError("cimd_allowed_clients entries must be non-empty strings")
             if "://" in entry and not entry.startswith("https://"):
                 raise ValueError(f"cimd_allowed_clients URL entries must be https; got {entry!r}")
+            if entry.startswith("*.") and entry[2:].lower().rstrip(".") in _SHARED_HOSTING_SUFFIXES:
+                raise ValueError(
+                    f"cimd_allowed_clients entry {entry!r} admits every tenant of a shared hosting "
+                    f"domain — anyone can publish a CIMD document under it. Name the exact host "
+                    f"(e.g. 'myapp.{entry[2:]}') instead."
+                )
             normalized.add(entry)
         return frozenset(normalized)
 

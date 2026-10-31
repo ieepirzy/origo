@@ -670,18 +670,12 @@ async def authorize(request: Request) -> Response:
     except ValueError:
         return JSONResponse({"error": "invalid_request", "error_description": "invalid client_id."}, status_code=400)
 
-    # Checked before the fetch, and for CIMD clients already registered (and
-    # persisted) too: narrowing the allowlist must cut off old registrations,
+    # Checked before the fetch, and against clients already registered (and
+    # persisted) too: narrowing the allowlist must cut off old registrations
+    # — CIMD and DCR alike, whether or not public_registration is still on —
     # not only stop new ones.
-    cimd_allowed_clients: frozenset[str] | None = request.app.state.cimd_allowed_clients
-    if (
-        client_is_https
-        and public_registration
-        and cimd_allowed_clients is not None
-        and client_id not in request.app.state.seeded_client_ids
-        and not _cimd_client_allowed(client_id, cimd_allowed_clients)
-    ):
-        logger.warning("authorize: refused CIMD client %r — not on cimd_allowed_clients.", client_id)
+    if not _dynamic_client_permitted(request.app.state, client_id):
+        logger.warning("authorize: refused client %r — a self-registered client not on cimd_allowed_clients.", client_id)
         return JSONResponse({"error": "unauthorized_client", "error_description": "Client is not allowed."}, status_code=401)
 
     if not storage.client_exists(client_id) and public_registration and client_is_https:
@@ -796,6 +790,22 @@ async def authorize(request: Request) -> Response:
     except ValueError:
         return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
     return RedirectResponse(redirect_url, status_code=302, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+def _dynamic_client_permitted(app_state, client_id: str) -> bool:
+    """With cimd_allowed_clients set, only pre-registered clients and listed
+    CIMD clients may authorize or refresh. Every other self-registered client
+    — a DCR client, an unlisted CIMD document, one persisted before the list
+    existed — is refused: with an IdP behind origo, any such client could
+    otherwise collect codes for whoever has a live IdP session."""
+    allowed: frozenset[str] | None = app_state.cimd_allowed_clients
+    if allowed is None or client_id in app_state.seeded_client_ids:
+        return True
+    try:
+        is_https = urlparse(client_id).scheme == "https"
+    except ValueError:
+        return False
+    return is_https and _cimd_client_allowed(client_id, allowed)
 
 
 def _cimd_client_allowed(client_id: str, allowed: frozenset[str]) -> bool:
@@ -933,6 +943,9 @@ async def authorize_callback(request: Request) -> Response:
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401, headers=_NO_STORE)
 
+    # When origo verified this sign-in. Refresh refuses grants older than the
+    # IdP's max_grant_age, so an offboarded person loses access within it.
+    claims["auth_time"] = int(time.time())
     logger.info("authorize: %r signed in for client %r.", claims["sub"], client_id)
     code = storage.store_code(
         client_id,
@@ -1004,6 +1017,10 @@ async def token(request: Request) -> JSONResponse:
     client_auth_method = storage.get_client_auth_method(client_id)
     if client_auth_method is None:
         return JSONResponse({"error": "invalid_client"}, status_code=401)
+    if not _dynamic_client_permitted(request.app.state, client_id):
+        # Same allowlist as /authorize: a grant held by a client the operator
+        # has since excluded must not be refreshed into new tokens.
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
 
     # Verify client credentials unless the client registered as a public PKCE client.
     if client_auth_method != "none":
@@ -1059,6 +1076,16 @@ async def token(request: Request) -> JSONResponse:
         # to any one refresh token in its rotation chain.
         claims = refresh_entry.get("claims")
 
+        identity_provider: IdentityProvider | None = request.app.state.identity_provider
+        if claims is not None and identity_provider is not None:
+            refusal = _refresh_refusal(identity_provider, claims)
+            if refusal is not None:
+                # The grant is over, not just this request: drop its live
+                # tokens too, so the person's access ends here.
+                logger.info("token: refresh for %r refused: %s", claims.get("sub"), refusal)
+                storage.revoke_family(token_family)
+                return JSONResponse({"error": "invalid_grant", "error_description": "Sign-in required."}, status_code=401)
+
     if claims is None and request.app.state.identity_provider is not None:
         # A grant from before the IdP was configured (persisted across the
         # upgrade). It names no person, so it can't be extended into a world
@@ -1096,6 +1123,29 @@ async def token(request: Request) -> JSONResponse:
         response_body,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
     )
+
+
+def _refresh_refusal(identity_provider: IdentityProvider, claims: dict) -> str | None:
+    """Why a person's grant may no longer be refreshed, or None.
+
+    Refresh never goes back to the IdP, so without these a grant would slide
+    forward forever (every rotation restarts refresh_token_ttl) and outlive
+    the person's account. The grant is bounded by max_grant_age from the
+    sign-in, after which the client sends the person back through /authorize
+    (silent with a live IdP session, refused for a disabled account), and the
+    allow gate is re-applied against the current configuration, so narrowing
+    allowed_groups/allowed_email_domains takes effect at the next refresh.
+    """
+    auth_time = claims.get("auth_time")
+    if not isinstance(auth_time, (int, float)) or time.time() - auth_time > identity_provider.max_grant_age:
+        return "grant is older than max_grant_age"
+    if not str(claims.get("sub", "")).startswith(f"{identity_provider.issuer}|"):
+        return "grant was issued by a different identity provider"
+    try:
+        identity_provider.check_gate(claims, claims)
+    except IdentityError as exc:
+        return str(exc)
+    return None
 
 
 async def userinfo(request: Request) -> JSONResponse:

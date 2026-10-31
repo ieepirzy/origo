@@ -81,6 +81,11 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 # becomes a stream of requests to the IdP.
 _JWKS_REFETCH_INTERVAL = 60
 
+# Cache lifetimes. Keys rotate, and an IdP's endpoints can move; neither is
+# re-read per sign-in, but neither is trusted for the life of the process.
+_JWKS_TTL = 3600
+_DISCOVERY_TTL = 24 * 3600
+
 _USER_AGENT = "origo (+https://github.com/ieepirzy/origo)"
 
 
@@ -187,6 +192,11 @@ class IdentityProvider:
                          ``"client_secret_post"``. Ignored without a secret.
         login_ttl:       Seconds a person has to finish signing in at the IdP.
                          Default 600.
+        max_grant_age:   Seconds a signed-in grant may be refreshed for, counted
+                         from the sign-in. Past it /token refuses the refresh and
+                         the client sends the person back through the IdP —
+                         silently while their IdP session lives, refused once
+                         their account is disabled. Default 12 hours.
         clock_skew:      Leeway in seconds for ``exp``/``iat``. Default 60.
 
     Every configured gate must pass. With neither gate set, anyone the IdP
@@ -205,6 +215,7 @@ class IdentityProvider:
         token_endpoint_auth_method: str = "client_secret_basic",
         login_ttl: int = 600,
         clock_skew: int = 60,
+        max_grant_age: int = 12 * 3600,
     ):
         if not issuer or not client_id:
             raise ValueError("IdentityProvider requires issuer and client_id")
@@ -229,8 +240,10 @@ class IdentityProvider:
         self.token_endpoint_auth_method = token_endpoint_auth_method
         self.login_ttl = login_ttl
         self.clock_skew = clock_skew
+        self.max_grant_age = max_grant_age
 
         self._metadata: Optional[dict] = None
+        self._metadata_fetched_at = 0.0
         self._jwks: Optional[dict] = None
         self._jwks_fetched_at = 0.0
 
@@ -284,9 +297,25 @@ class IdentityProvider:
     # --- Discovery ---
 
     async def metadata(self) -> dict:
-        """The IdP's discovery document, fetched once and cached."""
-        if self._metadata is not None:
+        """The IdP's discovery document, cached for a day.
+
+        A failed refresh keeps serving the cached document (logged) rather
+        than failing sign-ins over a transient outage of the discovery URL.
+        """
+        if self._metadata is not None and time.time() - self._metadata_fetched_at < _DISCOVERY_TTL:
             return self._metadata
+        try:
+            document = await self._fetch_metadata()
+        except IdentityError as exc:
+            if self._metadata is None:
+                raise
+            logger.warning("IdP discovery refresh failed, keeping the cached document: %s", exc)
+            return self._metadata
+        self._metadata = document
+        self._metadata_fetched_at = time.time()
+        return document
+
+    async def _fetch_metadata(self) -> dict:
         # Appended, never urljoin()ed: urljoin would drop the issuer's path
         # (Keycloak's /realms/<realm>) and fetch the host's root document.
         url = self.issuer.rstrip("/") + "/.well-known/openid-configuration"
@@ -306,7 +335,6 @@ class IdentityProvider:
                 _require_secure_url(value, f"IdP {key}")
             except ValueError as exc:
                 raise IdentityError(str(exc), error="server_error") from exc
-        self._metadata = document
         return document
 
     async def authorization_url(self, redirect_uri: str, state: str, nonce: str, code_challenge: str) -> str:
@@ -361,13 +389,21 @@ class IdentityProvider:
     # --- id_token verification ---
 
     async def _signing_key(self, kid: Optional[str], kty: str):
-        """The JWKS key for kid, refetching the JWKS once if the IdP rotated."""
+        """The JWKS key for kid. The JWKS is refetched when it is older than
+        _JWKS_TTL, or when it lacks kid (the IdP rotated) — the latter at most
+        once per _JWKS_REFETCH_INTERVAL."""
         now = time.time()
-        if self._jwks is None or (
-            self._find_jwk(self._jwks, kid, kty) is None and now - self._jwks_fetched_at >= _JWKS_REFETCH_INTERVAL
+        age = now - self._jwks_fetched_at
+        if self._jwks is None or age >= _JWKS_TTL or (
+            self._find_jwk(self._jwks, kid, kty) is None and age >= _JWKS_REFETCH_INTERVAL
         ):
-            self._jwks = await self._fetch((await self.metadata())["jwks_uri"])
-            self._jwks_fetched_at = now
+            try:
+                self._jwks = await self._fetch((await self.metadata())["jwks_uri"])
+                self._jwks_fetched_at = now
+            except IdentityError:
+                if self._jwks is None:
+                    raise
+                logger.warning("IdP JWKS refresh failed, keeping the cached keys.")
         jwk = self._find_jwk(self._jwks, kid, kty)
         if jwk is None:
             raise IdentityError(f"no IdP signing key matches kid {kid!r}")
@@ -456,6 +492,9 @@ class IdentityProvider:
         exp = claims.get("exp")
         if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp + self.clock_skew < now:
             raise IdentityError("id_token is expired or has no exp")
+        nbf = claims.get("nbf")
+        if nbf is not None and (not isinstance(nbf, (int, float)) or nbf - self.clock_skew > now):
+            raise IdentityError("id_token is not valid yet (nbf)")
         iat = claims.get("iat")
         if iat is not None and (not isinstance(iat, (int, float)) or iat - self.clock_skew > now):
             raise IdentityError("id_token iat is in the future")

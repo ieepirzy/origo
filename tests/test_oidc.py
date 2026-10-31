@@ -729,15 +729,73 @@ async def test_cimd_allowlist(fake, http, cimd_documents, allowed, client_id, ok
         assert not provider.storage.client_exists(client_id)
 
 
-async def test_cimd_allowlist_cuts_off_already_registered_clients(fake, http, cimd_documents, tmp_path):
+async def _register_before_the_allowlist(http, path):
+    """Self-register a CIMD and a DCR client on a deployment without the
+    allowlist (approve-only consent, as a pre-0.4 deployment would have)."""
+    before = OAuthProvider(base_url=BASE, public_registration=True, storage_path=path, client_ttl=3600,
+                           auto_approve=True, allow_unauthenticated_consent=True)
+    client = await http(before)
+    assert (await _cimd_authorize(client, "https://evil.example/meta")).status_code == 302
+    dcr = await client.post("/register", json={"redirect_uris": [CLIENT_REDIRECT], "token_endpoint_auth_method": "none"})
+    assert dcr.status_code == 201
+    return dcr.json()["client_id"]
+
+
+@pytest.mark.parametrize("public_registration", [True, False])
+async def test_cimd_allowlist_cuts_off_already_registered_clients(fake, http, cimd_documents, tmp_path, public_registration):
+    path = str(tmp_path / "o.db")
+    dcr_id = await _register_before_the_allowlist(http, path)
+    after = OAuthProvider(base_url=BASE, public_registration=public_registration, storage_path=path, client_ttl=3600,
+                          identity_provider=make_idp(fake), cimd_allowed_clients=["claude.ai"])
+    client = await http(after)
+    for client_id in ("https://evil.example/meta", dcr_id):
+        assert after.storage.client_exists(client_id)
+        assert (await _cimd_authorize(client, client_id)).status_code == 401
+
+
+async def test_cimd_allowlist_refuses_refresh_for_excluded_clients(fake, http, cimd_documents, tmp_path):
     path = str(tmp_path / "o.db")
     before = OAuthProvider(base_url=BASE, public_registration=True, storage_path=path, client_ttl=3600,
-                           identity_provider=make_idp(fake))
-    assert (await _cimd_authorize(await http(before), "https://evil.example/meta")).status_code == 302
-    after = OAuthProvider(base_url=BASE, public_registration=True, storage_path=path, client_ttl=3600,
-                          identity_provider=make_idp(fake), cimd_allowed_clients=["claude.ai"])
-    assert after.storage.client_exists("https://evil.example/meta")
-    assert (await _cimd_authorize(await http(after), "https://evil.example/meta")).status_code == 401
+                           auto_approve=True, allow_unauthenticated_consent=True)
+    client = await http(before)
+    dcr = (await client.post("/register", json={"redirect_uris": [CLIENT_REDIRECT], "token_endpoint_auth_method": "none"})).json()
+    verifier, challenge = make_pkce_pair()
+    resp = await client.get("/authorize", params={
+        "response_type": "code", "client_id": dcr["client_id"], "redirect_uri": CLIENT_REDIRECT,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": "s",
+    })
+    code = client_redirect_params(resp)["code"]
+    tokens = (await client.post("/token", data={
+        "grant_type": "authorization_code", "client_id": dcr["client_id"], "code": code,
+        "code_verifier": verifier, "redirect_uri": CLIENT_REDIRECT,
+    })).json()
+
+    after = OAuthProvider(base_url=BASE, public_registration=False, storage_path=path,
+                          allow_unauthenticated_consent=True, cimd_allowed_clients=["claude.ai"])
+    resp = await (await http(after)).post("/token", data={
+        "grant_type": "refresh_token", "client_id": dcr["client_id"], "refresh_token": tokens["refresh_token"],
+    })
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_client"
+
+
+def test_idp_with_public_registration_requires_the_allowlist(fake):
+    """No consent screen + a silent SSO session = any self-registered client
+    collects codes for the victim. Refused at construction."""
+    with pytest.raises(ValueError, match="cimd_allowed_clients"):
+        OAuthProvider(base_url=BASE, public_registration=True, storage_path=None, identity_provider=make_idp(fake))
+    # Each half alone is fine.
+    OAuthProvider(base_url=BASE, public_registration=True, storage_path=None,
+                  identity_provider=make_idp(fake), cimd_allowed_clients=["claude.ai"])
+    make_provider(fake)
+
+
+@pytest.mark.parametrize("entry", ["*.vercel.app", "*.github.io", "*.GitHub.io."])
+def test_shared_hosting_wildcards_are_refused(entry):
+    with pytest.raises(ValueError, match="shared hosting"):
+        OAuthProvider(base_url=BASE, public_registration=True, storage_path=None, cimd_allowed_clients=[entry])
+    # A named tenant is fine.
+    OAuthProvider(base_url=BASE, public_registration=True, storage_path=None, cimd_allowed_clients=["myapp.vercel.app"])
 
 
 async def test_cimd_allowlist_turns_dcr_off(fake, http):
@@ -752,12 +810,131 @@ async def test_cimd_allowlist_turns_dcr_off(fake, http):
     meta = (await client.get("/.well-known/oauth-authorization-server")).json()
     assert "registration_endpoint" not in meta
 
-    # Without the allowlist DCR stays as it was.
+    # Without the allowlist (and so without an IdP) DCR stays as it was.
     open_provider = OAuthProvider(base_url=BASE, public_registration=True, storage_path=None,
-                                  identity_provider=make_idp(fake))
+                                  allow_unauthenticated_consent=True)
     client = await http(open_provider)
     resp = await client.post("/register", json={"redirect_uris": ["https://app.example/cb"]})
     assert resp.status_code == 201
+
+
+# --- Grant age and gate on refresh (offboarding) ---
+
+async def _refresh(client, refresh_token):
+    return await client.post("/token", data={
+        "grant_type": "refresh_token", "client_id": "test-client", "client_secret": "test-secret",
+        "refresh_token": refresh_token,
+    })
+
+
+async def test_refresh_refused_past_max_grant_age(fake, http, monkeypatch):
+    provider = make_provider(fake, idp_kwargs={"max_grant_age": 3600})
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake)
+    resp = await _refresh(client, tokens["refresh_token"])
+    assert resp.status_code == 200
+    tokens = resp.json()
+
+    real_time = time.time
+    monkeypatch.setattr("origo.endpoints.time.time", lambda: real_time() + 3601)
+    resp = await _refresh(client, tokens["refresh_token"])
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "invalid_grant"
+    # The refused grant's live access token is revoked with it.
+    monkeypatch.setattr("origo.endpoints.time.time", real_time)
+    assert provider.verify_token(tokens["access_token"]) is None
+
+
+async def test_refresh_reapplies_the_gate(fake, http):
+    provider = make_provider(fake, idp_kwargs={"allowed_groups": ["/staff"]})
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake)
+    # The operator narrows the gate (or redeploys with a new config).
+    provider.identity_provider.allowed_groups = frozenset({"/admins"})
+    resp = await _refresh(client, tokens["refresh_token"])
+    assert resp.status_code == 401
+    assert provider.verify_token(tokens["access_token"]) is None
+
+
+async def test_refresh_refused_for_another_issuers_grant(fake, http, tmp_path):
+    path = str(tmp_path / "o.db")
+    first = make_provider(fake, storage_path=path)
+    tokens = await full_sign_in(await http(first), fake)
+    other = FakeIdP(issuer="https://idp.example/realms/other")
+    second = make_provider(other, storage_path=path)
+    resp = await _refresh(await http(second), tokens["refresh_token"])
+    assert resp.status_code == 401
+
+
+# --- Cache lifetimes ---
+
+async def test_jwks_refetched_after_ttl_even_for_known_kid(fake, http):
+    provider = make_provider(fake)
+    client = await http(provider)
+    await full_sign_in(client, fake)
+    certs = f"{ISSUER}/protocol/openid-connect/certs"
+    assert fake.requests.count(certs) == 1
+    await full_sign_in(client, fake)
+    assert fake.requests.count(certs) == 1  # cached
+    provider.identity_provider._jwks_fetched_at -= 3601
+    await full_sign_in(client, fake)
+    assert fake.requests.count(certs) == 2
+
+
+async def test_discovery_refetched_after_ttl_and_kept_on_failure(fake, http):
+    provider = make_provider(fake)
+    client = await http(provider)
+    await full_sign_in(client, fake)
+    discovery = f"{ISSUER}/.well-known/openid-configuration"
+    assert fake.requests.count(discovery) == 1
+    provider.identity_provider._metadata_fetched_at -= 24 * 3600 + 1
+    await full_sign_in(client, fake)
+    assert fake.requests.count(discovery) == 2
+
+    # A failed refresh keeps the cached document instead of failing sign-in.
+    provider.identity_provider._metadata_fetched_at -= 24 * 3600 + 1
+    real_fetch = fake.fetch_json
+
+    def flaky(url, form=None, headers=None):
+        if url == discovery:
+            raise IdentityError("down", error="server_error")
+        return real_fetch(url, form, headers)
+
+    provider.identity_provider.fetch_json = flaky
+    await full_sign_in(client, fake)
+
+
+async def test_nbf_in_the_future_is_refused(fake, http):
+    fake.claim_overrides = {"nbf": int(time.time()) + 3600}
+    client = await http(make_provider(fake))
+    cb, _ = await sign_in(client, fake)
+    assert_refused(cb)
+
+
+# --- Claims isolation ---
+
+async def test_verify_token_result_cannot_mutate_the_grant(fake, http):
+    provider = make_provider(fake)
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake)
+    meta = provider.verify_token(tokens["access_token"])
+    meta["groups"].append("/admins")
+    assert provider.verify_token(tokens["access_token"])["groups"] == ["/staff"]
+
+
+def test_storage_copies_claims_on_store():
+    from origo import OAuthStorage
+
+    storage = OAuthStorage()
+    claims = {"sub": "s", "groups": ["/staff"]}
+    token = storage.store_token("c", claims=claims)
+    refresh = storage.store_refresh_token("c", claims=claims)
+    code = storage.store_code("c", CLIENT_REDIRECT, "x", claims=claims)
+    claims["groups"].append("/admins")
+    claims["sub"] = "someone-else"
+    assert storage.verify_token(token)["claims"] == {"sub": "s", "groups": ["/staff"]}
+    assert storage.exchange_refresh_token(refresh)["claims"] == {"sub": "s", "groups": ["/staff"]}
+    assert storage.exchange_code(code)["claims"] == {"sub": "s", "groups": ["/staff"]}
 
 
 # --- Config validation ---

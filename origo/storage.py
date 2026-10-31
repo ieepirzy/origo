@@ -1,3 +1,4 @@
+import copy
 import hmac
 import secrets
 import time
@@ -337,7 +338,9 @@ class OAuthStorage:
             "code_challenge_method": code_challenge_method,
             "resource": resource,
             "scope": scope,
-            "claims": claims,
+            # Copied in: a caller's later mutation of its dict must not
+            # rewrite the grant (SQLite gets this for free by serializing).
+            "claims": copy.deepcopy(claims),
             "expires_at": expires_at,  # codes expire in 60 seconds
         }
         self._codes_expiry.append((code, expires_at))
@@ -373,7 +376,7 @@ class OAuthStorage:
             "scope": scope,
             "expires_at": expires_at,
             "family": family,
-            "claims": claims,
+            "claims": copy.deepcopy(claims),
         }
         self._tokens_expiry.append((token, expires_at))
         return token
@@ -413,7 +416,7 @@ class OAuthStorage:
             "scope": scope,
             "expires_at": expires_at,
             "family": family or secrets.token_urlsafe(16),
-            "claims": claims,
+            "claims": copy.deepcopy(claims),
         }
         self._refresh_tokens_expiry.append((token, expires_at))
         return token
