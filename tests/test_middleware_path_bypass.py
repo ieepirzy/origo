@@ -64,6 +64,7 @@ def test_public_paths_set_contents():
     assert _PUBLIC_PATHS == {
         "/register",
         "/authorize",
+        "/authorize/callback",
         "/token",
         "/.well-known/oauth-authorization-server",
         "/.well-known/openid-configuration",

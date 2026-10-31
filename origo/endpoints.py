@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from .oidc import IdentityError, IdentityProvider, domain_matches, s256_challenge
 from .storage import FamilyRevokedError, OAuthStorage
 
 import base64
@@ -48,6 +49,37 @@ class UserClaims:
     subject: str
     email: str | None
     scope: str
+    name: str | None = None
+    groups: list[str] | None = None
+
+
+def _user_claims(app_state, claims: dict | None, scope: str) -> UserClaims:
+    """The person a token speaks for: the signed-in identity stored with the
+    grant, or — for tokens no person signed in for (approve-only consent) —
+    the static user_subject/user_email configured on the provider."""
+    if claims:
+        return UserClaims(
+            subject=claims["sub"],
+            email=claims.get("email"),
+            scope=scope,
+            name=claims.get("name"),
+            groups=claims.get("groups"),
+        )
+    return UserClaims(subject=app_state.user_subject, email=app_state.user_email, scope=scope)
+
+
+def _add_scoped_claims(target: dict, user_claims: UserClaims) -> None:
+    """Standard OIDC scope -> claim release, shared by id_token and /userinfo."""
+    scopes = user_claims.scope.split()
+    if user_claims.email and "email" in scopes:
+        target["email"] = user_claims.email
+        # Only ever set from an IdP-verified email or the operator's own
+        # user_email; an unverified IdP email never reaches UserClaims.
+        target["email_verified"] = True
+    if user_claims.name and "profile" in scopes:
+        target["name"] = user_claims.name
+    if user_claims.groups is not None and "groups" in scopes:
+        target["groups"] = user_claims.groups
 
 
 def _safe_compare_digest(a: str, b: str) -> bool:
@@ -314,9 +346,7 @@ def _signed_id_token(issuer: str, client_id: str, user_claims: UserClaims, ttl: 
         "iat": now,
         "exp": now + ttl,
     }
-    if user_claims.email and "email" in user_claims.scope.split():
-        claims["email"] = user_claims.email
-        claims["email_verified"] = True
+    _add_scoped_claims(claims, user_claims)
 
     header = {"alg": "RS256", "typ": "JWT", "kid": "origo-1"}
     msg = f"{_base64url_json(header)}.{_base64url_json(claims)}"
@@ -630,6 +660,20 @@ async def authorize(request: Request) -> Response:
     except ValueError:
         return JSONResponse({"error": "invalid_request", "error_description": "invalid client_id."}, status_code=400)
 
+    # Checked before the fetch, and for CIMD clients already registered (and
+    # persisted) too: narrowing the allowlist must cut off old registrations,
+    # not only stop new ones.
+    cimd_allowed_clients: frozenset[str] | None = request.app.state.cimd_allowed_clients
+    if (
+        client_is_https
+        and public_registration
+        and cimd_allowed_clients is not None
+        and client_id not in request.app.state.seeded_client_ids
+        and not _cimd_client_allowed(client_id, cimd_allowed_clients)
+    ):
+        logger.warning("authorize: refused CIMD client %r — not on cimd_allowed_clients.", client_id)
+        return JSONResponse({"error": "unauthorized_client", "error_description": "Client is not allowed."}, status_code=401)
+
     if not storage.client_exists(client_id) and public_registration and client_is_https:
         metadata = await asyncio.to_thread(_fetch_client_metadata_document, client_id, allow_private_hosts=allow_private_cimd)
         if metadata is None:
@@ -689,6 +733,33 @@ async def authorize(request: Request) -> Response:
         )
         return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not allowed."}, status_code=400)
 
+    identity_provider: IdentityProvider | None = request.app.state.identity_provider
+    if identity_provider is not None:
+        # Upstream sign-in replaces the consent page outright. The POST
+        # (consent-form) path must not survive beside it: its CSRF pair is
+        # self-issued, so a script can submit "approved=true" without any
+        # person being involved.
+        if request.method != "GET":
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "Sign in through the identity provider."},
+                status_code=400,
+            )
+        return await _begin_upstream_login(request, identity_provider, params)
+
+    if not request.app.state.allow_unauthenticated_consent:
+        # Fail closed: with no IdP, the consent page would hand a code to
+        # whoever opened this URL. Same refusal for GET and POST, so neither
+        # the page nor a scripted form submission issues anything.
+        logger.warning(
+            "authorize: refused client %r — no identity_provider is configured and "
+            "unauthenticated consent is disabled (ORIGO_ALLOW_UNAUTHENTICATED_CONSENT).",
+            client_id,
+        )
+        return JSONResponse(
+            {"error": "access_denied", "error_description": "Authorization requires sign-in, which this server has not configured."},
+            status_code=403,
+        )
+
     # Show consent page on GET unless auto_approve
     if request.method == "GET" and not auto_approve:
         csrf_token = secrets.token_urlsafe(32)
@@ -715,6 +786,154 @@ async def authorize(request: Request) -> Response:
     except ValueError:
         return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
     return RedirectResponse(redirect_url, status_code=302, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+def _cimd_client_allowed(client_id: str, allowed: frozenset[str]) -> bool:
+    """True if a CIMD client_id URL is on cimd_allowed_clients: an exact URL
+    entry, or a host pattern ("claude.ai", "*.example.com") matching its host."""
+    if client_id in allowed:
+        return True
+    try:
+        host = urlparse(client_id).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(domain_matches(host, entry) for entry in allowed if "://" not in entry)
+
+
+# Binds a pending upstream sign-in to the browser that started it. Without it,
+# an attacker could start a sign-in, sign in at the IdP as themselves, and hand
+# the victim the callback URL — attaching the attacker's identity to the
+# victim's connector (login CSRF). One value per browser, reused across
+# concurrent sign-ins so two tabs don't invalidate each other.
+_LOGIN_COOKIE = "__Host-origo_login"
+_NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
+def _callback_url(app_state) -> str:
+    return f"{app_state.base_url}/authorize/callback"
+
+
+def _redirect_to_client(redirect_uri: str, params: dict) -> Response:
+    try:
+        url = _build_redirect(redirect_uri, params)
+    except ValueError:
+        return JSONResponse({"error": "invalid_request", "error_description": "invalid redirect_uri."}, status_code=400)
+    return RedirectResponse(url, status_code=302, headers=_NO_STORE)
+
+
+async def _begin_upstream_login(request: Request, identity_provider: IdentityProvider, params: dict) -> Response:
+    """Park the validated /authorize request and send the person to the IdP."""
+    storage: OAuthStorage = request.app.state.storage
+    login_state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    code_verifier = secrets.token_urlsafe(64)
+    browser_key = request.cookies.get(_LOGIN_COOKIE) or secrets.token_urlsafe(32)
+
+    try:
+        upstream_url = await identity_provider.authorization_url(
+            _callback_url(request.app.state), login_state, nonce, s256_challenge(code_verifier)
+        )
+    except IdentityError as exc:
+        logger.error("authorize: identity provider unavailable: %s", exc)
+        return _redirect_to_client(params["redirect_uri"], {"error": "temporarily_unavailable", "state": params.get("state", "")})
+
+    storage.store_pending_login(login_state, {
+        # The original request, already validated above; replayed verbatim
+        # into the origo code once the person is back.
+        "client_id": params["client_id"],
+        "redirect_uri": params["redirect_uri"],
+        "code_challenge": params["code_challenge"],
+        "code_challenge_method": params.get("code_challenge_method", "S256"),
+        "state": params.get("state", ""),
+        "resource": params.get("resource"),
+        "scope": params.get("scope", ""),
+        # This sign-in's secrets towards the IdP.
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "browser": hashlib.sha256(browser_key.encode()).hexdigest(),
+    }, ttl=identity_provider.login_ttl)
+
+    response = RedirectResponse(upstream_url, status_code=302, headers=_NO_STORE)
+    # SameSite=Lax still rides along on the IdP's top-level redirect back.
+    response.set_cookie(
+        _LOGIN_COOKIE, browser_key, httponly=True, samesite="lax",
+        max_age=identity_provider.login_ttl, secure=True, path="/",
+    )
+    return response
+
+
+async def authorize_callback(request: Request) -> Response:
+    """The IdP's redirect back: verify the sign-in, then issue the origo code."""
+    identity_provider: IdentityProvider | None = request.app.state.identity_provider
+    if identity_provider is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    storage: OAuthStorage = request.app.state.storage
+
+    if len(request.query_params.multi_items()) != len(request.query_params.keys()):
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+    params = dict(request.query_params)
+
+    login_state = params.get("state")
+    pending = storage.pop_pending_login(login_state) if login_state else None
+    if pending is None:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Unknown or expired sign-in. Start again from the application."},
+            status_code=400,
+            headers=_NO_STORE,
+        )
+
+    # Popped before this check on purpose: a sign-in that arrives in the wrong
+    # browser is spent, not left for a second guess. No redirect either — this
+    # request is not known to come from the person the client is waiting for.
+    browser_key = request.cookies.get(_LOGIN_COOKIE)
+    if not browser_key or not _safe_compare_digest(hashlib.sha256(browser_key.encode()).hexdigest(), pending["browser"]):
+        logger.warning("authorize: sign-in callback for client %r arrived without its browser binding.", pending["client_id"])
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "Sign-in was started in a different browser."},
+            status_code=400,
+            headers=_NO_STORE,
+        )
+
+    redirect_uri = pending["redirect_uri"]
+    client_state = pending["state"]
+    client_id = pending["client_id"]
+
+    if "error" in params:
+        # The person cancelled, or the IdP refused them. Relayed as
+        # access_denied; the IdP's own description stays in our log.
+        logger.info("authorize: identity provider returned %r for client %r: %r",
+                    params.get("error"), client_id, params.get("error_description"))
+        return _redirect_to_client(redirect_uri, {"error": "access_denied", "state": client_state})
+
+    upstream_code = params.get("code")
+    if not upstream_code:
+        return _redirect_to_client(redirect_uri, {"error": "access_denied", "state": client_state})
+
+    try:
+        claims = await identity_provider.complete_login(
+            upstream_code, _callback_url(request.app.state), pending["code_verifier"], pending["nonce"]
+        )
+    except IdentityError as exc:
+        logger.warning("authorize: sign-in for client %r refused: %s", client_id, exc)
+        return _redirect_to_client(redirect_uri, {"error": exc.error, "state": client_state})
+
+    # The client may have expired (client_ttl) while the person was away.
+    if not storage.client_exists(client_id):
+        return JSONResponse({"error": "unauthorized_client"}, status_code=401, headers=_NO_STORE)
+
+    logger.info("authorize: %r signed in for client %r.", claims["sub"], client_id)
+    code = storage.store_code(
+        client_id,
+        redirect_uri,
+        pending["code_challenge"],
+        pending["code_challenge_method"],
+        resource=pending["resource"],
+        scope=pending["scope"],
+        claims=claims,
+    )
+    return _redirect_to_client(redirect_uri, {"code": code, "state": client_state})
 
 
 # --- Token ---
@@ -805,6 +1024,7 @@ async def token(request: Request) -> JSONResponse:
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=401)
 
         scope = code_entry.get("scope", "")
+        claims = code_entry.get("claims")
         # New grant: start a fresh token family. Every token rotated from this
         # grant shares the id, so refresh-token reuse can revoke them together.
         token_family = secrets.token_urlsafe(16)
@@ -825,10 +1045,19 @@ async def token(request: Request) -> JSONResponse:
 
         scope = refresh_entry.get("scope", "")
         token_family = refresh_entry.get("family") or secrets.token_urlsafe(16)
+        # Carried forward unchanged: the identity belongs to the grant, not
+        # to any one refresh token in its rotation chain.
+        claims = refresh_entry.get("claims")
+
+    if claims is None and request.app.state.identity_provider is not None:
+        # A grant from before the IdP was configured (persisted across the
+        # upgrade). It names no person, so it can't be extended into a world
+        # where every token does; the client signs in again.
+        return JSONResponse({"error": "invalid_grant", "error_description": "Sign-in required."}, status_code=401)
 
     try:
-        access_token = storage.store_token(client_id, resource=resource, scope=scope, family=token_family)
-        new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope, family=token_family)
+        access_token = storage.store_token(client_id, resource=resource, scope=scope, family=token_family, claims=claims)
+        new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope, family=token_family, claims=claims)
     except FamilyRevokedError:
         # The family was revoked between our refresh-token exchange and the
         # replacement issuance (a concurrent replay tripped reuse detection).
@@ -844,11 +1073,7 @@ async def token(request: Request) -> JSONResponse:
     if scope:
         response_body["scope"] = scope
     if "openid" in scope.split():
-        user_claims = UserClaims(
-            subject=request.app.state.user_subject,
-            email=request.app.state.user_email,
-            scope=scope,
-        )
+        user_claims = _user_claims(request.app.state, claims, scope)
         response_body["id_token"] = _signed_id_token(
             request.app.state.base_url,
             client_id,
@@ -876,12 +1101,17 @@ async def userinfo(request: Request) -> JSONResponse:
     if meta is None:
         return JSONResponse({"error": "invalid_token"}, status_code=401)
 
-    scope = set(meta.get("scope", "").split())
-    if "openid" not in scope:
+    stored_claims = meta.get("claims")
+    if not stored_claims and request.app.state.identity_provider is not None:
+        # Same rule as OAuthProvider.verify_token: with an IdP, a token that
+        # names no person is not a valid token.
+        return JSONResponse({"error": "invalid_token"}, status_code=401)
+
+    scope = meta.get("scope", "")
+    if "openid" not in scope.split():
         return JSONResponse({"error": "insufficient_scope"}, status_code=403)
 
-    claims = {"sub": request.app.state.user_subject}
-    if request.app.state.user_email and "email" in scope:
-        claims["email"] = request.app.state.user_email
-        claims["email_verified"] = True
+    user_claims = _user_claims(request.app.state, stored_claims, scope)
+    claims = {"sub": user_claims.subject}
+    _add_scoped_claims(claims, user_claims)
     return JSONResponse(claims, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})

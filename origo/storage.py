@@ -94,11 +94,13 @@ class OAuthStorage:
         refresh_token_ttl: int = 30 * 24 * 3600,
         client_ttl: Optional[int] = None,
         max_dynamic_clients: int = 1000,
+        max_pending_logins: int = 10000,
     ):
         self.token_ttl = token_ttl
         self.refresh_token_ttl = refresh_token_ttl
         self.client_ttl = client_ttl
         self.max_dynamic_clients = max_dynamic_clients
+        self.max_pending_logins = max_pending_logins
         self._dynamic_clients_count = 0
         self._clients: dict[str, dict] = {}        # client_id -> {secret, redirect_uris, token_endpoint_auth_method}
         self._codes: dict[str, dict] = {}          # code -> metadata
@@ -109,6 +111,10 @@ class OAuthStorage:
         # OAuth 2.1 refresh-token rotation guidance.
         self._consumed_refresh_tokens: dict[str, dict] = {}  # refresh_token -> {family, retain_until}
         self._revoked_families: dict[str, float] = {}  # family -> retain_until
+        # Upstream (IdP) sign-ins in flight: login state -> {data, expires_at}.
+        # Insertion-ordered, which is also expiry order (one fixed TTL), so the
+        # oldest entry is always first.
+        self._pending_logins: dict[str, dict] = {}
         self._clients_expiry: deque = deque()
         self._codes_expiry: deque = deque()
         self._tokens_expiry: deque = deque()
@@ -316,7 +322,11 @@ class OAuthStorage:
         code_challenge_method: str = "S256",
         resource: Optional[str] = None,
         scope: str = "",
+        claims: Optional[dict] = None,
     ) -> str:
+        """Store an auth code. `claims` is the signed-in person's identity
+        (sub/email/name/groups) from upstream sign-in, or None when no person
+        was identified; it rides along to every token issued from the code."""
         self._cleanup_expired()
         code = secrets.token_urlsafe(32)
         expires_at = _now() + 60
@@ -327,6 +337,7 @@ class OAuthStorage:
             "code_challenge_method": code_challenge_method,
             "resource": resource,
             "scope": scope,
+            "claims": claims,
             "expires_at": expires_at,  # codes expire in 60 seconds
         }
         self._codes_expiry.append((code, expires_at))
@@ -343,7 +354,14 @@ class OAuthStorage:
 
     # --- Tokens ---
 
-    def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
+    def store_token(
+        self,
+        client_id: str,
+        resource: Optional[str] = None,
+        scope: str = "",
+        family: Optional[str] = None,
+        claims: Optional[dict] = None,
+    ) -> str:
         self._cleanup_expired()
         if family is not None and family in self._revoked_families:
             raise FamilyRevokedError(family)
@@ -355,6 +373,7 @@ class OAuthStorage:
             "scope": scope,
             "expires_at": expires_at,
             "family": family,
+            "claims": claims,
         }
         self._tokens_expiry.append((token, expires_at))
         return token
@@ -371,9 +390,18 @@ class OAuthStorage:
 
     # --- Refresh tokens ---
 
-    def store_refresh_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
+    def store_refresh_token(
+        self,
+        client_id: str,
+        resource: Optional[str] = None,
+        scope: str = "",
+        family: Optional[str] = None,
+        claims: Optional[dict] = None,
+    ) -> str:
         """Store a refresh token. `family` groups a token with every token
-        rotated from the same original grant; one is generated when omitted."""
+        rotated from the same original grant; one is generated when omitted.
+        `claims` is copied forward on every rotation, so the person's identity
+        outlives any single refresh token."""
         self._cleanup_expired()
         if family is not None and family in self._revoked_families:
             raise FamilyRevokedError(family)
@@ -385,6 +413,7 @@ class OAuthStorage:
             "scope": scope,
             "expires_at": expires_at,
             "family": family or secrets.token_urlsafe(16),
+            "claims": claims,
         }
         self._refresh_tokens_expiry.append((token, expires_at))
         return token
@@ -429,3 +458,30 @@ class OAuthStorage:
         retain_until = _now() + self.refresh_token_ttl
         self._revoked_families[family] = retain_until
         self._revoked_families_expiry.append((family, retain_until))
+
+    # --- Pending upstream sign-ins ---
+
+    def store_pending_login(self, login_state: str, data: dict, ttl: int) -> None:
+        """Remember an /authorize request while the person signs in at the IdP.
+
+        Entries are created by unauthenticated requests, so they are capped:
+        past max_pending_logins the oldest is evicted rather than new ones
+        refused. Refusing would let a flood lock every real person out for a
+        whole TTL; evicting means a flood must outpace one person's sign-in.
+        """
+        now = _now()
+        while self._pending_logins:
+            oldest = next(iter(self._pending_logins))
+            if self._pending_logins[oldest]["expires_at"] > now:
+                break
+            del self._pending_logins[oldest]
+        while len(self._pending_logins) >= self.max_pending_logins:
+            del self._pending_logins[next(iter(self._pending_logins))]
+        self._pending_logins[login_state] = {"data": data, "expires_at": now + ttl}
+
+    def pop_pending_login(self, login_state: str) -> Optional[dict]:
+        """Return and consume a pending sign-in (single use). None if unknown or expired."""
+        entry = self._pending_logins.pop(login_state, None)
+        if entry is None or _now() > entry["expires_at"]:
+            return None
+        return entry["data"]
