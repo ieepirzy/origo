@@ -23,6 +23,17 @@ def _default_storage_off(monkeypatch):
     monkeypatch.setenv("ORIGO_STORAGE_PATH", "")
 
 
+@pytest.fixture(autouse=True)
+def _unauthenticated_consent_on(monkeypatch):
+    """Since 0.4.0, /authorize fails closed without an identity provider
+    unless approve-only consent is explicitly enabled. Nearly every test in
+    this suite exercises the consent / auto_approve flow itself, so the suite
+    opts in the same way an upgrading deployment does — through the env var.
+    Tests of the fail-closed default and of upstream sign-in (test_oidc.py)
+    delete it again."""
+    monkeypatch.setenv("ORIGO_ALLOW_UNAUTHENTICATED_CONSENT", "true")
+
+
 @pytest.fixture
 def provider_private():
     return OAuthProvider(

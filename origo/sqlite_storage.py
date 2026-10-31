@@ -22,6 +22,12 @@ What is (and is not) written to disk:
   disk**: operator config is their source of truth and re-seeds them on
   every boot, so persisting them would only widen the file's blast
   radius.
+- A signed-in person's identity claims (sub, email, name, groups from
+  upstream IdP sign-in) are stored in plaintext JSON next to their hashed
+  codes/tokens: they are what the resource server reads back, so they
+  cannot be hashed. Treat the file as holding personal data.
+- Pending upstream sign-ins (the IdP PKCE verifier and nonce of a login in
+  flight, for at most the IdP's login_ttl) are stored under a hashed key.
 - The provider's RSA signing key is NOT persisted; it is regenerated per
   process as before. ID tokens are verified at delivery time, so a
   restart only rotates the JWKS.
@@ -62,7 +68,8 @@ CREATE TABLE IF NOT EXISTS codes (
     code_challenge_method TEXT NOT NULL,
     resource TEXT,
     scope TEXT NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    claims TEXT
 );
 CREATE TABLE IF NOT EXISTS tokens (
     token_hash TEXT PRIMARY KEY,
@@ -70,7 +77,8 @@ CREATE TABLE IF NOT EXISTS tokens (
     resource TEXT,
     scope TEXT NOT NULL,
     expires_at REAL NOT NULL,
-    family TEXT
+    family TEXT,
+    claims TEXT
 );
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -78,7 +86,8 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     resource TEXT,
     scope TEXT NOT NULL,
     expires_at REAL NOT NULL,
-    family TEXT NOT NULL
+    family TEXT NOT NULL,
+    claims TEXT
 );
 CREATE TABLE IF NOT EXISTS consumed_refresh_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -89,9 +98,34 @@ CREATE TABLE IF NOT EXISTS revoked_families (
     family TEXT PRIMARY KEY,
     retain_until REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_logins (
+    state_hash TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_tokens_family ON tokens (family);
+CREATE INDEX IF NOT EXISTS idx_pending_logins_expires ON pending_logins (expires_at);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens (family);
 """
+
+
+# Columns added after the first release of a table. CREATE TABLE IF NOT EXISTS
+# never alters an existing table, so a database written by an older origo is
+# brought forward here, on open, before anything reads it. Additive and
+# nullable only: an old row simply has no claims.
+_ADDED_COLUMNS = (
+    ("codes", "claims", "TEXT"),
+    ("tokens", "claims", "TEXT"),
+    ("refresh_tokens", "claims", "TEXT"),
+)
+
+
+def _dump_claims(claims: Optional[dict]) -> Optional[str]:
+    return json.dumps(claims) if claims is not None else None
+
+
+def _load_claims(raw: Optional[str]) -> Optional[dict]:
+    return json.loads(raw) if raw is not None else None
 
 
 def _hash(value: str) -> str:
@@ -111,11 +145,13 @@ class SQLiteOAuthStorage:
         refresh_token_ttl: int = 30 * 24 * 3600,
         client_ttl: Optional[int] = None,
         max_dynamic_clients: int = 1000,
+        max_pending_logins: int = 10000,
     ):
         self.token_ttl = token_ttl
         self.refresh_token_ttl = refresh_token_ttl
         self.client_ttl = client_ttl
         self.max_dynamic_clients = max_dynamic_clients
+        self.max_pending_logins = max_pending_logins
         self._path = path
         # Pre-seeded clients live only in memory; see module docstring.
         self._seeded: dict[str, dict] = {}
@@ -136,6 +172,19 @@ class SQLiteOAuthStorage:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
+            self._migrate_locked()
+
+    def _migrate_locked(self) -> None:
+        for table, column, decl in _ADDED_COLUMNS:
+            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                try:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                except sqlite3.OperationalError as exc:
+                    # A second process opening the same file migrated it
+                    # between our PRAGMA and our ALTER.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
     # --- Clients ---
 
@@ -302,6 +351,7 @@ class SQLiteOAuthStorage:
             self._conn.execute("DELETE FROM refresh_tokens WHERE expires_at <= ?", (now,))
             self._conn.execute("DELETE FROM consumed_refresh_tokens WHERE retain_until <= ?", (now,))
             self._conn.execute("DELETE FROM revoked_families WHERE retain_until <= ?", (now,))
+            self._conn.execute("DELETE FROM pending_logins WHERE expires_at <= ?", (now,))
             if self.client_ttl is not None:
                 self._conn.execute(
                     "DELETE FROM clients WHERE registered_at + ? <= ?", (self.client_ttl, now)
@@ -317,12 +367,17 @@ class SQLiteOAuthStorage:
         code_challenge_method: str = "S256",
         resource: Optional[str] = None,
         scope: str = "",
+        claims: Optional[dict] = None,
     ) -> str:
         code = secrets.token_urlsafe(32)
         with self._lock:
             self._cleanup_expired()
+            # Named columns throughout: a migrated table has its added columns
+            # at the end, a fresh one wherever _SCHEMA declares them.
             self._conn.execute(
-                "INSERT INTO codes VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO codes (code_hash, client_id, redirect_uri, code_challenge, "
+                "code_challenge_method, resource, scope, expires_at, claims) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _hash(code),
                     client_id,
@@ -332,6 +387,7 @@ class SQLiteOAuthStorage:
                     resource,
                     scope,
                     _mem._now() + 60,  # codes expire in 60 seconds
+                    _dump_claims(claims),
                 ),
             )
         return code
@@ -361,12 +417,20 @@ class SQLiteOAuthStorage:
             "code_challenge_method": row["code_challenge_method"],
             "resource": row["resource"],
             "scope": row["scope"],
+            "claims": _load_claims(row["claims"]),
             "expires_at": row["expires_at"],
         }
 
     # --- Tokens ---
 
-    def store_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
+    def store_token(
+        self,
+        client_id: str,
+        resource: Optional[str] = None,
+        scope: str = "",
+        family: Optional[str] = None,
+        claims: Optional[dict] = None,
+    ) -> str:
         token = secrets.token_urlsafe(48)
         with self._lock:
             self._cleanup_expired()
@@ -378,8 +442,9 @@ class SQLiteOAuthStorage:
                 if family is not None and self._family_revoked_locked(family):
                     raise _mem.FamilyRevokedError(family)
                 self._conn.execute(
-                    "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)",
-                    (_hash(token), client_id, resource, scope, _mem._now() + self.token_ttl, family),
+                    "INSERT INTO tokens (token_hash, client_id, resource, scope, expires_at, family, claims) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (_hash(token), client_id, resource, scope, _mem._now() + self.token_ttl, family, _dump_claims(claims)),
                 )
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -407,11 +472,19 @@ class SQLiteOAuthStorage:
             "scope": row["scope"],
             "expires_at": row["expires_at"],
             "family": row["family"],
+            "claims": _load_claims(row["claims"]),
         }
 
     # --- Refresh tokens ---
 
-    def store_refresh_token(self, client_id: str, resource: Optional[str] = None, scope: str = "", family: Optional[str] = None) -> str:
+    def store_refresh_token(
+        self,
+        client_id: str,
+        resource: Optional[str] = None,
+        scope: str = "",
+        family: Optional[str] = None,
+        claims: Optional[dict] = None,
+    ) -> str:
         """Store a refresh token. `family` groups a token with every token
         rotated from the same original grant; one is generated when omitted."""
         token = secrets.token_urlsafe(48)
@@ -422,7 +495,8 @@ class SQLiteOAuthStorage:
                 if family is not None and self._family_revoked_locked(family):
                     raise _mem.FamilyRevokedError(family)
                 self._conn.execute(
-                    "INSERT INTO refresh_tokens VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO refresh_tokens (token_hash, client_id, resource, scope, expires_at, family, claims) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         _hash(token),
                         client_id,
@@ -430,6 +504,7 @@ class SQLiteOAuthStorage:
                         scope,
                         _mem._now() + self.refresh_token_ttl,
                         family or secrets.token_urlsafe(16),
+                        _dump_claims(claims),
                     ),
                 )
                 self._conn.execute("COMMIT")
@@ -479,6 +554,7 @@ class SQLiteOAuthStorage:
             "scope": row["scope"],
             "expires_at": row["expires_at"],
             "family": row["family"],
+            "claims": _load_claims(row["claims"]),
         }
 
     def _family_revoked_locked(self, family: str) -> bool:
@@ -510,6 +586,53 @@ class SQLiteOAuthStorage:
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    # --- Pending upstream sign-ins ---
+
+    def store_pending_login(self, login_state: str, data: dict, ttl: int) -> None:
+        """Remember an /authorize request while the person signs in at the IdP.
+        Capped like OAuthStorage.store_pending_login: past max_pending_logins
+        the oldest entries are evicted. Persisted so the IdP's callback can
+        land on any process sharing this file."""
+        with self._lock:
+            self._cleanup_expired()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO pending_logins (state_hash, data, expires_at) VALUES (?, ?, ?)",
+                    (_hash(login_state), json.dumps(data), _mem._now() + ttl),
+                )
+                count = self._conn.execute("SELECT COUNT(*) FROM pending_logins").fetchone()[0]
+                if count > self.max_pending_logins:
+                    self._conn.execute(
+                        "DELETE FROM pending_logins WHERE state_hash IN "
+                        "(SELECT state_hash FROM pending_logins ORDER BY expires_at ASC LIMIT ?)",
+                        (count - self.max_pending_logins,),
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def pop_pending_login(self, login_state: str) -> Optional[dict]:
+        """Return and consume a pending sign-in (single use). None if unknown or expired."""
+        if not isinstance(login_state, str):
+            return None
+        state_hash = _hash(login_state)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT data, expires_at FROM pending_logins WHERE state_hash = ?", (state_hash,)
+                ).fetchone()
+                self._conn.execute("DELETE FROM pending_logins WHERE state_hash = ?", (state_hash,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        if row is None or _mem._now() > row["expires_at"]:
+            return None
+        return json.loads(row["data"])
 
     def close(self) -> None:
         with self._lock:

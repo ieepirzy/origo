@@ -10,6 +10,8 @@ Drop-in OAuth 2.1 provider, originally developed for use in custom/private MCP s
 
 Works with **FastMCP**, **FastAPI**, the raw **MCP SDK**, and MCP clients on the **OpenAI platform** such as ChatGPT connectors.
 
+> **Upgrading to 0.4.0?** `/authorize` now refuses requests unless people sign in through an identity provider, or you opt back in to the approve-only consent page. Set `ORIGO_ALLOW_UNAUTHENTICATED_CONSENT=true` **before** upgrading to keep today's behaviour. See [Upgrading to 0.4.0](#upgrading-to-040).
+
 ## Install
 
 ```bash
@@ -118,12 +120,84 @@ By default, origo persists state to a local SQLite file, so tokens survive resta
 - You control who gets client credentials
 - Operational simplicity matters more than enterprise auth guarantees
 
-**Use a proper auth server (Keycloak, Auth0, etc.) when:**
+**Put an identity provider in front (see [Per-user sign-in](#per-user-sign-in-upstream-oidc)) when:**
 
-- Multiple users need independent identities
+- Multiple users need independent identities. origo delegates the sign-in to your IdP (Keycloak, Google Workspace, Entra, …) and carries each person's identity in its own tokens.
+
+**Use a proper auth server (Keycloak, Auth0, etc.) as the authorization server itself when:**
+
 - You need instant token revocation
 - You're sharing one auth service across many servers (ex. MCP servers)
 - Compliance requirements mandate it
+
+## Per-user sign-in (upstream OIDC)
+
+By default nobody signs in on origo's consent page: it is an approve/deny button, so whoever opens the authorize URL can approve, and every token carries the same static `sub`. To tell people apart, configure an upstream OpenID Connect provider. `/authorize` then always sends the person to the IdP's own sign-in page (email, password, MFA — origo never sees a password) and issues a code only after verifying the IdP's answer:
+
+```python
+from origo import IdentityProvider, OAuthProvider
+
+auth = OAuthProvider(
+    base_url="https://mcp.example.com",
+    public_registration=True,                      # e.g. claude.ai connectors via CIMD
+    cimd_allowed_clients=["claude.ai"],             # which connector platforms may start a sign-in
+    token_ttl=900,                                  # short: see "Disabled users" below
+    identity_provider=IdentityProvider(
+        issuer="https://auth.example.com/realms/staff",
+        client_id=os.environ["OIDC_CLIENT_ID"],
+        client_secret=os.environ["OIDC_CLIENT_SECRET"],
+        allowed_email_domains=["example.com"],     # optional gate
+        allowed_groups=["/mcp-users"],              # optional gate
+    ),
+)
+```
+
+The flow, per authorization:
+
+1. The client identifies itself as before (pre-registered, DCR, or CIMD) and its `redirect_uri` is checked. With an IdP, `public_registration=True` **requires** `cimd_allowed_clients` (origo refuses to start without it): there is no consent screen, and a person with a live IdP session is signed in without a click, so any self-registered client could otherwise collect codes carrying their identity. The allowlist limits self-registered clients to the listed CIMD documents, turns DCR off, and refuses every other self-registered client, including ones persisted before the list existed. Never list a wildcard on a shared hosting domain (`*.vercel.app`, `*.github.io`, …): anyone can publish a CIMD document there. origo refuses the common ones and any wildcard over a single label (`*.app`), but the list is not exhaustive. With an IdP and `public_registration=False`, only pre-registered clients may authorize or refresh: self-registered clients left over from an earlier public deployment are refused.
+2. origo parks the request and redirects to the IdP's authorization endpoint (found by discovery at `<issuer>/.well-known/openid-configuration`) using the code flow with PKCE, `state` and `nonce`. A `__Host-origo_login` cookie binds the sign-in to the browser that started it.
+3. The IdP redirects back to **`{base_url}/authorize/callback`**. origo exchanges the code and verifies the `id_token`: signature against the IdP's JWKS (asymmetric algorithms only; `none` and HMAC are refused), `iss`, `aud`/`azp`, `exp` and `nonce`.
+4. The allow gate runs: every configured gate must pass. `allowed_email_domains` matches the **verified** email's domain exactly (no subdomains); `allowed_groups` needs at least one exact match in the `groups_claim` claim (default `groups`; a dotted path such as `realm_access.roles` reaches nested claims). A refused or failed sign-in returns `error=access_denied` to the client and issues no code.
+5. origo issues its own code, and from it its own tokens, carrying the person's claims.
+
+**Claims.** `sub` is `<issuer>|<idp sub>`, so two IdPs or realms can never collide. `email` is included only when the IdP asserts `email_verified: true`. `name` and `groups` are included when present. The claims are stored with the grant, so they survive refresh-token rotation without another trip to the IdP. They surface in three places:
+
+- `provider.verify_token(token)` returns `sub`, `email`, `name`, `groups` alongside `client_id`, `scope`, `resource` and `expires_at`, so a resource server can attribute a request to both the person and the client. The FastMCP adapter passes the same dict through as `AccessToken.claims`.
+- `/userinfo` returns `sub`, plus `email` (`email` scope), `name` (`profile` scope) and `groups` (`groups` scope).
+- The `id_token` from `/token` (for `openid` requests) carries the same claims under the same scope rules.
+
+With an IdP configured, `auto_approve` and the consent page are never used, `POST /authorize` is refused, and tokens that name no person (for example ones persisted from before the IdP was configured) stop validating: those clients sign in again.
+
+**Keycloak setup** (the first deployment target; any OIDC provider works the same way):
+
+- Create a confidential OpenID Connect client with *Standard flow* on. Set its *Valid redirect URI* to exactly `https://<your origo base_url>/authorize/callback`.
+- `issuer` is `https://<keycloak host>/realms/<realm>` (no trailing slash).
+- For `allowed_groups`, add a *Group Membership* mapper to the client (or a client scope it uses) with *Add to ID token* on. With *Full group path* on, groups appear as `/name`; match them exactly as emitted.
+- Users created by an admin need *Email verified* set, or the email claim is dropped and the domain gate refuses them.
+
+**Disabled users.** Refresh does not go back to the IdP, so two bounds stand in for it. A signed-in grant can be refreshed only until `max_grant_age` (an `IdentityProvider` argument, default 12 hours) after the sign-in; then `/token` refuses and the client sends the person back through `/authorize`, which with a live IdP session is usually silent and for a disabled account is refused. And every refresh re-applies the allow gate against the current configuration, so removing a group from `allowed_groups` (or a domain from `allowed_email_domains`) takes effect at the next refresh. A refused refresh also revokes the grant's live tokens. Within those bounds, a disabled person keeps access until their access token expires, so keep `token_ttl` short. Checking the account at the IdP on refresh (its refresh token or back-channel logout) is planned.
+
+**Several origo instances, one IdP.** Each origo deployment registers its own callback URL at the IdP (one client per deployment, or one client listing every callback). Pending sign-ins live in origo's storage, so processes that share one SQLite file can take each other's callbacks; separate deployments with separate storage each hold their own grants.
+
+## Approve-only consent (no identity provider)
+
+Without an `identity_provider`, `/authorize` **fails closed**: it answers `403 access_denied` and issues nothing, because the consent page would authenticate nobody. To keep the approve-only page (single-operator deployments, local development), opt in explicitly:
+
+- **`ORIGO_ALLOW_UNAUTHENTICATED_CONSENT=true`** (env var), or
+- **`allow_unauthenticated_consent=True`** in code. An explicit `False` overrides the env var.
+
+origo logs a warning at startup when this is on. `auto_approve=True` is honoured only under this opt-in.
+
+## Upgrading to 0.4.0
+
+0.4.0 is a breaking release ([#130](https://github.com/ieepirzy/origo/issues/130)):
+
+- **`/authorize` fails closed without an identity provider.** Deployments that rely on the consent page or `auto_approve=True` must set `ORIGO_ALLOW_UNAUTHENTICATED_CONSENT=true` (or pass `allow_unauthenticated_consent=True`) **before upgrading**, or every new authorization is refused. Existing access and refresh tokens keep working either way.
+- **`verify_token` no longer reports a person for approve-only tokens.** It gains `sub`/`email`/`name`/`groups` only for tokens issued after upstream sign-in. `/userinfo` and the `id_token` still return the static `user_subject`/`user_email` for approve-only tokens.
+- **SQLite storage is migrated automatically** on first open (new nullable `claims` columns and a `pending_logins` table). Downgrading to 0.3.x after tokens with claims were issued is not supported.
+- **Stop every 0.3.x process before starting 0.4.0 on a shared SQLite file.** 0.3.x writes rows positionally, so once 0.4.0 has migrated the file, an old process still running against it fails its writes. No rolling upgrade across the two versions.
+
+New: `identity_provider` (upstream OIDC sign-in), `cimd_allowed_clients`, the `/authorize/callback` route (public, like `/authorize`). Test suites that drive the consent flow should set `ORIGO_ALLOW_UNAUTHENTICATED_CONSENT=true` in their setup, next to `ORIGO_STORAGE_PATH=""`.
 
 ## Two Modes
 
@@ -238,7 +312,10 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | `clients` | `dict` | `None` | Pre-registered `{client_id: client_secret}` |
 | `client_redirect_uris` | `dict` | `None` | Optional redirect URI allowlist for pre-registered clients (exact-match, fail-closed). A confidential client may map to `ANY_REDIRECT_URI` instead of a list — see [Redirect URIs for pre-registered clients](#redirect-uris-for-pre-registered-clients) |
 | `public_registration` | `bool` | `False` | Allow dynamic client registration |
-| `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients |
+| `auto_approve` | `bool` | `False` | Skip consent page, auto-approve all valid clients. Only honoured with `allow_unauthenticated_consent`; ignored with an `identity_provider` |
+| `identity_provider` | `IdentityProvider` | `None` | Upstream OIDC sign-in for every authorization — see [Per-user sign-in](#per-user-sign-in-upstream-oidc) |
+| `allow_unauthenticated_consent` | `bool` | `None` (reads `$ORIGO_ALLOW_UNAUTHENTICATED_CONSENT`) | Without an IdP, allow the approve-only consent page instead of failing closed — see [Approve-only consent](#approve-only-consent-no-identity-provider) |
+| `cimd_allowed_clients` | `list[str]` | `None` (any) | CIMD clients allowed to authorize: exact `client_id` URLs and/or host patterns (`"claude.ai"`, `"*.example.com"`; never a shared-hosting wildcard like `*.vercel.app`). When set, DCR (`/register`) is disabled and every other self-registered client, including already-persisted ones, is refused. Required with `identity_provider` + `public_registration=True` |
 | `token_ttl` | `int` | `3600` | Access token lifetime in seconds |
 | `refresh_token_ttl` | `int` | `2592000` (30 days) | Refresh token lifetime in seconds. Refresh tokens are single-use and rotated on every `/token` request; replaying a used one revokes the whole token family |
 | `storage_path` | `str` | auto (`./.origo/<hash>.db`, or `$ORIGO_STORAGE_PATH`) | Path to a SQLite file for persistent storage (see [Token persistence](#token-persistence)). Pass `None` explicitly to force in-memory storage |
@@ -259,8 +336,9 @@ If you run multiple workers/processes against the same file, SQLite's WAL mode p
 | `GET /.well-known/openid-configuration` | OpenID Connect discovery |
 | `GET /.well-known/oauth-protected-resource` | Resource metadata |
 | `POST /register` | Dynamic client registration (public mode only) |
-| `GET /authorize` | Show consent page (or redirect immediately if `auto_approve=True`) |
-| `POST /authorize` | Submit consent form |
+| `GET /authorize` | Redirect to the identity provider's sign-in; without one, show the consent page (or redirect immediately if `auto_approve=True`) when approve-only consent is allowed |
+| `POST /authorize` | Submit consent form (approve-only consent only) |
+| `GET /authorize/callback` | Identity provider's redirect back after sign-in |
 | `POST /token` | Token exchange |
 | `GET/POST /userinfo` | Lightweight OIDC userinfo endpoint for `openid` tokens |
 

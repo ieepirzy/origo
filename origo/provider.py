@@ -1,5 +1,7 @@
+import copy
 import functools
 import hashlib
+import logging
 import os
 import sqlite3
 import warnings
@@ -11,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from .endpoints import (
     authorize,
+    authorize_callback,
     jwks,
     oauth_metadata,
     protected_resource_metadata,
@@ -19,6 +22,7 @@ from .endpoints import (
     userinfo,
 )
 from .middleware import OAuthMiddleware
+from .oidc import IdentityProvider
 from .sqlite_storage import SQLiteOAuthStorage
 from .storage import OAuthStorage
 
@@ -27,6 +31,28 @@ from .storage import OAuthStorage
 # storage_path=None (always in-memory). A plain default of None could not
 # make that distinction.
 _AUTO_STORAGE_PATH = object()
+
+logger = logging.getLogger("origo")
+
+# Operational switch for the approve-only consent page; see
+# allow_unauthenticated_consent in OAuthProvider's docstring.
+CONSENT_ENV_VAR = "ORIGO_ALLOW_UNAUTHENTICATED_CONSENT"
+
+
+# Domains where anyone can get a subdomain. A "*.<one of these>" CIMD pattern
+# admits every tenant, i.e. anyone, so it is refused. Not exhaustive (the
+# Public Suffix List is the full story); the README says so.
+_SHARED_HOSTING_SUFFIXES = frozenset({
+    "vercel.app", "github.io", "netlify.app", "pages.dev", "workers.dev",
+    "herokuapp.com", "azurewebsites.net", "cloudfront.net", "appspot.com",
+    "web.app", "firebaseapp.com", "onrender.com", "fly.dev", "glitch.me",
+    "ngrok.io", "ngrok-free.app", "trycloudflare.com", "repl.co",
+    "amplifyapp.com", "gitlab.io", "deno.dev", "railway.app", "up.railway.app",
+})
+
+
+def _env_allows_unauthenticated_consent() -> bool:
+    return os.environ.get(CONSENT_ENV_VAR, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _default_storage_dir() -> Optional[str]:
@@ -73,8 +99,16 @@ class OAuthProvider:
         public_registration: Allow dynamic client registration (DCR).
                              Default False.
         auto_approve:        Skip consent page, approve all valid clients.
-                             Default False.
+                             Default False. Honoured only when unauthenticated
+                             consent is allowed (see allow_unauthenticated_consent);
+                             ignored with an identity_provider.
         token_ttl:           Access token lifetime in seconds. Default 3600.
+                             With an identity_provider, keep this short: refresh
+                             does not ask the IdP again, so a person disabled at
+                             the IdP keeps their current access token until it
+                             expires, and can refresh until the identity
+                             provider's max_grant_age (counted from sign-in) runs
+                             out or they fail its allow gate.
         refresh_token_ttl:   Refresh token lifetime in seconds. Default 30 days.
                              Refresh tokens are single-use and rotated on every
                              /token request (a new one is issued each time).
@@ -116,6 +150,28 @@ class OAuthProvider:
                              app clients. Off by default — an unconfigured scheme could
                              be claimed by another app on the same device, so schemes
                              must be declared explicitly by the operator.
+        public_paths:        Application paths that skip token validation (exact
+                             match; never the MCP endpoint).
+        identity_provider:   An origo.IdentityProvider (upstream OIDC). When set,
+                             /authorize always sends the person to sign in at the
+                             IdP — the consent page and auto_approve are never used
+                             — and tokens carry that person's sub/email/name/groups.
+        allow_unauthenticated_consent: Without an identity_provider, /authorize
+                             refuses (fails closed) unless this is enabled: the
+                             approve/deny page authenticates nobody, so whoever
+                             opens the authorize URL can approve. None (default)
+                             reads the ORIGO_ALLOW_UNAUTHENTICATED_CONSENT env var
+                             ("true" enables it); True/False override the env var.
+                             When enabled, origo logs a warning at startup.
+        cimd_allowed_clients: Optional allowlist for CIMD (URL client_id) clients:
+                             exact client_id URLs ("https://claude.ai/oauth/...")
+                             and/or host patterns ("claude.ai", "*.example.com").
+                             None (default) accepts any CIMD client when
+                             public_registration is on. When set, dynamic client
+                             registration (/register) is turned off as well — it
+                             would otherwise mint unlisted clients at will — and
+                             already-registered CIMD clients not on the list are
+                             refused. Pre-registered clients are unaffected.
     """
 
     def __init__(
@@ -140,6 +196,9 @@ class OAuthProvider:
         # silently rebind existing callers' positional arguments.
         storage_path: Optional[str] = _AUTO_STORAGE_PATH,
         public_paths: Optional[Iterable[str]] = None,
+        identity_provider: Optional[IdentityProvider] = None,
+        allow_unauthenticated_consent: Optional[bool] = None,
+        cimd_allowed_clients: Optional[Iterable[str]] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -150,6 +209,30 @@ class OAuthProvider:
         self.user_email = user_email
         self.user_subject = user_subject or user_email or "origo-user"
         self.allow_private_cimd = allow_private_cimd
+        if identity_provider is not None and not isinstance(identity_provider, IdentityProvider):
+            raise TypeError("identity_provider must be an origo.IdentityProvider")
+        self.identity_provider = identity_provider
+        self.allow_unauthenticated_consent = (
+            _env_allows_unauthenticated_consent()
+            if allow_unauthenticated_consent is None
+            else bool(allow_unauthenticated_consent)
+        )
+        self.cimd_allowed_clients = self._normalize_cimd_allowed_clients(cimd_allowed_clients)
+        if identity_provider is not None and public_registration and self.cimd_allowed_clients is None:
+            # Refused, not warned: there is no consent screen behind an IdP,
+            # and an IdP with a live SSO session signs the person in without
+            # a click. Any self-registered client — DCR, or a CIMD document
+            # the attacker hosts — could then send a victim an /authorize
+            # link and collect a code carrying the victim's identity.
+            raise ValueError(
+                "OAuthProvider: identity_provider with public_registration=True requires "
+                "cimd_allowed_clients — otherwise any self-registered client can collect "
+                "codes for whoever has a live session at your IdP, without a click. List "
+                "the connector platforms you use (e.g. ['claude.ai']), or pre-register "
+                "clients with clients= and turn public_registration off."
+            )
+        self._seeded_client_ids = frozenset(clients or {})
+        self._log_authorization_mode()
 
         self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -248,6 +331,7 @@ class OAuthProvider:
             Route("/.well-known/jwks.json", jwks, methods=["GET"]),
             Route("/register", register, methods=["POST"]),
             Route("/authorize", authorize, methods=["GET", "POST"]),
+            Route("/authorize/callback", authorize_callback, methods=["GET"]),
             Route("/token", token, methods=["POST"]),
             Route("/userinfo", userinfo, methods=["GET", "POST"]),
         ]
@@ -285,6 +369,10 @@ class OAuthProvider:
         app.state.allow_private_cimd = self.allow_private_cimd
         app.state.custom_redirect_uri_schemes = self.custom_redirect_uri_schemes
         app.state.private_key = self.private_key
+        app.state.identity_provider = self.identity_provider
+        app.state.allow_unauthenticated_consent = self.allow_unauthenticated_consent
+        app.state.cimd_allowed_clients = self.cimd_allowed_clients
+        app.state.seeded_client_ids = self._seeded_client_ids
         return app
 
     def asgi_app(self) -> Starlette:
@@ -292,13 +380,88 @@ class OAuthProvider:
         return self._app
 
     def verify_token(self, token: str, resource: Optional[str] = None) -> Optional[dict]:
-        """Verify a bearer token. Returns metadata dict or None."""
+        """Verify a bearer token. Returns metadata dict or None.
+
+        The dict carries client_id, scope, resource and expires_at, and — for a
+        token issued after upstream sign-in — the person: sub
+        ("<issuer>|<idp sub>"), plus email, name and groups when the IdP
+        provided them. A token no person signed in for has no sub: the static
+        user_subject identifies nobody and is never reported as a person here.
+        """
         meta = self.storage.verify_token(token)
         if meta is None:
             return None
         if resource is not None and meta.get("resource") not in (None, resource):
             return None
-        return meta
+        result = {k: v for k, v in meta.items() if k != "claims"}
+        claims = meta.get("claims")
+        if claims:
+            for key in ("sub", "email", "name", "groups"):
+                if key in claims:
+                    # A copy: the caller may mutate what it is handed.
+                    result[key] = copy.deepcopy(claims[key])
+        elif self.identity_provider is not None:
+            # Issued before the IdP was configured (approve-only consent, read
+            # back from persistent storage). Once people sign in, a token that
+            # names no person must not keep working beside theirs.
+            return None
+        return result
+
+    def _log_authorization_mode(self) -> None:
+        """Say once, at startup, how /authorize will decide who gets a code."""
+        if self.identity_provider is not None:
+            ignored = [name for name, on in (
+                ("auto_approve", self.auto_approve),
+                ("allow_unauthenticated_consent", self.allow_unauthenticated_consent),
+            ) if on]
+            if ignored:
+                logger.warning(
+                    "OAuthProvider: identity_provider is configured, so /authorize always "
+                    "requires upstream sign-in; %s ignored.", " and ".join(ignored),
+                )
+        elif self.allow_unauthenticated_consent:
+            logger.warning(
+                "OAuthProvider: unauthenticated consent is enabled (%s / "
+                "allow_unauthenticated_consent) — the approve page authenticates "
+                "nobody: whoever opens the authorize URL can approve%s. Configure "
+                "identity_provider to sign people in instead.",
+                CONSENT_ENV_VAR,
+                ", and auto_approve skips even that" if self.auto_approve else "",
+            )
+        else:
+            logger.warning(
+                "OAuthProvider: no identity_provider and unauthenticated consent is "
+                "disabled — /authorize will refuse every request (fail closed). Set "
+                "%s=true (or allow_unauthenticated_consent=True) to keep the "
+                "approve-only consent page, or configure identity_provider.",
+                CONSENT_ENV_VAR,
+            )
+
+    @staticmethod
+    def _normalize_cimd_allowed_clients(entries: Optional[Iterable[str]]) -> Optional[frozenset[str]]:
+        if entries is None:
+            return None
+        if isinstance(entries, str):
+            raise TypeError("cimd_allowed_clients must be a list of strings, not a single string")
+        normalized = set()
+        for entry in entries:
+            if not isinstance(entry, str) or not entry:
+                raise TypeError("cimd_allowed_clients entries must be non-empty strings")
+            if "://" in entry and not entry.startswith("https://"):
+                raise ValueError(f"cimd_allowed_clients URL entries must be https; got {entry!r}")
+            if entry.startswith("*.") and len([label for label in entry[2:].rstrip(".").split(".") if label]) < 2:
+                raise ValueError(
+                    f"cimd_allowed_clients entry {entry!r} is a wildcard over a top-level domain; "
+                    f"name a registrable domain (e.g. '*.example.com') or an exact host."
+                )
+            if entry.startswith("*.") and entry[2:].lower().rstrip(".") in _SHARED_HOSTING_SUFFIXES:
+                raise ValueError(
+                    f"cimd_allowed_clients entry {entry!r} admits every tenant of a shared hosting "
+                    f"domain — anyone can publish a CIMD document under it. Name the exact host "
+                    f"(e.g. 'myapp.{entry[2:]}') instead."
+                )
+            normalized.add(entry)
+        return frozenset(normalized)
 
     def _normalize_public_paths(self, public_paths: Optional[Iterable[str]]) -> frozenset[str]:
         """Validate application-declared paths that skip token validation.

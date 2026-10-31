@@ -26,6 +26,10 @@ def _is_client_disconnect(exc: BaseException) -> bool:
 _PUBLIC_PATHS = {
     "/register",
     "/authorize",
+    # The IdP's redirect back after upstream sign-in. Public by necessity —
+    # the browser arriving here carries no bearer token — and authenticated
+    # by the pending-login state, its browser cookie and the IdP's id_token.
+    "/authorize/callback",
     "/token",
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
