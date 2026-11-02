@@ -1344,8 +1344,11 @@ def test_fetch_client_metadata_document_allow_private_hosts_skips_host_check(mon
         def __exit__(self, *exc):
             return False
 
+    sent = []
+
     class _FakeOpener:
         def open(self, request, timeout):
+            sent.append(request)
             return _FakeResponse()
 
     monkeypatch.setattr(endpoints.urllib.request, "build_opener", lambda *a: _FakeOpener())
@@ -1357,6 +1360,10 @@ def test_fetch_client_metadata_document_allow_private_hosts_skips_host_check(mon
     metadata = endpoints._fetch_client_metadata_document("https://10.0.0.5/cimd.json", allow_private_hosts=True)
     assert metadata is not None
     assert metadata["client_id"] == "https://10.0.0.5/cimd.json"
+    # A named User-Agent: Cloudflare answers 403 to urllib's default one,
+    # which failed every claude.ai sign-in (its CIMD sits behind Cloudflare).
+    [request] = sent
+    assert request.get_header("User-agent", "").startswith("origo ")
 
 
 @pytest.mark.asyncio

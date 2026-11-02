@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from .oidc import IdentityError, IdentityProvider, domain_matches, s256_challenge
+from .oidc import _USER_AGENT, IdentityError, IdentityProvider, domain_matches, s256_challenge
 from .storage import FamilyRevokedError, OAuthStorage
 
 import base64
@@ -257,7 +257,9 @@ def _fetch_client_metadata_document(client_id: str, allow_private_hosts: bool = 
     try:
         request = urllib.request.Request(
             client_id,
-            headers={"Accept": "application/json"},
+            # urllib's default "Python-urllib/x.y" gets a 403 from Cloudflare's
+            # bot rules, in front of claude.ai's own metadata document among others.
+            headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
             method="GET",
         )
         with opener.open(request, timeout=5) as response:
