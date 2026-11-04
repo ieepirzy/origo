@@ -19,6 +19,14 @@ Those claims are stored with the grant (code -> access token -> every rotated
 refresh token), so they survive refresh-token rotation without another trip to
 the IdP.
 
+With ``recheck_on_refresh`` on, origo also keeps the IdP's own refresh token
+for the grant, sealed with AES-GCM under an operator key (see
+:class:`TokenSealer`), and every origo refresh first refreshes at the IdP. The
+person's access then ends server-side, within one origo access-token lifetime,
+as soon as the IdP refuses: account disabled, session logged out or revoked,
+SSO session idle or max reached, or no longer in an allowed group. Nothing
+depends on what the client holds.
+
 The id_token is verified with ``cryptography`` (already a dependency for
 origo's own signing) rather than a JWT library: signature against the IdP's
 JWKS, ``iss``, ``aud``/``azp``, ``exp`` and ``nonce``. Only asymmetric
@@ -37,6 +45,7 @@ import hmac
 import http.client
 import json
 import logging
+import os
 import time
 import urllib.error
 import urllib.request
@@ -45,10 +54,11 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import asyncio
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 logger = logging.getLogger("origo")
@@ -101,15 +111,109 @@ class IdentityError(Exception):
     ``access_denied`` when the person or their token was refused, and
     ``server_error`` when the IdP could not be reached or misbehaved.
     The message is for origo's log only, never sent to the client.
+
+    ``status`` and ``oauth_error`` are set when the IdP answered an HTTP error:
+    its status code and, if its body was an OAuth error object, the ``error``
+    code in it (``invalid_grant`` and so on).
     """
 
-    def __init__(self, message: str, error: str = "access_denied"):
+    def __init__(self, message: str, error: str = "access_denied", status: Optional[int] = None,
+                 oauth_error: Optional[str] = None):
         super().__init__(message)
         self.error = error
+        self.status = status
+        self.oauth_error = oauth_error
 
 
 class IdentityRefused(IdentityError):
-    """A verified identity that failed the allow gate (domain or group)."""
+    """A verified identity that failed the allow gate (domain or group), or,
+    on a refresh re-check, a grant the IdP no longer honours."""
+
+
+# --- Sealing the IdP's refresh token at rest ---
+
+_SEAL_VERSION = "v1"
+_SEAL_CONTEXT = b"origo-idp-refresh-token\0"
+
+
+def _load_key(raw: bytes, what: str) -> bytes:
+    """A 32-byte AES-256 key: the raw bytes, or their base64 / base64url /
+    hex encoding (surrounding whitespace ignored)."""
+    if len(raw) == 32:
+        return raw
+    text = raw.strip()
+    for decode in (
+        lambda t: bytes.fromhex(t.decode("ascii")),
+        lambda t: base64.b64decode(t + b"=" * (-len(t) % 4), validate=True),
+        lambda t: base64.urlsafe_b64decode(t + b"=" * (-len(t) % 4)),
+    ):
+        try:
+            key = decode(text)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if len(key) == 32:
+            return key
+    raise ValueError(f"{what} is not a 32-byte key (raw, hex, base64 or base64url)")
+
+
+class TokenSealer:
+    """AES-256-GCM sealing of the IdP refresh tokens origo keeps.
+
+    The first key seals; every key opens, so a key can be rotated without
+    signing anyone out: add the new key in front, keep the old one behind it
+    until every grant has refreshed once (each refresh re-seals under the
+    first key), then drop it. A sealed value names its key by an 8-hex-digit
+    fingerprint (a prefix of the key's SHA-256), never the key itself.
+
+    ``associated`` binds a sealed value to where it is stored (the grant's
+    token family, or the auth code it waits under), so a value copied to
+    another grant's row does not open.
+    """
+
+    def __init__(self, keys: Iterable[bytes]):
+        self._keys: list[tuple[str, AESGCM]] = []
+        for key in keys:
+            if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+                raise ValueError("token keys must be 32 bytes each (AES-256)")
+            kid = hashlib.sha256(bytes(key)).hexdigest()[:8]
+            if any(k == kid for k, _ in self._keys):
+                raise ValueError("the same token key is configured twice")
+            self._keys.append((kid, AESGCM(bytes(key))))
+        if not self._keys:
+            raise ValueError("TokenSealer needs at least one key")
+
+    @classmethod
+    def from_files(cls, paths: Iterable[str]) -> "TokenSealer":
+        keys = []
+        for path in paths:
+            with open(path, "rb") as f:
+                keys.append(_load_key(f.read(), f"token key file {path!r}"))
+        return cls(keys)
+
+    def seal(self, value: str, associated: str) -> str:
+        kid, aead = self._keys[0]
+        nonce = os.urandom(12)
+        ciphertext = aead.encrypt(nonce, value.encode("utf-8"), _SEAL_CONTEXT + associated.encode("utf-8"))
+        return f"{_SEAL_VERSION}.{kid}.{base64.urlsafe_b64encode(nonce + ciphertext).decode().rstrip('=')}"
+
+    def open(self, sealed: str, associated: str) -> Optional[str]:
+        """The value, or None when no configured key opens it (wrong key,
+        tampered, or bound to another place)."""
+        try:
+            version, kid, body = sealed.split(".", 2)
+            raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        except (AttributeError, ValueError):
+            return None
+        if version != _SEAL_VERSION or len(raw) < 12 + 16:
+            return None
+        for key_id, aead in self._keys:
+            if key_id != kid:
+                continue
+            try:
+                return aead.decrypt(raw[:12], raw[12:], _SEAL_CONTEXT + associated.encode("utf-8")).decode("utf-8")
+            except (InvalidTag, UnicodeDecodeError):
+                return None
+        return None
 
 
 def _b64url_decode(value: str) -> bytes:
@@ -199,10 +303,28 @@ class IdentityProvider:
                          Default 600.
         max_grant_age:   Seconds a signed-in grant may be refreshed for, counted
                          from the sign-in. Past it /token refuses the refresh and
-                         the client sends the person back through the IdP —
-                         silently while their IdP session lives, refused once
-                         their account is disabled. Default 12 hours.
+                         the client has to send the person back through the IdP.
+                         Default 12 hours. With ``recheck_on_refresh`` it stays
+                         an absolute upper bound on top of the IdP's own limits.
         clock_skew:      Leeway in seconds for ``exp``/``iat``. Default 60.
+        recheck_on_refresh: Keep the IdP's refresh token for each grant and
+                         refresh at the IdP on every origo refresh. The IdP's
+                         refusal (``invalid_grant``: account disabled, logged
+                         out, session revoked, SSO session idle or max
+                         reached) or a failed allow gate on the fresh claims
+                         ends the grant and revokes its live tokens; group and
+                         email changes reach the stored claims. An unreachable
+                         IdP refuses the refresh as retryable without ending
+                         the grant. A grant's lifetime then follows the IdP's
+                         session settings (Keycloak: SSO Session Idle/Max and
+                         Client Session Idle/Max); a refresh every token_ttl
+                         keeps an idle timeout longer than it alive. Requires
+                         ``token_keys`` or ``token_key_files``. Default False.
+        token_keys:      32-byte AES-256 keys sealing the kept IdP refresh
+                         tokens; the first seals, all open (rotation: see
+                         :class:`TokenSealer`).
+        token_key_files: Paths to the same keys, one per file (raw 32 bytes,
+                         hex, base64 or base64url), read once at construction.
 
     Every configured gate must pass. With neither gate set, anyone the IdP
     authenticates gets in — right for a realm that holds only your own people.
@@ -221,6 +343,9 @@ class IdentityProvider:
         login_ttl: int = 600,
         clock_skew: int = 60,
         max_grant_age: int = 12 * 3600,
+        recheck_on_refresh: bool = False,
+        token_keys: Optional[Iterable[bytes]] = None,
+        token_key_files: Optional[Iterable[str]] = None,
     ):
         if not issuer or not client_id:
             raise ValueError("IdentityProvider requires issuer and client_id")
@@ -246,6 +371,22 @@ class IdentityProvider:
         self.login_ttl = login_ttl
         self.clock_skew = clock_skew
         self.max_grant_age = max_grant_age
+
+        if isinstance(token_key_files, str):
+            raise TypeError("IdentityProvider token_key_files must be a list of paths, not a single string")
+        if token_keys is not None and token_key_files is not None:
+            raise ValueError("give token_keys or token_key_files, not both")
+        self.sealer: Optional[TokenSealer] = None
+        if token_key_files is not None:
+            self.sealer = TokenSealer.from_files(token_key_files)
+        elif token_keys is not None:
+            self.sealer = TokenSealer(token_keys)
+        if recheck_on_refresh and self.sealer is None:
+            raise ValueError(
+                "IdentityProvider recheck_on_refresh needs token_keys or token_key_files: "
+                "the IdP refresh tokens it keeps are sealed at rest"
+            )
+        self.recheck_on_refresh = bool(recheck_on_refresh)
 
         self._metadata: Optional[dict] = None
         self._metadata_fetched_at = 0.0
@@ -283,7 +424,17 @@ class IdentityProvider:
                 detail = exc.read(4096).decode("utf-8", "replace")
             except Exception:
                 detail = ""
-            raise IdentityError(f"IdP returned HTTP {exc.code} from {url}: {detail}", error="server_error") from exc
+            oauth_error = None
+            try:
+                parsed_detail = json.loads(detail)
+                if isinstance(parsed_detail, dict) and isinstance(parsed_detail.get("error"), str):
+                    oauth_error = parsed_detail["error"]
+            except ValueError:
+                pass
+            raise IdentityError(
+                f"IdP returned HTTP {exc.code} from {url}: {detail}",
+                error="server_error", status=exc.code, oauth_error=oauth_error,
+            ) from exc
         except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as exc:
             # HTTPException: a truncated or malformed response (IncompleteRead,
             # BadStatusLine) must become a server_error redirect, not a 500.
@@ -367,18 +518,10 @@ class IdentityProvider:
 
     # --- Code exchange ---
 
-    async def complete_login(self, code: str, redirect_uri: str, code_verifier: str, nonce: str) -> dict:
-        """Exchange the IdP's code, verify its id_token, apply the gate, and
-        return origo's claims for the person: sub, plus email/name/groups when
-        the IdP provided them. Raises IdentityError (or IdentityRefused)."""
+    async def _token_request(self, form: dict) -> dict:
+        """POST to the IdP's token endpoint with origo's client authentication."""
         metadata = await self.metadata()
-        form = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": code_verifier,
-            "client_id": self.client_id,
-        }
+        form = {**form, "client_id": self.client_id}
         headers = {}
         if self.client_secret:
             if self.token_endpoint_auth_method == "client_secret_post":
@@ -388,14 +531,95 @@ class IdentityProvider:
                 # being joined, so a secret containing ':' or '%' survives.
                 pair = f"{_form_encode(self.client_id)}:{_form_encode(self.client_secret)}"
                 headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
-        response = await self._fetch(metadata["token_endpoint"], form=form, headers=headers)
+        return await self._fetch(metadata["token_endpoint"], form=form, headers=headers)
+
+    async def complete_login(self, code: str, redirect_uri: str, code_verifier: str, nonce: str) -> dict:
+        """Exchange the IdP's code, verify its id_token, apply the gate, and
+        return origo's claims for the person: sub, plus email/name/groups when
+        the IdP provided them. Raises IdentityError (or IdentityRefused)."""
+        identity, _ = await self.complete_login_with_refresh_token(code, redirect_uri, code_verifier, nonce)
+        return identity
+
+    async def complete_login_with_refresh_token(
+        self, code: str, redirect_uri: str, code_verifier: str, nonce: str
+    ) -> tuple[dict, Optional[str]]:
+        """complete_login, also returning the IdP's refresh token (None when
+        the IdP issued none). The token is a credential: seal it, never log it."""
+        response = await self._token_request({
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+        })
         id_token = response.get("id_token")
         if not isinstance(id_token, str) or not id_token:
             raise IdentityError("IdP token response carries no id_token", error="server_error")
         claims = await self.verify_id_token(id_token, nonce)
         identity = self.map_claims(claims)
         self.check_gate(identity, claims)
-        return identity
+        refresh_token = response.get("refresh_token")
+        return identity, refresh_token if isinstance(refresh_token, str) and refresh_token else None
+
+    async def refresh_identity(self, refresh_token: str, sub: str) -> tuple[dict, str]:
+        """Refresh at the IdP with its refresh token for the grant of ``sub``
+        (origo's namespaced subject). Returns the person's fresh claims, gate
+        applied, and the refresh token to keep next (the rotated one, or the
+        same one when the IdP does not rotate).
+
+        Raises IdentityRefused when the grant is over: the IdP answered
+        ``invalid_grant``, named a different subject, or the fresh claims fail
+        the allow gate. Raises a plain IdentityError when the IdP could not
+        give an answer (unreachable, 5xx, any other error, an id_token that
+        doesn't verify): retryable, the grant is not over.
+        """
+        try:
+            response = await self._token_request({"grant_type": "refresh_token", "refresh_token": refresh_token})
+        except IdentityRefused:
+            raise
+        except IdentityError as exc:
+            if exc.oauth_error == "invalid_grant":
+                raise IdentityRefused(f"the IdP refused the grant's refresh (HTTP {exc.status}, invalid_grant)") from exc
+            # Without the IdP's body (it may echo request details) in the message.
+            raise IdentityError(
+                f"IdP refresh failed (HTTP {exc.status}, {exc.oauth_error or 'no OAuth error code'})"
+                if exc.status is not None else "IdP refresh failed: the IdP could not be reached",
+                error="server_error", status=exc.status, oauth_error=exc.oauth_error,
+            ) from exc
+
+        id_token = response.get("id_token")
+        if isinstance(id_token, str) and id_token:
+            # OIDC Core §12.2: a refreshed id_token's iss, sub and aud match
+            # the original's. Its nonce, if any, is the original sign-in's,
+            # which origo doesn't keep: the signature, iss, aud/azp and exp
+            # are what bind this token to this IdP and this client.
+            claims = await self.verify_id_token(id_token, nonce=None)
+        else:
+            claims = await self._userinfo(response.get("access_token"))
+        if f"{self.issuer}|{claims.get('sub')}" != sub:
+            raise IdentityRefused("the IdP's refreshed identity names a different subject")
+        identity = self.map_claims(claims)
+        self.check_gate(identity, claims)
+        new_refresh_token = response.get("refresh_token")
+        return identity, new_refresh_token if isinstance(new_refresh_token, str) and new_refresh_token else refresh_token
+
+    async def _userinfo(self, access_token) -> dict:
+        """The person's claims from the IdP's userinfo endpoint, for an IdP
+        that returns no id_token on refresh. Fetched over TLS straight from
+        the discovered endpoint with the access token the IdP just issued."""
+        endpoint = (await self.metadata()).get("userinfo_endpoint")
+        if not isinstance(access_token, str) or not access_token or not isinstance(endpoint, str):
+            raise IdentityError(
+                "IdP refresh returned no id_token, and no userinfo endpoint and access token to fall back on",
+                error="server_error",
+            )
+        try:
+            _require_secure_url(endpoint, "IdP userinfo_endpoint")
+        except ValueError as exc:
+            raise IdentityError(str(exc), error="server_error") from exc
+        claims = await self._fetch(endpoint, headers={"Authorization": f"Bearer {access_token}"})
+        if not isinstance(claims.get("sub"), str) or not claims["sub"]:
+            raise IdentityError("IdP userinfo has no sub", error="server_error")
+        return claims
 
     # --- id_token verification ---
 
@@ -441,8 +665,11 @@ class IdentityProvider:
         # No kid in the header: unambiguous only if the IdP has one such key.
         return candidates[0] if len(candidates) == 1 else None
 
-    async def verify_id_token(self, id_token: str, nonce: str) -> dict:
-        """Verify signature, iss, aud/azp, exp and nonce; return the claims."""
+    async def verify_id_token(self, id_token: str, nonce: Optional[str]) -> dict:
+        """Verify signature, iss, aud/azp, exp and nonce; return the claims.
+
+        ``nonce`` is None only for an id_token from a refresh, which answers
+        no sign-in of ours (OIDC Core §12.2); every sign-in passes its own."""
         try:
             header_b64, payload_b64, signature_b64 = id_token.split(".")
             header = json.loads(_b64url_decode(header_b64))
@@ -512,9 +739,10 @@ class IdentityProvider:
         if iat is not None and (not isinstance(iat, (int, float)) or iat - self.clock_skew > now):
             raise IdentityError("id_token iat is in the future")
 
-        token_nonce = claims.get("nonce")
-        if not isinstance(token_nonce, str) or not hmac.compare_digest(token_nonce.encode(), nonce.encode()):
-            raise IdentityError("id_token nonce does not match this sign-in")
+        if nonce is not None:
+            token_nonce = claims.get("nonce")
+            if not isinstance(token_nonce, str) or not hmac.compare_digest(token_nonce.encode(), nonce.encode()):
+                raise IdentityError("id_token nonce does not match this sign-in")
 
         if not isinstance(claims.get("sub"), str) or not claims["sub"]:
             raise IdentityError("id_token has no sub")

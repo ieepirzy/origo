@@ -28,6 +28,10 @@ What is (and is not) written to disk:
   cannot be hashed. Treat the file as holding personal data.
 - Pending upstream sign-ins (the IdP PKCE verifier and nonce of a login in
   flight, for at most the IdP's login_ttl) are stored under a hashed key.
+- With ``recheck_on_refresh``, each grant's IdP refresh token is stored
+  **sealed** (AES-256-GCM under the operator's token key, bound to its grant),
+  never in plaintext: unlike origo's own credentials it is the IdP's, so it
+  can't be hashed, and a copy of the file must not yield it.
 - The provider's RSA signing key is NOT persisted; it is regenerated per
   process as before. ID tokens are verified at delivery time, so a
   restart only rotates the JWKS.
@@ -101,6 +105,11 @@ CREATE TABLE IF NOT EXISTS revoked_families (
 CREATE TABLE IF NOT EXISTS pending_logins (
     state_hash TEXT PRIMARY KEY,
     data TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS idp_tokens (
+    key TEXT PRIMARY KEY,
+    sealed TEXT NOT NULL,
     expires_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_family ON tokens (family);
@@ -352,6 +361,7 @@ class SQLiteOAuthStorage:
             self._conn.execute("DELETE FROM consumed_refresh_tokens WHERE retain_until <= ?", (now,))
             self._conn.execute("DELETE FROM revoked_families WHERE retain_until <= ?", (now,))
             self._conn.execute("DELETE FROM pending_logins WHERE expires_at <= ?", (now,))
+            self._conn.execute("DELETE FROM idp_tokens WHERE expires_at <= ?", (now,))
             if self.client_ttl is not None:
                 self._conn.execute(
                     "DELETE FROM clients WHERE registered_at + ? <= ?", (self.client_ttl, now)
@@ -513,6 +523,26 @@ class SQLiteOAuthStorage:
                 raise
         return token
 
+    def peek_refresh_token(self, refresh_token: str) -> Optional[dict]:
+        """A live refresh token's metadata, without consuming it (see
+        OAuthStorage.peek_refresh_token)."""
+        if not isinstance(refresh_token, str):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM refresh_tokens WHERE token_hash = ?", (_hash(refresh_token),)
+            ).fetchone()
+        if row is None or _mem._now() > row["expires_at"]:
+            return None
+        return {
+            "client_id": row["client_id"],
+            "resource": row["resource"],
+            "scope": row["scope"],
+            "expires_at": row["expires_at"],
+            "family": row["family"],
+            "claims": _load_claims(row["claims"]),
+        }
+
     def exchange_refresh_token(self, refresh_token: str) -> Optional[dict]:
         """Return and consume a refresh token (rotation). None if missing or expired.
 
@@ -569,6 +599,7 @@ class SQLiteOAuthStorage:
             return
         self._conn.execute("DELETE FROM refresh_tokens WHERE family = ?", (family,))
         self._conn.execute("DELETE FROM tokens WHERE family = ?", (family,))
+        self._conn.execute("DELETE FROM idp_tokens WHERE key = ?", (f"family:{family}",))
         # Persistent marker: an in-flight refresh that already exchanged this
         # family's token must not be able to mint replacements afterwards.
         self._conn.execute(
@@ -586,6 +617,38 @@ class SQLiteOAuthStorage:
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    # --- Sealed IdP refresh tokens ---
+
+    def store_idp_token(self, key: str, sealed: str, ttl: float) -> None:
+        """Keep a sealed IdP refresh token under key (replacing any) for ttl seconds."""
+        with self._lock:
+            self._cleanup_expired()
+            self._conn.execute(
+                "INSERT OR REPLACE INTO idp_tokens (key, sealed, expires_at) VALUES (?, ?, ?)",
+                (key, sealed, _mem._now() + ttl),
+            )
+
+    def get_idp_token(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute("SELECT sealed, expires_at FROM idp_tokens WHERE key = ?", (key,)).fetchone()
+        if row is None or _mem._now() > row["expires_at"]:
+            return None
+        return row["sealed"]
+
+    def pop_idp_token(self, key: str) -> Optional[str]:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT sealed, expires_at FROM idp_tokens WHERE key = ?", (key,)).fetchone()
+                self._conn.execute("DELETE FROM idp_tokens WHERE key = ?", (key,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        if row is None or _mem._now() > row["expires_at"]:
+            return None
+        return row["sealed"]
 
     # --- Pending upstream sign-ins ---
 
