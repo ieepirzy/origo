@@ -175,7 +175,27 @@ With an IdP configured, `auto_approve` and the consent page are never used, `POS
 - For `allowed_groups`, add a *Group Membership* mapper to the client (or a client scope it uses) with *Add to ID token* on. With *Full group path* on, groups appear as `/name`; match them exactly as emitted.
 - Users created by an admin need *Email verified* set, or the email claim is dropped and the domain gate refuses them.
 
-**Disabled users.** Refresh does not go back to the IdP, so two bounds stand in for it. A signed-in grant can be refreshed only until `max_grant_age` (an `IdentityProvider` argument, default 12 hours) after the sign-in; then `/token` refuses and the client sends the person back through `/authorize`, which with a live IdP session is usually silent and for a disabled account is refused. And every refresh re-applies the allow gate against the current configuration, so removing a group from `allowed_groups` (or a domain from `allowed_email_domains`) takes effect at the next refresh. A refused refresh also revokes the grant's live tokens. Within those bounds, a disabled person keeps access until their access token expires, so keep `token_ttl` short. Checking the account at the IdP on refresh (its refresh token or back-channel logout) is planned.
+**Disabled users.** By default, refresh does not go back to the IdP, so two bounds stand in for it. A signed-in grant can be refreshed only until `max_grant_age` (an `IdentityProvider` argument, default 12 hours) after the sign-in; then `/token` refuses and the client has to send the person back through `/authorize` (connector clients typically show "reconnect" rather than doing it silently). And every refresh re-applies the allow gate against the current configuration, so removing a group from `allowed_groups` (or a domain from `allowed_email_domains`) takes effect at the next refresh. A refused refresh also revokes the grant's live tokens. Within those bounds, a disabled person keeps access until `max_grant_age` runs out, so keep `token_ttl` short.
+
+**Re-checking the IdP on every refresh** (`recheck_on_refresh=True`). origo keeps the IdP's own refresh token for each grant and, on every origo refresh, refreshes at the IdP first. Revocation then happens server-side and doesn't depend on what the client holds:
+
+```python
+IdentityProvider(
+    issuer="https://auth.example.com/realms/staff",
+    client_id=..., client_secret=...,
+    allowed_groups=["/mcp-users"],
+    recheck_on_refresh=True,
+    token_key_files=["/run/secrets/origo-token-key"],   # 32 bytes: raw, hex or base64
+)
+```
+
+- The IdP answering `invalid_grant` (account disabled, signed out, session revoked, SSO session idle or max reached), a different subject, or fresh claims failing the allow gate **ends the grant**: `/token` answers `invalid_grant` and every live access and refresh token of the grant is revoked. A disabled person loses access within one `token_ttl`.
+- Fresh claims (name, email, groups) replace the stored ones on each refresh.
+- An IdP that can't be reached or answers 5xx gets a `503 temporarily_unavailable` with `Retry-After`; the client's refresh token is **not** spent and the grant is kept, so a retry succeeds once the IdP is back.
+- A grant's lifetime then follows the IdP's session settings (Keycloak: *SSO Session Idle/Max*, *Client Session Idle/Max*). A refresh every `token_ttl` keeps an idle timeout longer than it alive; a *Max* shorter than a working day means a sign-in sooner. `max_grant_age` stays an absolute upper bound on top.
+- The IdP refresh tokens are sealed at rest with AES-256-GCM, each bound to its grant. The first key seals and every listed key opens, so to rotate a key put the new one first, keep the old one until every grant has refreshed once (each refresh re-seals under the first key), then drop it. Keys are required: `recheck_on_refresh` without one is a configuration error.
+- The origo client at the IdP must be issued refresh tokens (Keycloak's default for a standard-flow client). A sign-in where the IdP issues none fails with `server_error`. If the IdP returns no `id_token` on refresh, origo reads the claims from its `userinfo_endpoint`.
+- **Upgrading:** grants issued before `recheck_on_refresh` was turned on hold no IdP token, so their next refresh is refused and the person signs in once.
 
 **Several origo instances, one IdP.** Each origo deployment registers its own callback URL at the IdP (one client per deployment, or one client listing every callback). Pending sign-ins live in origo's storage, so processes that share one SQLite file can take each other's callbacks; separate deployments with separate storage each hold their own grants.
 

@@ -12,6 +12,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+import weakref
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from starlette.requests import Request
@@ -20,7 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from .oidc import _USER_AGENT, IdentityError, IdentityProvider, domain_matches, s256_challenge
+from .oidc import _USER_AGENT, IdentityError, IdentityProvider, IdentityRefused, TokenSealer, domain_matches, s256_challenge
 from .storage import FamilyRevokedError, OAuthStorage
 
 import base64
@@ -944,12 +945,21 @@ async def authorize_callback(request: Request) -> Response:
         return _redirect_to_client(redirect_uri, {"error": "access_denied", "state": client_state})
 
     try:
-        claims = await identity_provider.complete_login(
+        claims, idp_refresh_token = await identity_provider.complete_login_with_refresh_token(
             upstream_code, _callback_url(request.app.state), pending["code_verifier"], pending["nonce"]
         )
     except IdentityError as exc:
         logger.warning("authorize: sign-in for client %r refused: %s", client_id, exc)
         return _redirect_to_client(redirect_uri, {"error": exc.error, "state": client_state})
+
+    if identity_provider.recheck_on_refresh and idp_refresh_token is None:
+        # Without the IdP's refresh token origo couldn't re-check this grant,
+        # so it would outlive the person's account. Fail closed and say why.
+        logger.error(
+            "authorize: the IdP issued no refresh_token, which recheck_on_refresh needs; "
+            "allow refresh tokens for origo's client at the IdP. Sign-in for client %r refused.", client_id,
+        )
+        return _redirect_to_client(redirect_uri, {"error": "server_error", "state": client_state})
 
     # The client may have expired (client_ttl) while the person was away.
     if not storage.client_exists(client_id):
@@ -968,7 +978,43 @@ async def authorize_callback(request: Request) -> Response:
         scope=pending["scope"],
         claims=claims,
     )
+    if identity_provider.recheck_on_refresh:
+        # Waits with the code (single use, 60 s) until /token gives the grant
+        # its family; sealed and bound to this code meanwhile.
+        key = _code_idp_key(code)
+        storage.store_idp_token(key, _sealer(identity_provider).seal(idp_refresh_token, key), 60)
     return _redirect_to_client(redirect_uri, {"code": code, "state": client_state})
+
+
+def _sealer(identity_provider: IdentityProvider) -> TokenSealer:
+    # IdentityProvider refuses recheck_on_refresh without one; checked here
+    # too so a sealer removed at runtime fails loudly instead of skipping.
+    if identity_provider.sealer is None:
+        raise RuntimeError("recheck_on_refresh is on but the IdentityProvider has no token keys")
+    return identity_provider.sealer
+
+
+def _code_idp_key(code: str) -> str:
+    return "code:" + hashlib.sha256(code.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _family_idp_key(family: str) -> str:
+    return f"family:{family}"
+
+
+# One lock per token family while a refresh is re-checked at the IdP, so two
+# concurrent refreshes of one grant don't both spend its IdP refresh token.
+# Per process; the storage's own atomic exchange still decides across
+# processes. Weak values: a lock lives only while someone holds or awaits it.
+_refresh_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+
+
+def _family_lock(family: str) -> asyncio.Lock:
+    lock = _refresh_locks.get(family)
+    if lock is None:
+        lock = asyncio.Lock()
+        _refresh_locks[family] = lock
+    return lock
 
 
 # --- Token ---
@@ -1067,7 +1113,24 @@ async def token(request: Request) -> JSONResponse:
         # New grant: start a fresh token family. Every token rotated from this
         # grant shares the id, so refresh-token reuse can revoke them together.
         token_family = secrets.token_urlsafe(16)
+
+        identity_provider = request.app.state.identity_provider
+        if claims is not None and identity_provider is not None and identity_provider.recheck_on_refresh:
+            code_key = _code_idp_key(code)
+            sealed = storage.pop_idp_token(code_key)
+            idp_refresh_token = _sealer(identity_provider).open(sealed, code_key) if sealed else None
+            if idp_refresh_token is None:
+                # Issued before recheck was turned on, or its sealed token is
+                # gone: a grant origo couldn't re-check is not issued.
+                return JSONResponse({"error": "invalid_grant", "error_description": "Sign-in required."}, status_code=401)
+            family_key = _family_idp_key(token_family)
+            storage.store_idp_token(
+                family_key, _sealer(identity_provider).seal(idp_refresh_token, family_key), storage.refresh_token_ttl
+            )
     else:
+        identity_provider: IdentityProvider | None = request.app.state.identity_provider
+        if identity_provider is not None and identity_provider.recheck_on_refresh:
+            return await _refresh_with_recheck(request, storage, identity_provider, client_id, refresh_token, params)
         # Exchange (and rotate) refresh token
         refresh_entry = storage.exchange_refresh_token(refresh_token)
         if refresh_entry is None:
@@ -1088,7 +1151,6 @@ async def token(request: Request) -> JSONResponse:
         # to any one refresh token in its rotation chain.
         claims = refresh_entry.get("claims")
 
-        identity_provider: IdentityProvider | None = request.app.state.identity_provider
         if claims is not None and identity_provider is not None:
             refusal = _refresh_refusal(identity_provider, claims)
             if refusal is not None:
@@ -1104,6 +1166,100 @@ async def token(request: Request) -> JSONResponse:
         # where every token does; the client signs in again.
         return JSONResponse({"error": "invalid_grant", "error_description": "Sign-in required."}, status_code=401)
 
+    return _issue_tokens(request, storage, client_id, resource, scope, token_family, claims)
+
+
+async def _refresh_with_recheck(
+    request: Request,
+    storage: OAuthStorage,
+    identity_provider: IdentityProvider,
+    client_id: str,
+    refresh_token: str,
+    params: dict,
+) -> JSONResponse:
+    """A refresh that first asks the IdP whether the grant still stands.
+
+    The client's refresh token is only looked at (peeked) until the IdP has
+    answered, then rotated: an IdP that can't be reached leaves it usable for
+    a retry. The IdP refusing (invalid_grant), or the fresh claims failing the
+    gate, ends the grant and revokes every live token in its family.
+    """
+    sign_in_required = JSONResponse({"error": "invalid_grant", "error_description": "Sign-in required."}, status_code=401)
+    peeked = storage.peek_refresh_token(refresh_token)
+    if peeked is None or peeked.get("claims") is None:
+        # Unknown, expired or already rotated (exchange applies reuse
+        # detection), or a grant that names no person (refused below).
+        refresh_entry = storage.exchange_refresh_token(refresh_token)
+        if refresh_entry is None:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Refresh token expired or invalid."}, status_code=401)
+        return sign_in_required
+    family = peeked["family"]
+
+    async with _family_lock(family):
+        # Again under the lock: a concurrent refresh may have rotated it.
+        peeked = storage.peek_refresh_token(refresh_token)
+        if peeked is None:
+            storage.exchange_refresh_token(refresh_token)  # rotated meanwhile: reuse detection
+            return JSONResponse({"error": "invalid_grant", "error_description": "Refresh token expired or invalid."}, status_code=401)
+        if peeked["client_id"] != client_id:
+            return JSONResponse({"error": "invalid_grant"}, status_code=401)
+        resource = params.get("resource")
+        if resource is None:
+            resource = peeked.get("resource")
+        elif peeked.get("resource") != resource:
+            return JSONResponse({"error": "invalid_grant", "error_description": "resource mismatch."}, status_code=401)
+
+        claims = peeked["claims"]
+
+        def end_grant(reason: str) -> JSONResponse:
+            logger.info("token: refresh for %r refused: %s", claims.get("sub"), reason)
+            storage.revoke_family(family)
+            return sign_in_required
+
+        refusal = _refresh_refusal(identity_provider, claims)
+        if refusal is not None:
+            return end_grant(refusal)
+        family_key = _family_idp_key(family)
+        sealed = storage.get_idp_token(family_key)
+        idp_refresh_token = _sealer(identity_provider).open(sealed, family_key) if sealed else None
+        if idp_refresh_token is None:
+            # A grant from before recheck was on, or one whose token no
+            # configured key opens: it can't be re-checked, so it ends.
+            return end_grant("grant has no IdP refresh token origo can use (one sign-in renews it)")
+        try:
+            fresh, next_idp_refresh_token = await identity_provider.refresh_identity(idp_refresh_token, claims["sub"])
+        except IdentityRefused as exc:
+            return end_grant(str(exc))
+        except IdentityError as exc:
+            logger.warning("token: refresh for %r not re-checked, IdP unavailable: %s", claims.get("sub"), exc)
+            return JSONResponse(
+                {"error": "temporarily_unavailable", "error_description": "The identity provider is unavailable; try again."},
+                status_code=503, headers={**_NO_STORE, "Retry-After": "10"},
+            )
+
+        # Keep the IdP's rotated token before rotating ours: if what follows
+        # fails, the grant still holds the IdP token that is current now.
+        storage.store_idp_token(
+            family_key, _sealer(identity_provider).seal(next_idp_refresh_token, family_key), storage.refresh_token_ttl
+        )
+        refresh_entry = storage.exchange_refresh_token(refresh_token)
+        if refresh_entry is None:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Refresh token expired or invalid."}, status_code=401)
+        # The fresh identity from the IdP, with the grant's own sign-in time
+        # (max_grant_age counts from it).
+        fresh["auth_time"] = claims.get("auth_time")
+        return _issue_tokens(request, storage, client_id, resource, refresh_entry.get("scope", ""), family, fresh)
+
+
+def _issue_tokens(
+    request: Request,
+    storage: OAuthStorage,
+    client_id: str,
+    resource,
+    scope: str,
+    token_family: str,
+    claims,
+) -> JSONResponse:
     try:
         access_token = storage.store_token(client_id, resource=resource, scope=scope, family=token_family, claims=claims)
         new_refresh_token = storage.store_refresh_token(client_id, resource=resource, scope=scope, family=token_family, claims=claims)
@@ -1140,13 +1296,14 @@ async def token(request: Request) -> JSONResponse:
 def _refresh_refusal(identity_provider: IdentityProvider, claims: dict) -> str | None:
     """Why a person's grant may no longer be refreshed, or None.
 
-    Refresh never goes back to the IdP, so without these a grant would slide
-    forward forever (every rotation restarts refresh_token_ttl) and outlive
-    the person's account. The grant is bounded by max_grant_age from the
-    sign-in, after which the client sends the person back through /authorize
-    (silent with a live IdP session, refused for a disabled account), and the
-    allow gate is re-applied against the current configuration, so narrowing
-    allowed_groups/allowed_email_domains takes effect at the next refresh.
+    Without recheck_on_refresh, refresh never goes back to the IdP, so
+    without these a grant would slide forward forever (every rotation restarts
+    refresh_token_ttl) and outlive the person's account. The grant is bounded
+    by max_grant_age from the sign-in, after which the client sends the person
+    back through /authorize, and the allow gate is re-applied against the
+    current configuration, so narrowing allowed_groups/allowed_email_domains
+    takes effect at the next refresh. With recheck_on_refresh these still
+    apply first, as outer bounds, before the IdP is asked.
     """
     auth_time = claims.get("auth_time")
     if not isinstance(auth_time, (int, float)) or time.time() - auth_time > identity_provider.max_grant_age:

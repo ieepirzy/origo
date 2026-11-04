@@ -116,6 +116,10 @@ class OAuthStorage:
         # Insertion-ordered, which is also expiry order (one fixed TTL), so the
         # oldest entry is always first.
         self._pending_logins: dict[str, dict] = {}
+        # Sealed IdP refresh tokens (recheck_on_refresh): key -> {sealed, expires_at}.
+        # Keys are "family:<family>" for a grant, "code:<sha256(code)>" while
+        # an auth code waits to be exchanged.
+        self._idp_tokens: dict[str, dict] = {}
         self._clients_expiry: deque = deque()
         self._codes_expiry: deque = deque()
         self._tokens_expiry: deque = deque()
@@ -304,6 +308,10 @@ class OAuthStorage:
             if self._revoked_families.get(k) == exp:
                 del self._revoked_families[k]
 
+        # Sealed IdP refresh tokens (few: one per live grant; a plain sweep)
+        for k in [k for k, v in self._idp_tokens.items() if v["expires_at"] <= now]:
+            del self._idp_tokens[k]
+
         # Clean up clients
         if self.client_ttl is not None:
             while self._clients_expiry and self._clients_expiry[0][1] <= now:
@@ -421,6 +429,16 @@ class OAuthStorage:
         self._refresh_tokens_expiry.append((token, expires_at))
         return token
 
+    def peek_refresh_token(self, refresh_token: str) -> Optional[dict]:
+        """A live refresh token's metadata, without consuming it. None if
+        missing, expired or already consumed. Lets /token check a grant at the
+        IdP before rotating, so a retryable failure leaves the client's
+        refresh token usable."""
+        entry = self._refresh_tokens.get(refresh_token)
+        if entry is None or _now() > entry["expires_at"]:
+            return None
+        return copy.deepcopy(entry)
+
     def exchange_refresh_token(self, refresh_token: str) -> Optional[dict]:
         """Return and consume a refresh token (rotation). None if missing or expired.
 
@@ -458,9 +476,29 @@ class OAuthStorage:
             del self._refresh_tokens[k]
         for k in [k for k, v in self._tokens.items() if v.get("family") == family]:
             del self._tokens[k]
+        self._idp_tokens.pop(f"family:{family}", None)
         retain_until = _now() + self.refresh_token_ttl
         self._revoked_families[family] = retain_until
         self._revoked_families_expiry.append((family, retain_until))
+
+    # --- Sealed IdP refresh tokens ---
+
+    def store_idp_token(self, key: str, sealed: str, ttl: float) -> None:
+        """Keep a sealed IdP refresh token under key (replacing any) for ttl seconds."""
+        self._cleanup_expired()
+        self._idp_tokens[key] = {"sealed": sealed, "expires_at": _now() + ttl}
+
+    def get_idp_token(self, key: str) -> Optional[str]:
+        entry = self._idp_tokens.get(key)
+        if entry is None or _now() > entry["expires_at"]:
+            return None
+        return entry["sealed"]
+
+    def pop_idp_token(self, key: str) -> Optional[str]:
+        entry = self._idp_tokens.pop(key, None)
+        if entry is None or _now() > entry["expires_at"]:
+            return None
+        return entry["sealed"]
 
     # --- Pending upstream sign-ins ---
 
