@@ -636,7 +636,6 @@ async def _register_cimd_client(app_state, storage: OAuthStorage, client_id: str
 async def authorize(request: Request) -> Response:
     storage: OAuthStorage = request.app.state.storage
     auto_approve: bool = request.app.state.auto_approve
-    allow_private_cimd: bool = request.app.state.allow_private_cimd
 
     if request.method == "GET":
         if len(request.query_params.multi_items()) != len(request.query_params.keys()):
