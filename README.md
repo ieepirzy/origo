@@ -199,6 +199,67 @@ IdentityProvider(
 
 **Several origo instances, one IdP.** Each origo deployment registers its own callback URL at the IdP (one client per deployment, or one client listing every callback). Pending sign-ins live in origo's storage, so processes that share one SQLite file can take each other's callbacks; separate deployments with separate storage each hold their own grants.
 
+## Managed sign-in (ID-JAG, claude.ai managed authorization)
+
+With an upstream identity provider configured, origo can also accept
+**Identity Assertion JWT Authorization Grants** (draft-ietf-oauth-identity-assertion-authz-grant):
+claude.ai's "managed authorization" connects every member of your organization
+once, without each of them going through a browser sign-in. claude.ai signs a
+short-lived assertion naming the member; its client presents it at `/token` as
+an RFC 7523 `urn:ietf:params:oauth:grant-type:jwt-bearer` grant.
+
+```python
+from origo import IdentityProvider, ManagedSignIn, OAuthProvider
+
+auth = OAuthProvider(
+    base_url="https://mcp.example.com",
+    public_registration=True,
+    cimd_allowed_clients=["claude.ai"],
+    identity_provider=IdentityProvider(
+        issuer="https://auth.example.com/realms/staff",
+        client_id="my-mcp",
+        client_secret=os.environ["IDP_CLIENT_SECRET"],
+    ),
+    managed_sign_in=ManagedSignIn(
+        # claude.ai -> Organization -> Connectors -> managed authorization:
+        # "Claude-issued", the Issuer URL it shows (one per organization).
+        issuer="https://identity.anthropic.com/issuers/iss_...",
+        tenant=None,  # or the Tenant ID you entered there
+        group_paths=False,  # match the realm's group mapper "Full group path"
+    ),
+)
+```
+
+What origo checks: header `typ` `oauth-id-jag+jwt` and an asymmetric `alg`;
+the signature against the pinned issuer's JWKS; `iss`; `aud` is origo's own
+issuer (`base_url`); `client_id` is the client calling `/token`, which must be
+on `cimd_allowed_clients` and declare the grant in its metadata document;
+`exp`, `iat` (no older than `max_assertion_age`, 300 s), `nbf`; `jti` is single
+use (persisted, so replay is refused across restarts); `aud_tenant` when a
+tenant is configured; `resource`, if present, is this server; the email is
+plain ASCII. Non-finite times (`NaN`, `Infinity`) are refused.
+
+Assertions are **not sender-constrained**: claude.ai's client is public and
+the issuer does not bind them, so a leaked assertion could be redeemed once
+within `max_assertion_age`. An assertion that carries `cnf` is refused, since
+origo cannot verify the binding.
+
+**Who the token is for.** The assertion only says "a member of this
+organization, with this email". The token is for the one **enabled** Keycloak
+user whose **verified** email matches, with no pending required actions and
+no brute-force lockout, with the same subject
+(`<issuer>|<keycloak id>`), groups and allow gate as an interactive sign-in. No
+such user (or two) means `invalid_grant`: managed sign-in never creates
+identities. The lookup uses the identity provider's own client with the
+client-credentials grant, so the Keycloak client needs **Service accounts**
+enabled and the realm-management role **view-users**. Browser-flow policies
+(conditional access in a custom authentication flow) do not apply to this
+path; the allow gate does.
+
+No refresh token is issued: claude.ai asks for a fresh assertion, so removing
+someone from the organization or disabling them in Keycloak stops them at
+their next exchange (at most one `token_ttl`).
+
 ## Approve-only consent (no identity provider)
 
 Without an `identity_provider`, `/authorize` **fails closed**: it answers `403 access_denied` and issues nothing, because the consent page would authenticate nobody. To keep the approve-only page (single-operator deployments, local development), opt in explicitly:

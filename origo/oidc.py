@@ -259,12 +259,97 @@ def domain_matches(host: str, pattern: str) -> bool:
     return host == pattern
 
 
+def _verify_jws_signature(header_b64: str, payload_b64: str, signature: bytes, alg: str, jwk: dict, what: str) -> None:
+    """Verify a JWS signature with an asymmetric ``alg`` (a key of _ALGORITHMS)
+    against ``jwk``. Raises IdentityError naming ``what`` on any failure."""
+    family, hash_cls, curve = _ALGORITHMS[alg]
+    kty = "EC" if family == "EC" else "RSA"
+    signing_input = f"{header_b64}.{payload_b64}".encode()
+    try:
+        if kty == "RSA":
+            public_key = rsa.RSAPublicNumbers(_b64url_int(jwk["e"]), _b64url_int(jwk["n"])).public_key()
+            pad = (
+                padding.PKCS1v15() if family == "RSA"
+                else padding.PSS(mgf=padding.MGF1(hash_cls()), salt_length=hash_cls.digest_size)
+            )
+            public_key.verify(signature, signing_input, pad, hash_cls())
+        else:
+            if jwk.get("crv") != curve:
+                raise IdentityError(f"{what} alg {alg} does not match key curve {jwk.get('crv')!r}")
+            curve_cls, size = _EC_CURVES[curve]
+            public_key = ec.EllipticCurvePublicNumbers(
+                _b64url_int(jwk["x"]), _b64url_int(jwk["y"]), curve_cls()
+            ).public_key()
+            # JWS carries ECDSA signatures as raw r||s, not DER.
+            if len(signature) != 2 * size:
+                raise IdentityError(f"{what} ECDSA signature has the wrong length")
+            r = int.from_bytes(signature[:size], "big")
+            s = int.from_bytes(signature[size:], "big")
+            public_key.verify(encode_dss_signature(r, s), signing_input, ec.ECDSA(hash_cls()))
+    except InvalidSignature as exc:
+        raise IdentityError(f"{what} signature is invalid") from exc
+    except (KeyError, TypeError, ValueError) as exc:
+        raise IdentityError(f"IdP signing key is unusable: {exc}") from exc
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """The token endpoint must answer itself: a redirect could carry the
     authorization code and client secret somewhere else."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _http_json(url: str, form: Optional[dict] = None, headers: Optional[dict] = None, allow_list: bool = False):
+    """GET (or, with ``form``, POST form-encoded) ``url`` and return its JSON
+    object (or, with ``allow_list``, array). Raises IdentityError on any
+    transport, status or decoding failure. Redirects are refused. Synchronous;
+    callers use a worker thread."""
+    _require_secure_url(url, "IdP endpoint")
+    # An explicit User-Agent: Cloudflare's default bot rules answer 403 to
+    # urllib's "Python-urllib/x.y" (observed in front of the first
+    # Keycloak this was deployed against), which would fail every sign-in.
+    request_headers = {"Accept": "application/json", "User-Agent": _USER_AGENT, **(headers or {})}
+    data = None
+    if form is not None:
+        data = urlencode(form).encode()
+        request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+    request = urllib.request.Request(url, data=data, headers=request_headers, method="POST" if data is not None else "GET")
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    try:
+        with opener.open(request, timeout=10) as response:
+            body = response.read(_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        # The IdP's error body (e.g. {"error": "invalid_grant"}) is the
+        # useful part of a failed exchange; keep it for the log.
+        try:
+            detail = exc.read(4096).decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        oauth_error = None
+        try:
+            parsed_detail = json.loads(detail)
+            if isinstance(parsed_detail, dict) and isinstance(parsed_detail.get("error"), str):
+                oauth_error = parsed_detail["error"]
+        except ValueError:
+            pass
+        raise IdentityError(
+            f"IdP returned HTTP {exc.code} from {url}: {detail}",
+            error="server_error", status=exc.code, oauth_error=oauth_error,
+        ) from exc
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as exc:
+        # HTTPException: a truncated or malformed response (IncompleteRead,
+        # BadStatusLine) must become a server_error redirect, not a 500.
+        raise IdentityError(f"IdP request to {url} failed: {exc}", error="server_error") from exc
+    if len(body) > _MAX_RESPONSE_BYTES:
+        raise IdentityError(f"IdP response from {url} exceeds {_MAX_RESPONSE_BYTES} bytes", error="server_error")
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise IdentityError(f"IdP response from {url} is not JSON", error="server_error") from exc
+    if not isinstance(parsed, dict) and not (allow_list and isinstance(parsed, list)):
+        raise IdentityError(f"IdP response from {url} is not a JSON object", error="server_error")
+    return parsed
 
 
 class IdentityProvider:
@@ -403,51 +488,7 @@ class IdentityProvider:
         Raises IdentityError on any transport, status or decoding failure.
         Redirects are refused. Runs synchronously; callers use a worker thread.
         """
-        _require_secure_url(url, "IdP endpoint")
-        # An explicit User-Agent: Cloudflare's default bot rules answer 403 to
-        # urllib's "Python-urllib/x.y" (observed in front of the first
-        # Keycloak this was deployed against), which would fail every sign-in.
-        request_headers = {"Accept": "application/json", "User-Agent": _USER_AGENT, **(headers or {})}
-        data = None
-        if form is not None:
-            data = urlencode(form).encode()
-            request_headers["Content-Type"] = "application/x-www-form-urlencoded"
-        request = urllib.request.Request(url, data=data, headers=request_headers, method="POST" if data is not None else "GET")
-        opener = urllib.request.build_opener(_NoRedirectHandler)
-        try:
-            with opener.open(request, timeout=10) as response:
-                body = response.read(_MAX_RESPONSE_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            # The IdP's error body (e.g. {"error": "invalid_grant"}) is the
-            # useful part of a failed exchange; keep it for the log.
-            try:
-                detail = exc.read(4096).decode("utf-8", "replace")
-            except Exception:
-                detail = ""
-            oauth_error = None
-            try:
-                parsed_detail = json.loads(detail)
-                if isinstance(parsed_detail, dict) and isinstance(parsed_detail.get("error"), str):
-                    oauth_error = parsed_detail["error"]
-            except ValueError:
-                pass
-            raise IdentityError(
-                f"IdP returned HTTP {exc.code} from {url}: {detail}",
-                error="server_error", status=exc.code, oauth_error=oauth_error,
-            ) from exc
-        except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as exc:
-            # HTTPException: a truncated or malformed response (IncompleteRead,
-            # BadStatusLine) must become a server_error redirect, not a 500.
-            raise IdentityError(f"IdP request to {url} failed: {exc}", error="server_error") from exc
-        if len(body) > _MAX_RESPONSE_BYTES:
-            raise IdentityError(f"IdP response from {url} exceeds {_MAX_RESPONSE_BYTES} bytes", error="server_error")
-        try:
-            parsed = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise IdentityError(f"IdP response from {url} is not JSON", error="server_error") from exc
-        if not isinstance(parsed, dict):
-            raise IdentityError(f"IdP response from {url} is not a JSON object", error="server_error")
-        return parsed
+        return _http_json(url, form, headers)
 
     async def _fetch(self, url: str, form: Optional[dict] = None, headers: Optional[dict] = None) -> dict:
         return await asyncio.to_thread(self.fetch_json, url, form, headers)
@@ -688,32 +729,7 @@ class IdentityProvider:
         kid = header.get("kid")
         jwk = await self._signing_key(kid if isinstance(kid, str) else None, kty)
 
-        signing_input = f"{header_b64}.{payload_b64}".encode()
-        try:
-            if kty == "RSA":
-                public_key = rsa.RSAPublicNumbers(_b64url_int(jwk["e"]), _b64url_int(jwk["n"])).public_key()
-                pad = (
-                    padding.PKCS1v15() if family == "RSA"
-                    else padding.PSS(mgf=padding.MGF1(hash_cls()), salt_length=hash_cls.digest_size)
-                )
-                public_key.verify(signature, signing_input, pad, hash_cls())
-            else:
-                if jwk.get("crv") != curve:
-                    raise IdentityError(f"id_token alg {alg} does not match key curve {jwk.get('crv')!r}")
-                curve_cls, size = _EC_CURVES[curve]
-                public_key = ec.EllipticCurvePublicNumbers(
-                    _b64url_int(jwk["x"]), _b64url_int(jwk["y"]), curve_cls()
-                ).public_key()
-                # JWS carries ECDSA signatures as raw r||s, not DER.
-                if len(signature) != 2 * size:
-                    raise IdentityError("id_token ECDSA signature has the wrong length")
-                r = int.from_bytes(signature[:size], "big")
-                s = int.from_bytes(signature[size:], "big")
-                public_key.verify(encode_dss_signature(r, s), signing_input, ec.ECDSA(hash_cls()))
-        except InvalidSignature as exc:
-            raise IdentityError("id_token signature is invalid") from exc
-        except (KeyError, TypeError, ValueError) as exc:
-            raise IdentityError(f"IdP signing key is unusable: {exc}") from exc
+        _verify_jws_signature(header_b64, payload_b64, signature, alg, jwk, "id_token")
 
         if claims.get("iss") != self.issuer:
             raise IdentityError(f"id_token iss {claims.get('iss')!r} is not {self.issuer!r}")

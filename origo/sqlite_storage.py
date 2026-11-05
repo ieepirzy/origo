@@ -620,6 +620,27 @@ class SQLiteOAuthStorage:
 
     # --- Sealed IdP refresh tokens ---
 
+    def claim_once(self, key: str, ttl: float) -> bool:
+        """Mark key used for ttl seconds. True the first time; False while an
+        earlier claim of the same key is live (a replayed assertion jti).
+        One transaction, so two workers presenting the same jti can't both win."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = _mem._now()
+                row = self._conn.execute("SELECT expires_at FROM idp_tokens WHERE key = ?", (key,)).fetchone()
+                if row is not None and now <= row["expires_at"]:
+                    self._conn.execute("COMMIT")
+                    return False
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO idp_tokens (key, sealed, expires_at) VALUES (?, '', ?)", (key, now + ttl)
+                )
+                self._conn.execute("COMMIT")
+                return True
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def store_idp_token(self, key: str, sealed: str, ttl: float) -> None:
         """Keep a sealed IdP refresh token under key (replacing any) for ttl seconds."""
         with self._lock:

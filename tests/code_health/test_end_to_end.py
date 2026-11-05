@@ -43,7 +43,7 @@ def test_the_artifact_validates(snapshot):
 
 def test_the_artifact_measures_this_package(snapshot):
     assert snapshot["target"]["paths"] == ["origo"]
-    assert snapshot["summary"]["files"] == 7
+    assert snapshot["summary"]["files"] == 9
     assert snapshot["summary"]["functions"] > 50
 
 

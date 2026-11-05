@@ -22,6 +22,7 @@ from .endpoints import (
     userinfo,
 )
 from .middleware import OAuthMiddleware
+from .idjag import ManagedSignIn
 from .oidc import IdentityProvider
 from .sqlite_storage import SQLiteOAuthStorage
 from .storage import OAuthStorage
@@ -172,6 +173,13 @@ class OAuthProvider:
                              would otherwise mint unlisted clients at will — and
                              already-registered CIMD clients not on the list are
                              refused. Pre-registered clients are unaffected.
+        managed_sign_in:     An origo.ManagedSignIn: accept ID-JAG assertions from
+                             one trusted issuer (claude.ai's managed authorization)
+                             at /token as the jwt-bearer grant. Requires
+                             identity_provider (the person is looked up there and
+                             its allow gate applies) and cimd_allowed_clients (the
+                             only clients that may present assertions). See
+                             origo/idjag.py.
     """
 
     def __init__(
@@ -199,6 +207,7 @@ class OAuthProvider:
         identity_provider: Optional[IdentityProvider] = None,
         allow_unauthenticated_consent: Optional[bool] = None,
         cimd_allowed_clients: Optional[Iterable[str]] = None,
+        managed_sign_in: Optional[ManagedSignIn] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.public_registration = public_registration
@@ -231,6 +240,20 @@ class OAuthProvider:
                 "the connector platforms you use (e.g. ['claude.ai']), or pre-register "
                 "clients with clients= and turn public_registration off."
             )
+        if managed_sign_in is not None:
+            if not isinstance(managed_sign_in, ManagedSignIn):
+                raise TypeError("managed_sign_in must be an origo.ManagedSignIn")
+            if identity_provider is None:
+                raise ValueError(
+                    "OAuthProvider: managed_sign_in requires identity_provider — an assertion only "
+                    "names an email; the person is the identity provider's user with that email."
+                )
+            if not self.cimd_allowed_clients:
+                raise ValueError(
+                    "OAuthProvider: managed_sign_in requires cimd_allowed_clients (e.g. ['claude.ai']): "
+                    "only listed CIMD clients may present assertions."
+                )
+        self.managed_sign_in = managed_sign_in
         self._seeded_client_ids = frozenset(clients or {})
         self._log_authorization_mode()
 
@@ -372,6 +395,7 @@ class OAuthProvider:
         app.state.identity_provider = self.identity_provider
         app.state.allow_unauthenticated_consent = self.allow_unauthenticated_consent
         app.state.cimd_allowed_clients = self.cimd_allowed_clients
+        app.state.managed_sign_in = self.managed_sign_in
         app.state.seeded_client_ids = self._seeded_client_ids
         return app
 

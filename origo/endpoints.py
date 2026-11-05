@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from .idjag import JWT_BEARER, ManagedSignIn
 from .oidc import _USER_AGENT, IdentityError, IdentityProvider, IdentityRefused, TokenSealer, domain_matches, s256_challenge
 from .storage import FamilyRevokedError, OAuthStorage
 
@@ -372,7 +373,8 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "token_endpoint": f"{base_url}/token",
         "userinfo_endpoint": f"{base_url}/userinfo",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "grant_types_supported": ["authorization_code", "refresh_token"]
+        + ([JWT_BEARER] if getattr(request.app.state, "managed_sign_in", None) is not None else []),
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "code_challenge_methods_supported": ["S256"],
@@ -606,10 +608,34 @@ def _consent_page(params: dict, csrf_token: str) -> HTMLResponse:
     return response
 
 
+async def _register_cimd_client(app_state, storage: OAuthStorage, client_id: str) -> JSONResponse | None:
+    """Fetch and register a CIMD client_id URL's metadata document. Returns
+    the refusal to send, or None once the client is registered. Callers check
+    the cimd_allowed_clients allowlist first."""
+    custom_redirect_uri_schemes: frozenset[str] = app_state.custom_redirect_uri_schemes
+    metadata = await asyncio.to_thread(_fetch_client_metadata_document, client_id, allow_private_hosts=app_state.allow_private_cimd)
+    if metadata is None:
+        return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
+
+    redirect_uris = metadata.get("redirect_uris", [])
+    auth_method = metadata.get("token_endpoint_auth_method", "none")
+    if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
+        return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD metadata must declare a non-empty redirect_uris list."}, status_code=401)
+    if not all(_is_valid_redirect_uri(u, custom_redirect_uri_schemes) for u in redirect_uris):
+        return JSONResponse(
+            {"error": "unauthorized_client", "error_description": "CIMD redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes)},
+            status_code=401,
+        )
+    try:
+        storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
+    except ValueError as e:
+        return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=429)
+    return None
+
+
 async def authorize(request: Request) -> Response:
     storage: OAuthStorage = request.app.state.storage
     auto_approve: bool = request.app.state.auto_approve
-    allow_private_cimd: bool = request.app.state.allow_private_cimd
 
     if request.method == "GET":
         if len(request.query_params.multi_items()) != len(request.query_params.keys()):
@@ -682,23 +708,9 @@ async def authorize(request: Request) -> Response:
         return JSONResponse({"error": "unauthorized_client", "error_description": "Client is not allowed."}, status_code=401)
 
     if not storage.client_exists(client_id) and public_registration and client_is_https:
-        metadata = await asyncio.to_thread(_fetch_client_metadata_document, client_id, allow_private_hosts=allow_private_cimd)
-        if metadata is None:
-            return JSONResponse({"error": "unauthorized_client", "error_description": "Invalid client metadata document."}, status_code=401)
-
-        redirect_uris = metadata.get("redirect_uris", [])
-        auth_method = metadata.get("token_endpoint_auth_method", "none")
-        if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris) or auth_method not in _SUPPORTED_CIMD_AUTH_METHODS:
-            return JSONResponse({"error": "unauthorized_client", "error_description": "CIMD metadata must declare a non-empty redirect_uris list."}, status_code=401)
-        if not all(_is_valid_redirect_uri(u, custom_redirect_uri_schemes) for u in redirect_uris):
-            return JSONResponse(
-                {"error": "unauthorized_client", "error_description": "CIMD redirect_uris " + _redirect_uri_error_description(custom_redirect_uri_schemes)},
-                status_code=401,
-            )
-        try:
-            storage.register_client(client_id, None, redirect_uris, auth_method, metadata)
-        except ValueError as e:
-            return JSONResponse({"error": "server_error", "error_description": str(e)}, status_code=429)
+        refusal = await _register_cimd_client(request.app.state, storage, client_id)
+        if refusal is not None:
+            return refusal
 
     if not storage.client_exists(client_id):
         return JSONResponse({"error": "unauthorized_client"}, status_code=401)
@@ -1058,6 +1070,8 @@ async def token(request: Request) -> JSONResponse:
                 return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     grant_type = params.get("grant_type")
+    if grant_type == JWT_BEARER and getattr(request.app.state, "managed_sign_in", None) is not None:
+        return await _token_jwt_bearer(request, storage, params, client_id, client_secret)
     redirect_uri = params.get("redirect_uri")
     code = params.get("code")
     code_verifier = params.get("code_verifier")
@@ -1167,6 +1181,115 @@ async def token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant", "error_description": "Sign-in required."}, status_code=401)
 
     return _issue_tokens(request, storage, client_id, resource, scope, token_family, claims)
+
+
+def _no_store(body: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(body, status_code=status_code, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+async def _token_jwt_bearer(request: Request, storage: OAuthStorage, params: dict, client_id, client_secret) -> JSONResponse:
+    """The ID-JAG grant (origo/idjag.py): an assertion from the trusted issuer
+    for a person, presented by an allowlisted CIMD client, exchanged for an
+    access token of the identity provider's user with that email. No refresh
+    token: the client gets a fresh assertion instead, so a person removed from
+    the issuer's organization or from Keycloak stops at the next exchange."""
+    state = request.app.state
+    managed: ManagedSignIn = state.managed_sign_in
+    identity_provider: IdentityProvider = state.identity_provider
+    assertion = params.get("assertion")
+    if not client_id or not assertion:
+        return _no_store({"error": "invalid_request"}, 400)
+
+    # Only an allowlisted CIMD client may present assertions: never a seeded
+    # client (whose secret could sit anywhere) and never a self-registered one.
+    try:
+        is_https = urlparse(client_id).scheme == "https"
+    except ValueError:
+        is_https = False
+    if not is_https or not _cimd_client_allowed(client_id, state.cimd_allowed_clients or frozenset()):
+        logger.warning("token: jwt-bearer refused for client %r — not an allowlisted CIMD client.", client_id)
+        return _no_store({"error": "unauthorized_client"}, 401)
+    if not storage.client_exists(client_id) and state.public_registration:
+        refusal = await _register_cimd_client(state, storage, client_id)
+        if refusal is not None:
+            return refusal
+    if not storage.client_exists(client_id):
+        return _no_store({"error": "invalid_client"}, 401)
+    grant_types = (storage.get_client_metadata(client_id) or {}).get("grant_types")
+    if not isinstance(grant_types, list) or JWT_BEARER not in grant_types:
+        return _no_store({"error": "unauthorized_client", "error_description": "Client does not declare the jwt-bearer grant."}, 401)
+    if storage.get_client_auth_method(client_id) != "none":
+        if not client_secret or not storage.verify_client_secret(client_id, client_secret):
+            return _no_store({"error": "invalid_client"}, 401)
+
+    try:
+        claims = await managed.verify_assertion(assertion, audience=state.base_url, client_id=client_id)
+    except IdentityError as exc:
+        if exc.error == "server_error":
+            logger.error("token: jwt-bearer: assertion issuer unavailable: %s", exc)
+            return _no_store({"error": "temporarily_unavailable"}, 503)
+        logger.info("token: jwt-bearer: assertion refused for client %r: %s", client_id, exc)
+        return _no_store({"error": "invalid_grant"}, 400)
+
+    # The assertion's resource (if any) must be this server: an assertion for
+    # another resource is not one for us (draft §4.4.1).
+    own_resource = f"{state.base_url}{state.mcp_path}"
+    resource = params.get("resource")
+    claim_resource = claims.get("resource")
+    if claim_resource is not None:
+        claim_resources = [claim_resource] if isinstance(claim_resource, str) else claim_resource
+        if not isinstance(claim_resources, list) or claim_resources != [own_resource]:
+            return _no_store({"error": "invalid_grant", "error_description": "resource is not this server."}, 400)
+        if resource is not None and resource != own_resource:
+            return _no_store({"error": "invalid_grant", "error_description": "resource mismatch."}, 400)
+        resource = own_resource
+    elif resource is not None and resource != own_resource:
+        return _no_store({"error": "invalid_target"}, 400)
+
+    claim_scope = claims.get("scope")
+    if claim_scope is not None and not isinstance(claim_scope, str):
+        return _no_store({"error": "invalid_grant"}, 400)
+    scope = params.get("scope")
+    if scope is None:
+        # The assertion's scope narrowed to what this server supports: a
+        # scope another resource understands is not an error here.
+        supported = state.scopes_supported
+        scope = " ".join(
+            s for s in (claim_scope or "").split() if not supported or s in supported
+        )
+    elif claim_scope is not None and not set(scope.split()) <= set(claim_scope.split()):
+        return _no_store({"error": "invalid_scope"}, 400)
+    if not _validate_scope(scope, state.scopes_supported):
+        return _no_store({"error": "invalid_scope"}, 400)
+
+    # Single use, after every check that needs no side effect: a replayed
+    # assertion is refused even though it verifies.
+    replay_key, replay_ttl = managed.replay_key(claims)
+    if not storage.claim_once(replay_key, replay_ttl):
+        logger.warning("token: jwt-bearer: replayed assertion jti for client %r", client_id)
+        return _no_store({"error": "invalid_grant"}, 400)
+
+    try:
+        identity = await managed.resolve(identity_provider, claims["email"])
+    except IdentityRefused as exc:
+        logger.info("token: jwt-bearer: %s", exc)
+        return _no_store({"error": "invalid_grant", "error_description": "No matching account."}, 400)
+    except IdentityError as exc:
+        logger.error("token: jwt-bearer: identity provider unavailable: %s", exc)
+        return _no_store({"error": "temporarily_unavailable"}, 503)
+    identity["auth_time"] = int(time.time())
+
+    try:
+        access_token = storage.store_token(
+            client_id, resource=resource, scope=scope, family=secrets.token_urlsafe(16), claims=identity
+        )
+    except FamilyRevokedError:
+        return _no_store({"error": "invalid_grant"}, 400)
+    logger.info("token: jwt-bearer: issued for %r to client %r", identity["sub"], client_id)
+    body = {"access_token": access_token, "token_type": "bearer", "expires_in": storage.token_ttl}
+    if scope:
+        body["scope"] = scope
+    return _no_store(body)
 
 
 async def _refresh_with_recheck(
