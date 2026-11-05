@@ -1216,6 +1216,14 @@ async def _token_jwt_bearer(request: Request, storage: OAuthStorage, params: dic
     if not storage.client_exists(client_id):
         return _no_store({"error": "invalid_client"}, 401)
     grant_types = (storage.get_client_metadata(client_id) or {}).get("grant_types")
+    if (not isinstance(grant_types, list) or JWT_BEARER not in grant_types) and state.public_registration:
+        # A record stored before the client's document declared the grant
+        # (CIMD clients are persisted for client_ttl): fetch the document
+        # again, once, rather than refuse until the record expires.
+        refusal = await _register_cimd_client(state, storage, client_id)
+        if refusal is not None:
+            return refusal
+        grant_types = (storage.get_client_metadata(client_id) or {}).get("grant_types")
     if not isinstance(grant_types, list) or JWT_BEARER not in grant_types:
         return _no_store({"error": "unauthorized_client", "error_description": "Client does not declare the jwt-bearer grant."}, 401)
     if storage.get_client_auth_method(client_id) != "none":
