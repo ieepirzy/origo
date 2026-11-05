@@ -506,3 +506,22 @@ async def test_group_paths_emit_full_paths_only(http, issuer, keycloak):
     client = await http(provider)
     # The bare name is not granted where the realm emits full paths.
     assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+async def test_a_stale_stored_client_record_is_refreshed_from_its_document(http, issuer, keycloak, monkeypatch):
+    """A claude.ai record persisted before its document declared jwt-bearer
+    is re-fetched once, not refused until the record expires."""
+    provider = make_provider(issuer, keycloak)
+    old = {**CLAUDE_CIMD, "grant_types": ["authorization_code", "refresh_token"]}
+    provider.storage.register_client(CLAUDE, None, old["redirect_uris"], "none", old)
+    fetches = []
+
+    def fetch(client_id, allow_private_hosts=False):
+        fetches.append(client_id)
+        return dict(CLAUDE_CIMD)
+    monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fetch)
+    client = await http(provider)
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert fetches == [CLAUDE]
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert fetches == [CLAUDE]  # fresh record now: no second fetch
