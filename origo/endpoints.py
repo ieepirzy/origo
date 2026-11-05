@@ -1232,19 +1232,32 @@ async def _token_jwt_bearer(request: Request, storage: OAuthStorage, params: dic
         logger.info("token: jwt-bearer: assertion refused for client %r: %s", client_id, exc)
         return _no_store({"error": "invalid_grant"}, 400)
 
+    # The assertion's resource (if any) must be this server: an assertion for
+    # another resource is not one for us (draft §4.4.1).
+    own_resource = f"{state.base_url}{state.mcp_path}"
     resource = params.get("resource")
     claim_resource = claims.get("resource")
     if claim_resource is not None:
-        if not isinstance(claim_resource, str) or (resource is not None and resource != claim_resource):
+        claim_resources = [claim_resource] if isinstance(claim_resource, str) else claim_resource
+        if not isinstance(claim_resources, list) or claim_resources != [own_resource]:
+            return _no_store({"error": "invalid_grant", "error_description": "resource is not this server."}, 400)
+        if resource is not None and resource != own_resource:
             return _no_store({"error": "invalid_grant", "error_description": "resource mismatch."}, 400)
-        resource = claim_resource
+        resource = own_resource
+    elif resource is not None and resource != own_resource:
+        return _no_store({"error": "invalid_target"}, 400)
 
     claim_scope = claims.get("scope")
     if claim_scope is not None and not isinstance(claim_scope, str):
         return _no_store({"error": "invalid_grant"}, 400)
     scope = params.get("scope")
     if scope is None:
-        scope = claim_scope or ""
+        # The assertion's scope narrowed to what this server supports: a
+        # scope another resource understands is not an error here.
+        supported = state.scopes_supported
+        scope = " ".join(
+            s for s in (claim_scope or "").split() if not supported or s in supported
+        )
     elif claim_scope is not None and not set(scope.split()) <= set(claim_scope.split()):
         return _no_store({"error": "invalid_scope"}, 400)
     if not _validate_scope(scope, state.scopes_supported):

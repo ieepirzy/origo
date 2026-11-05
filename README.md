@@ -225,6 +225,7 @@ auth = OAuthProvider(
         # "Claude-issued", the Issuer URL it shows (one per organization).
         issuer="https://identity.anthropic.com/issuers/iss_...",
         tenant=None,  # or the Tenant ID you entered there
+        group_paths=False,  # match the realm's group mapper "Full group path"
     ),
 )
 ```
@@ -235,16 +236,25 @@ issuer (`base_url`); `client_id` is the client calling `/token`, which must be
 on `cimd_allowed_clients` and declare the grant in its metadata document;
 `exp`, `iat` (no older than `max_assertion_age`, 300 s), `nbf`; `jti` is single
 use (persisted, so replay is refused across restarts); `aud_tenant` when a
-tenant is configured.
+tenant is configured; `resource`, if present, is this server; the email is
+plain ASCII. Non-finite times (`NaN`, `Infinity`) are refused.
+
+Assertions are **not sender-constrained**: claude.ai's client is public and
+the issuer does not bind them, so a leaked assertion could be redeemed once
+within `max_assertion_age`. An assertion that carries `cnf` is refused, since
+origo cannot verify the binding.
 
 **Who the token is for.** The assertion only says "a member of this
 organization, with this email". The token is for the one **enabled** Keycloak
-user whose **verified** email matches, with the same subject
+user whose **verified** email matches, with no pending required actions and
+no brute-force lockout, with the same subject
 (`<issuer>|<keycloak id>`), groups and allow gate as an interactive sign-in. No
 such user (or two) means `invalid_grant`: managed sign-in never creates
 identities. The lookup uses the identity provider's own client with the
 client-credentials grant, so the Keycloak client needs **Service accounts**
-enabled and the realm-management role **view-users**.
+enabled and the realm-management role **view-users**. Browser-flow policies
+(conditional access in a custom authentication flow) do not apply to this
+path; the allow gate does.
 
 No refresh token is issued: claude.ai asks for a fresh assertion, so removing
 someone from the organization or disabling them in Keycloak stops them at

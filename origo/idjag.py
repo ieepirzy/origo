@@ -38,6 +38,7 @@ realm-management role ``view-users``.
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Optional
 from urllib.parse import quote, urlencode
@@ -83,9 +84,22 @@ class ManagedSignIn:
         max_assertion_age: Seconds an assertion is accepted for after its
                            ``iat``, whatever its ``exp``. Default 300.
         clock_skew:        Leeway in seconds for ``exp``/``iat``. Default 60.
+        group_paths:       Emit the person's groups as full paths (``/a/b``)
+                           rather than names (``b``): set it to match the
+                           realm's group mapper "Full group path", so the
+                           groups (and the allow gate) are exactly what an
+                           interactive sign-in gets. Default False (names).
+
+    Assertions are not sender-constrained: claude.ai's client is public
+    (``token_endpoint_auth_method: none``) and the issuer does not bind them
+    (no ``cnf``), so a leaked assertion could be redeemed once by anyone
+    within its lifetime. The window is ``max_assertion_age`` and the ``jti``
+    is single-use. An assertion that does carry ``cnf`` is refused, since
+    origo cannot verify the binding it asks for.
     """
 
-    def __init__(self, issuer: str, tenant: Optional[str] = None, max_assertion_age: int = 300, clock_skew: int = 60):
+    def __init__(self, issuer: str, tenant: Optional[str] = None, max_assertion_age: int = 300, clock_skew: int = 60,
+                 group_paths: bool = False):
         if not issuer:
             raise ValueError("ManagedSignIn requires issuer")
         _require_secure_url(issuer, "ManagedSignIn issuer")
@@ -95,6 +109,7 @@ class ManagedSignIn:
         self.tenant = tenant
         self.max_assertion_age = max_assertion_age
         self.clock_skew = clock_skew
+        self.group_paths = bool(group_paths)
         self._metadata: Optional[dict] = None
         self._metadata_fetched_at = 0.0
         self._metadata_retry_after = 0.0
@@ -198,7 +213,7 @@ class ManagedSignIn:
         if not isinstance(typ, str) or typ.lower() != ID_JAG_TYP:
             raise IdentityError(f"assertion typ {typ!r} is not {ID_JAG_TYP!r}")
         alg = header.get("alg")
-        if alg not in _ALGORITHMS:
+        if not isinstance(alg, str) or alg not in _ALGORITHMS:
             raise IdentityError(f"assertion alg {alg!r} is not accepted")
         if "crit" in header:
             raise IdentityError("assertion carries crit header parameters origo does not understand")
@@ -239,11 +254,20 @@ class ManagedSignIn:
         for name in ("sub", "email"):
             if not isinstance(claims.get(name), str) or not claims[name]:
                 raise IdentityError(f"assertion has no {name}")
+        # Matched exactly against Keycloak's stored (lowercased) email: ASCII
+        # only, so no Unicode case folding (the Kelvin sign) can make two
+        # addresses equal.
+        if not claims["email"].isascii() or "@" not in claims["email"]:
+            raise IdentityError("assertion email is not a plain ASCII address")
+        if "cnf" in claims:
+            raise IdentityError("assertion is sender-constrained (cnf), which origo cannot verify")
         return claims
 
     def replay_key(self, claims: dict) -> tuple[str, float]:
         """Storage key and lifetime (seconds) that make claims' jti single-use."""
-        ttl = max(float(claims["exp"]) - time.time(), 0.0) + self.clock_skew
+        # Capped: an assertion is accepted for at most max_assertion_age past
+        # its iat, so the record need not outlive that whatever exp says.
+        ttl = min(max(float(claims["exp"]) - time.time(), 0.0), float(self.max_assertion_age)) + 2 * self.clock_skew
         return f"idjag-jti:{self.issuer}|{claims['jti']}", ttl
 
     # --- The person, from Keycloak ---
@@ -264,24 +288,28 @@ class ManagedSignIn:
             and u.get("enabled") is True
             and u.get("emailVerified") is True
             and isinstance(u.get("email"), str)
-            and u["email"].lower() == email.lower()
+            and u["email"] == email.lower()
+            # A sign-in Keycloak would stop at a required action (verify
+            # email, set up OTP, new password, terms) is not issued here.
+            and not u.get("requiredActions")
             and isinstance(u.get("id"), str) and u["id"]
         ]
         if len(matches) != 1:
             raise IdentityRefused(f"no single enabled Keycloak user with verified email {email!r} ({len(matches)} found)")
         user = matches[0]
+        # A temporary brute-force lockout leaves the user enabled.
+        status = await self._fetch(f"{admin}/attack-detection/brute-force/users/{quote(user['id'], safe='')}", headers=auth)
+        if status.get("disabled") is not False:
+            raise IdentityRefused(f"Keycloak user {user['id']!r} is locked out (brute-force detection)")
         groups = await self._fetch_list(f"{admin}/users/{quote(user['id'], safe='')}/groups", headers=auth)
-        # Both the name and the full path: Keycloak's group mapper emits one
-        # or the other ("Full group path"), and the gate's allowed_groups is
-        # written for whichever the realm uses. A name alone is what the
-        # mapper emits for a nested group without the full path too.
+        # One form, the one the realm's group mapper emits (group_paths), so
+        # the groups are exactly an interactive sign-in's.
+        key = "path" if self.group_paths else "name"
         names: list[str] = []
         for group in groups:
-            if isinstance(group, dict):
-                for key in ("path", "name"):
-                    value = group.get(key)
-                    if isinstance(value, str) and value and value not in names:
-                        names.append(value)
+            value = group.get(key) if isinstance(group, dict) else None
+            if isinstance(value, str) and value and value not in names:
+                names.append(value)
         name = " ".join(p for p in (user.get("firstName"), user.get("lastName")) if isinstance(p, str) and p)
         upstream = {"sub": user["id"], "email": user["email"], "email_verified": True, "groups": names}
         if name:
@@ -305,8 +333,10 @@ class ManagedSignIn:
 
 
 def _number(value, name: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise IdentityError(f"assertion has no numeric {name}")
+    # NaN and Infinity parse as JSON numbers in Python and compare False with
+    # everything: they would pass every time check.
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise IdentityError(f"assertion has no finite numeric {name}")
     return float(value)
 
 

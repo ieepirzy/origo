@@ -18,6 +18,8 @@ import pytest_asyncio
 from cryptography.hazmat.primitives import hashes, hmac as crypto_hmac
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from urllib.parse import parse_qs, urlparse
+
 from httpx import ASGITransport, AsyncClient
 
 from origo import IdentityError, IdentityProvider, ManagedSignIn, OAuthProvider
@@ -95,6 +97,7 @@ class FakeKeycloak:
         self.token_requests = 0
         self.searches: list[str] = []
         self.down = False
+        self.locked: set[str] = set()
 
     def fetch_json(self, url, form=None, headers=None, allow_list=False):
         if self.down:
@@ -113,7 +116,12 @@ class FakeKeycloak:
         if url.startswith(f"{admin}/users?"):
             self.searches.append(url)
             assert "exact=true" in url
-            return [u for u in self.users if u["email"].lower() in url.lower().replace("%40", "@")]
+            # As Keycloak: the decoded search value, lowercased, exact.
+            wanted = parse_qs(urlparse(url).query)["email"][0].lower()
+            return [u for u in self.users if u["email"].lower() == wanted]
+        if url.startswith(f"{admin}/attack-detection/brute-force/users/"):
+            uid = url.rsplit("/", 1)[1]
+            return {"disabled": uid in self.locked, "numFailures": 0}
         if url.startswith(f"{admin}/users/") and url.endswith("/groups"):
             return self.groups.get(url[len(f"{admin}/users/"):-len("/groups")], [])
         raise AssertionError(f"unexpected Keycloak request {url}")
@@ -136,12 +144,12 @@ def _claude_cimd(monkeypatch):
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fetch)
 
 
-def make_provider(issuer, keycloak, tenant=None, idp_kwargs=None, managed=True, **kwargs):
+def make_provider(issuer, keycloak, tenant=None, idp_kwargs=None, managed=True, group_paths=False, **kwargs):
     idp = IdentityProvider(issuer=KC_ISSUER, client_id="origo", client_secret="idp-secret", **(idp_kwargs or {}))
     idp.fetch_json = keycloak.fetch_json
     msi = None
     if managed:
-        msi = ManagedSignIn(issuer=JAG_ISSUER, tenant=tenant)
+        msi = ManagedSignIn(issuer=JAG_ISSUER, tenant=tenant, group_paths=group_paths)
         msi.fetch_json = lambda url, form=None, headers=None, allow_list=False: (
             issuer.fetch_json(url, form, headers, allow_list) if url.startswith(JAG_ISSUER)
             else keycloak.fetch_json(url, form, headers, allow_list)
@@ -190,7 +198,8 @@ async def test_assertion_is_exchanged_for_the_keycloak_users_token(http, issuer,
     assert meta["claims"]["sub"] == f"{KC_ISSUER}|kc-ada"
     assert meta["claims"]["email"] == "ada@muutto365.fi"
     assert meta["claims"]["name"] == "Ada Lovelace"
-    assert "/staff" in meta["claims"]["groups"]
+    # Names, as the realm's mapper emits them (full.path false): one form only.
+    assert meta["claims"]["groups"] == ["staff"]
     assert meta["client_id"] == CLAUDE
 
 
@@ -379,7 +388,7 @@ async def test_two_keycloak_users_with_the_email_is_ambiguous_and_refused(http, 
 
 
 async def test_the_allow_gate_applies(http, issuer, keycloak):
-    client = await http(make_provider(issuer, keycloak, idp_kwargs={"allowed_groups": ["/admins"]}))
+    client = await http(make_provider(issuer, keycloak, idp_kwargs={"allowed_groups": ["admins"]}))
     assert (await grant(client, issuer.assertion())).status_code == 400
     keycloak.groups["kc-ada"].append({"name": "admins", "path": "/admins"})
     assert (await grant(client, issuer.assertion())).status_code == 200
@@ -420,3 +429,80 @@ async def test_the_resource_binds_the_token(http, issuer, keycloak):
     assert provider.storage.verify_token(resp.json()["access_token"])["resource"] == f"{BASE}/mcp"
     mismatch = await grant(client, issuer.assertion(resource=f"{BASE}/mcp"), resource="https://other.example/mcp")
     assert mismatch.status_code == 400
+
+
+# --- Review findings (origo#149) ---
+
+async def test_a_non_string_alg_is_refused_not_a_500(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    head = _b64json({"alg": ["ES256"], "typ": "oauth-id-jag+jwt"})
+    resp = await grant(client, f"{head}.{_b64json({'iss': JAG_ISSUER})}.AA")
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.parametrize("change", [
+    {"iat": float("nan")}, {"exp": float("inf")}, {"exp": float("nan")},
+])
+async def test_non_finite_times_are_refused(http, issuer, keycloak, change):
+    client = await http(make_provider(issuer, keycloak))
+    resp = await grant(client, issuer.assertion(**change))
+    assert resp.status_code == 400, change
+
+
+async def test_the_replay_record_is_capped_but_covers_the_acceptance_window(issuer):
+    msi = ManagedSignIn(issuer=JAG_ISSUER)
+    now = time.time()
+    _, ttl = msi.replay_key({"jti": "j", "exp": now + 10 * 365 * 86400, "iat": now})
+    assert msi.max_assertion_age <= ttl <= msi.max_assertion_age + 2 * msi.clock_skew
+
+
+async def test_a_sender_constrained_assertion_is_refused(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    resp = await grant(client, issuer.assertion(cnf={"jkt": "abc"}))
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("email", ["\u212aate@muutto365.fi", "ada"])
+async def test_a_non_ascii_or_malformed_email_is_refused(http, issuer, keycloak, email):
+    keycloak.users[0]["email"] = "kate@muutto365.fi"
+    client = await http(make_provider(issuer, keycloak))
+    assert (await grant(client, issuer.assertion(email=email))).status_code == 400
+
+
+async def test_the_email_matches_case_insensitively_against_keycloaks_stored_form(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    assert (await grant(client, issuer.assertion(email="Ada@Muutto365.fi"))).status_code == 200
+
+
+async def test_a_user_with_pending_required_actions_is_refused(http, issuer, keycloak):
+    keycloak.users[0]["requiredActions"] = ["CONFIGURE_TOTP"]
+    client = await http(make_provider(issuer, keycloak))
+    assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+async def test_a_brute_force_locked_user_is_refused(http, issuer, keycloak):
+    keycloak.locked.add("kc-ada")
+    client = await http(make_provider(issuer, keycloak))
+    assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+async def test_an_assertion_for_another_resource_is_refused(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    resp = await grant(client, issuer.assertion(resource="https://other.example/mcp"))
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+    target = await grant(client, issuer.assertion(), resource="https://other.example/mcp")
+    assert target.status_code == 400 and target.json()["error"] == "invalid_target"
+
+
+async def test_unsupported_assertion_scopes_are_dropped_not_fatal(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    resp = await grant(client, issuer.assertion(scope="mcp offline_access other:thing"))
+    assert resp.status_code == 200 and resp.json()["scope"] == "mcp"
+
+
+async def test_group_paths_emit_full_paths_only(http, issuer, keycloak):
+    keycloak.groups["kc-ada"] = [{"name": "admins", "path": "/contractors/admins"}]
+    provider = make_provider(issuer, keycloak, group_paths=True, idp_kwargs={"allowed_groups": ["admins"]})
+    client = await http(provider)
+    # The bare name is not granted where the realm emits full paths.
+    assert (await grant(client, issuer.assertion())).status_code == 400
