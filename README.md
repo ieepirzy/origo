@@ -256,6 +256,13 @@ enabled and the realm-management role **view-users**. Browser-flow policies
 (conditional access in a custom authentication flow) do not apply to this
 path; the allow gate does.
 
+**Keycloak's admin API inside the cluster.** If Keycloak exposes only
+`/realms` publicly, point the lookup at its Service:
+`ManagedSignIn(..., directory_url="http://keycloak.keycloak.svc.cluster.local:8080")`,
+or set `ORIGO_MANAGED_SIGNIN_DIRECTORY_URL`. Plain http is accepted only for
+a `*.svc.cluster.local` name; the client-credentials token still comes from
+the issuer's token endpoint.
+
 No refresh token is issued: claude.ai asks for a fresh assertion, so removing
 someone from the organization or disabling them in Keycloak stops them at
 their next exchange (at most one `token_ttl`).

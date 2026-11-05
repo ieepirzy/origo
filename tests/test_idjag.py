@@ -525,3 +525,59 @@ async def test_a_stale_stored_client_record_is_refreshed_from_its_document(http,
     assert fetches == [CLAUDE]
     assert (await grant(client, issuer.assertion())).status_code == 200
     assert fetches == [CLAUDE]  # fresh record now: no second fetch
+
+
+# --- directory_url: Keycloak's admin API inside the cluster ---
+
+DIRECTORY = "http://keycloak.keycloak.svc.cluster.local:8080"
+
+
+async def test_the_lookup_goes_to_the_directory_url_when_set(http, issuer, keycloak, monkeypatch):
+    """A Keycloak exposing only /realms publicly: the admin API is reached at
+    its Service; the token still comes from the issuer's token endpoint."""
+    seen = []
+    real = keycloak.fetch_json
+
+    def fetch(url, form=None, headers=None, allow_list=False):
+        seen.append(url)
+        if url.startswith(DIRECTORY + "/admin/"):
+            url = "https://auth.example" + url[len(DIRECTORY):]
+        elif url.startswith("https://auth.example/admin/"):
+            raise IdentityError("public admin path: 404", error="server_error")
+        return real(url, form, headers, allow_list)
+    keycloak.fetch_json = fetch
+    provider = make_provider(issuer, keycloak)
+    provider.managed_sign_in.directory_url = DIRECTORY
+    client = await http(provider)
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert any(u.startswith(DIRECTORY + "/admin/realms/staff/users?") for u in seen)
+    assert f"{KC_ISSUER}/token" in seen
+
+
+def test_directory_url_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_URL", DIRECTORY + "/")
+    assert ManagedSignIn(issuer=JAG_ISSUER).directory_url == DIRECTORY
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_URL")
+    assert ManagedSignIn(issuer=JAG_ISSUER).directory_url is None
+
+
+@pytest.mark.parametrize("url", [
+    "http://keycloak.example.com:8080",       # plain http off the cluster
+    "http://keycloak:8080",                   # not a full Service name
+    "http://user:pw@keycloak.keycloak.svc.cluster.local",
+    "https://keycloak.example.com/admin",     # a path
+    "ftp://keycloak.keycloak.svc.cluster.local",
+])
+def test_a_bad_directory_url_is_refused(url):
+    with pytest.raises(ValueError):
+        ManagedSignIn(issuer=JAG_ISSUER, directory_url=url)
+
+
+def test_only_directory_urls_may_be_plain_http():
+    """The issuer's own endpoints stay https-only even with a directory set."""
+    from origo.oidc import _http_json
+    msi = ManagedSignIn(issuer=JAG_ISSUER, directory_url=DIRECTORY)
+    with pytest.raises(ValueError):
+        msi.fetch_json("http://identity.example/issuers/iss_test/jwks.json")
+    with pytest.raises(ValueError):
+        _http_json("http://keycloak.keycloak.svc.cluster.local:8080/x")

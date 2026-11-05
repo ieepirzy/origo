@@ -300,12 +300,27 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _http_json(url: str, form: Optional[dict] = None, headers: Optional[dict] = None, allow_list: bool = False):
+def _is_cluster_service_url(url: str) -> bool:
+    """http://<service>.<namespace>.svc.cluster.local[:port]/...: a Kubernetes
+    Service's in-cluster name, which never leaves the cluster network."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "http" and host.endswith(".svc.cluster.local") and host.count(".") >= 4 \
+        and not parsed.username and not parsed.password
+
+
+def _http_json(url: str, form: Optional[dict] = None, headers: Optional[dict] = None, allow_list: bool = False,
+               allow_cluster_http: bool = False):
     """GET (or, with ``form``, POST form-encoded) ``url`` and return its JSON
     object (or, with ``allow_list``, array). Raises IdentityError on any
     transport, status or decoding failure. Redirects are refused. Synchronous;
-    callers use a worker thread."""
-    _require_secure_url(url, "IdP endpoint")
+    callers use a worker thread. ``allow_cluster_http`` also admits plain
+    http to an in-cluster Service name (see _is_cluster_service_url)."""
+    if not (allow_cluster_http and _is_cluster_service_url(url)):
+        _require_secure_url(url, "IdP endpoint")
     # An explicit User-Agent: Cloudflare's default bot rules answer 403 to
     # urllib's "Python-urllib/x.y" (observed in front of the first
     # Keycloak this was deployed against), which would fail every sign-in.
