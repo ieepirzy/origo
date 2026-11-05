@@ -39,9 +39,10 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from typing import Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 from .oidc import (
     _ALGORITHMS,
@@ -50,6 +51,7 @@ from .oidc import (
     IdentityRefused,
     _b64url_decode,
     _http_json,
+    _is_cluster_service_url,
     _JWKS_REFETCH_INTERVAL,
     _JWKS_TTL,
     _DISCOVERY_TTL,
@@ -89,6 +91,16 @@ class ManagedSignIn:
                            realm's group mapper "Full group path", so the
                            groups (and the allow gate) are exactly what an
                            interactive sign-in gets. Default False (names).
+        directory_url:     Where origo reaches Keycloak's admin API for the
+                           lookup, when that is not the issuer's host: a
+                           Keycloak that exposes only /realms publicly (the
+                           admin API inside the cluster only) is reached at
+                           its Service, e.g.
+                           ``http://keycloak.keycloak.svc.cluster.local:8080``.
+                           https, or plain http to a ``*.svc.cluster.local``
+                           name only. Default: the
+                           ``ORIGO_MANAGED_SIGNIN_DIRECTORY_URL`` environment
+                           variable, else the issuer's own host.
 
     Assertions are not sender-constrained: claude.ai's client is public
     (``token_endpoint_auth_method: none``) and the issuer does not bind them
@@ -99,7 +111,7 @@ class ManagedSignIn:
     """
 
     def __init__(self, issuer: str, tenant: Optional[str] = None, max_assertion_age: int = 300, clock_skew: int = 60,
-                 group_paths: bool = False):
+                 group_paths: bool = False, directory_url: Optional[str] = None):
         if not issuer:
             raise ValueError("ManagedSignIn requires issuer")
         _require_secure_url(issuer, "ManagedSignIn issuer")
@@ -110,6 +122,15 @@ class ManagedSignIn:
         self.max_assertion_age = max_assertion_age
         self.clock_skew = clock_skew
         self.group_paths = bool(group_paths)
+        if directory_url is None:
+            directory_url = os.environ.get("ORIGO_MANAGED_SIGNIN_DIRECTORY_URL", "").strip() or None
+        if directory_url is not None:
+            directory_url = directory_url.rstrip("/")
+            if not _is_cluster_service_url(directory_url):
+                _require_secure_url(directory_url, "ManagedSignIn directory_url")
+            if urlparse(directory_url).path not in ("", "/") or urlparse(directory_url).query:
+                raise ValueError("ManagedSignIn directory_url is a scheme, host and port only")
+        self.directory_url = directory_url
         self._metadata: Optional[dict] = None
         self._metadata_fetched_at = 0.0
         self._metadata_retry_after = 0.0
@@ -122,7 +143,8 @@ class ManagedSignIn:
     # --- HTTP (the one seam tests replace) ---
 
     def fetch_json(self, url: str, form: Optional[dict] = None, headers: Optional[dict] = None, allow_list: bool = False):
-        return _http_json(url, form, headers, allow_list=allow_list)
+        in_directory = self.directory_url is not None and url.startswith(self.directory_url + "/")
+        return _http_json(url, form, headers, allow_list=allow_list, allow_cluster_http=in_directory)
 
     async def _fetch(self, url: str, form: Optional[dict] = None, headers: Optional[dict] = None) -> dict:
         result = await asyncio.to_thread(self.fetch_json, url, form, headers, False)
@@ -277,7 +299,7 @@ class ManagedSignIn:
         email, gate applied. Raises IdentityRefused when there is no such user
         (or more than one), IdentityError(server_error) when Keycloak could not
         be asked."""
-        admin = _keycloak_admin_base(identity_provider.issuer)
+        admin = _keycloak_admin_base(identity_provider.issuer, self.directory_url)
         token = await self._admin_access_token(identity_provider)
         auth = {"Authorization": f"Bearer {token}"}
         query = urlencode({"email": email, "exact": "true", "briefRepresentation": "false"})
@@ -340,10 +362,11 @@ def _number(value, name: str) -> float:
     return float(value)
 
 
-def _keycloak_admin_base(issuer: str) -> str:
-    """``https://host/realms/r`` -> ``https://host/admin/realms/r``."""
+def _keycloak_admin_base(issuer: str, directory_url: Optional[str] = None) -> str:
+    """``https://host/realms/r`` -> ``https://host/admin/realms/r``, or
+    ``<directory_url>/admin/realms/r`` when one is configured."""
     marker = "/realms/"
     if issuer.count(marker) != 1:
         raise IdentityError(f"identity provider issuer {issuer!r} is not a Keycloak realm URL", error="server_error")
     host, realm = issuer.split(marker)
-    return f"{host}/admin/realms/{realm.rstrip('/')}"
+    return f"{directory_url or host}/admin/realms/{realm.rstrip('/')}"
