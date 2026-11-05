@@ -483,6 +483,16 @@ class OAuthStorage:
 
     # --- Sealed IdP refresh tokens ---
 
+    def claim_once(self, key: str, ttl: float) -> bool:
+        """Mark key used for ttl seconds. True the first time; False while an
+        earlier claim of the same key is live (a replayed assertion jti)."""
+        self._cleanup_expired()
+        entry = self._idp_tokens.get(key)
+        if entry is not None and _now() <= entry["expires_at"]:
+            return False
+        self._idp_tokens[key] = {"sealed": "", "expires_at": _now() + ttl}
+        return True
+
     def store_idp_token(self, key: str, sealed: str, ttl: float) -> None:
         """Keep a sealed IdP refresh token under key (replacing any) for ttl seconds."""
         self._cleanup_expired()
