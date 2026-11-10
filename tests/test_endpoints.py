@@ -733,6 +733,27 @@ async def test_token_invalid_client_secret(client_private):
 
 
 @pytest.mark.asyncio
+async def test_token_multiple_auth_methods(client_private):
+    client, provider = client_private
+    verifier, challenge = make_pkce_pair()
+    code = provider.storage.store_code("test-client", "https://example.com/cb", challenge, "S256")
+    credentials = base64.b64encode(b"test-client:test-secret").decode()
+    resp = await client.post("/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": "https://example.com/cb",
+            "client_id": "test-client",
+            "client_secret": "test-secret"
+        },
+        headers={"Authorization": f"Basic {credentials}"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+
+
+@pytest.mark.asyncio
 async def test_token_basic_auth(client_private):
     client, provider = client_private
     verifier, challenge = make_pkce_pair()
