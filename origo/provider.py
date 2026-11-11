@@ -411,6 +411,8 @@ class OAuthProvider:
         ("<issuer>|<idp sub>"), plus email, name and groups when the IdP
         provided them. A token no person signed in for has no sub: the static
         user_subject identifies nobody and is never reported as a person here.
+        With ``IdentityProvider(extra_claims=...)``, ``idp_claims`` holds the
+        configured id_token claims the IdP issued (absent when it issued none).
         """
         meta = self.storage.verify_token(token)
         if meta is None:
@@ -420,7 +422,7 @@ class OAuthProvider:
         result = {k: v for k, v in meta.items() if k != "claims"}
         claims = meta.get("claims")
         if claims:
-            for key in ("sub", "email", "name", "groups"):
+            for key in ("sub", "email", "name", "groups", "idp_claims"):
                 if key in claims:
                     # A copy: the caller may mutate what it is handed.
                     result[key] = copy.deepcopy(claims[key])

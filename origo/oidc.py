@@ -14,6 +14,8 @@ What origo takes from the IdP, and nothing more:
 - ``email``, only when the IdP asserts ``email_verified: true``. An unverified
   email is dropped, and fails the domain gate if one is configured.
 - ``name`` and, when the configured claim is present, ``groups``.
+- with ``extra_claims``, the named id_token claims, copied as the IdP issued
+  them under ``idp_claims`` (never mixed in with origo's own claims).
 
 Those claims are stored with the grant (code -> access token -> every rotated
 refresh token), so they survive refresh-token rotation without another trip to
@@ -40,6 +42,7 @@ the tests replace with a fake IdP; nothing else here touches the network.
 """
 
 import base64
+import copy
 import hashlib
 import hmac
 import http.client
@@ -62,6 +65,11 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 logger = logging.getLogger("origo")
+
+# The most JSON IdentityProvider(extra_claims=...) carries per grant. Claims
+# are stored with every token of the grant; a bigger set is refused, never
+# truncated.
+MAX_EXTRA_CLAIMS_BYTES = 16 * 1024
 
 # alg -> (key type, hash, EC curve name or None). Asymmetric only: see module docstring.
 _ALGORITHMS = {
@@ -425,6 +433,17 @@ class IdentityProvider:
                          :class:`TokenSealer`).
         token_key_files: Paths to the same keys, one per file (raw 32 bytes,
                          hex, base64 or base64url), read once at construction.
+        extra_claims:    id_token claims to carry with the grant as the IdP
+                         issued them, each a name or a dotted path into a
+                         nested claim (``resource_access.my-client.roles``).
+                         They come back from ``verify_token`` under
+                         ``idp_claims``, re-nested along the same path, and
+                         are replaced from the IdP on every recheck. A path
+                         the id_token lacks is left out. origo never reads
+                         them: what they mean is the resource server's
+                         business. At most ``MAX_EXTRA_CLAIMS_BYTES`` of
+                         JSON; a sign-in whose claims are larger is refused.
+                         Default none.
 
     Every configured gate must pass. With neither gate set, anyone the IdP
     authenticates gets in — right for a realm that holds only your own people.
@@ -446,11 +465,12 @@ class IdentityProvider:
         recheck_on_refresh: bool = False,
         token_keys: Optional[Iterable[bytes]] = None,
         token_key_files: Optional[Iterable[str]] = None,
+        extra_claims: Optional[Iterable[str]] = None,
     ):
         if not issuer or not client_id:
             raise ValueError("IdentityProvider requires issuer and client_id")
         _require_secure_url(issuer, "IdentityProvider issuer")
-        for name, value in (("scopes", scopes), ("allowed_email_domains", allowed_email_domains), ("allowed_groups", allowed_groups)):
+        for name, value in (("scopes", scopes), ("allowed_email_domains", allowed_email_domains), ("allowed_groups", allowed_groups), ("extra_claims", extra_claims)):
             if isinstance(value, str):
                 raise TypeError(f"IdentityProvider {name} must be a list of strings, not a single string")
         if token_endpoint_auth_method not in ("client_secret_basic", "client_secret_post"):
@@ -467,6 +487,7 @@ class IdentityProvider:
         self.allowed_email_domains = frozenset(d.lower().lstrip("@") for d in (allowed_email_domains or []))
         self.allowed_groups = frozenset(allowed_groups or [])
         self.groups_claim = groups_claim
+        self.extra_claims = _claim_paths(extra_claims or [])
         self.token_endpoint_auth_method = token_endpoint_auth_method
         self.login_ttl = login_ttl
         self.clock_skew = clock_skew
@@ -808,7 +829,31 @@ class IdentityProvider:
         groups = self._groups(claims)
         if groups is not None:
             identity["groups"] = groups
+        extras = self._extra_claims(claims)
+        if extras:
+            identity["idp_claims"] = extras
         return identity
+
+    def _extra_claims(self, claims: dict) -> dict:
+        """The configured extra claims present in ``claims``, re-nested along
+        their paths. Copied, so nothing shares structure with the id_token."""
+        extras: dict = {}
+        for path in self.extra_claims:
+            value = claims
+            for part in path:
+                if not isinstance(value, dict) or part not in value:
+                    break
+                value = value[part]
+            else:
+                target = extras
+                for part in path[:-1]:
+                    target = target.setdefault(part, {})
+                target[path[-1]] = copy.deepcopy(value)
+        if extras and len(json.dumps(extras, separators=(",", ":"))) > MAX_EXTRA_CLAIMS_BYTES:
+            raise IdentityRefused(
+                f"sign-in refused: the IdP's extra claims exceed {MAX_EXTRA_CLAIMS_BYTES} bytes"
+            )
+        return extras
 
     def check_gate(self, identity: dict, claims: dict) -> None:
         if self.allowed_email_domains:
@@ -829,6 +874,26 @@ class IdentityProvider:
                     f"sign-in of {identity['sub']!r} refused: not in any allowed group "
                     f"(claim {self.groups_claim!r} = {identity.get('groups')!r})"
                 )
+
+
+def _claim_paths(paths: Iterable[str]) -> tuple[tuple[str, ...], ...]:
+    """Validate extra_claims: dotted paths of non-empty names. One path may
+    not lie inside another (both would write the same place)."""
+    parsed: list[tuple[str, ...]] = []
+    for path in paths:
+        if not isinstance(path, str) or not path:
+            raise ValueError("IdentityProvider extra_claims entries must be non-empty strings")
+        parts = tuple(path.split("."))
+        if any(not part for part in parts):
+            raise ValueError(f"IdentityProvider extra_claims entry {path!r} has an empty segment")
+        parsed.append(parts)
+    for a in parsed:
+        for b in parsed:
+            if a != b and b[: len(a)] == a:
+                raise ValueError(
+                    f"IdentityProvider extra_claims {'.'.join(b)!r} lies inside {'.'.join(a)!r}; list one"
+                )
+    return tuple(dict.fromkeys(parsed))
 
 
 def _form_encode(value: str) -> str:

@@ -163,6 +163,7 @@ The flow, per authorization:
 **Claims.** `sub` is `<issuer>|<idp sub>`, so two IdPs or realms can never collide. `email` is included only when the IdP asserts `email_verified: true`. `name` and `groups` are included when present. The claims are stored with the grant, so they survive refresh-token rotation without another trip to the IdP. They surface in three places:
 
 - `provider.verify_token(token)` returns `sub`, `email`, `name`, `groups` alongside `client_id`, `scope`, `resource` and `expires_at`, so a resource server can attribute a request to both the person and the client. The FastMCP adapter passes the same dict through as `AccessToken.claims`.
+- With `extra_claims`, `verify_token` also returns `idp_claims`: the listed id_token claims exactly as the IdP issued them (see *Extra claims* below).
 - `/userinfo` returns `sub`, plus `email` (`email` scope), `name` (`profile` scope) and `groups` (`groups` scope).
 - The `id_token` from `/token` (for `openid` requests) carries the same claims under the same scope rules.
 
@@ -196,6 +197,24 @@ IdentityProvider(
 - The IdP refresh tokens are sealed at rest with AES-256-GCM, each bound to its grant. The first key seals and every listed key opens, so to rotate a key put the new one first, keep the old one until every grant has refreshed once (each refresh re-seals under the first key), then drop it. Keys are required: `recheck_on_refresh` without one is a configuration error.
 - The origo client at the IdP must be issued refresh tokens (Keycloak's default for a standard-flow client). A sign-in where the IdP issues none fails with `server_error`. If the IdP returns no `id_token` on refresh, origo reads the claims from its `userinfo_endpoint`.
 - **Upgrading:** grants issued before `recheck_on_refresh` was turned on hold no IdP token, so their next refresh is refused and the person signs in once.
+
+**Extra claims** (`extra_claims=[...]`). A resource server that needs more of the IdP's answer than `sub`, `email`, `name` and `groups`, such as which organizations the person belongs to or their roles on one client, names those id_token claims, each a name or a dotted path:
+
+```python
+IdentityProvider(
+    issuer="https://auth.example.com/realms/staff",
+    client_id=..., client_secret=...,
+    extra_claims=["my_organizations", "resource_access.my-app.roles"],
+    recheck_on_refresh=True, token_key_files=[...],
+)
+```
+
+- `verify_token` returns them under `idp_claims`, re-nested along their paths (`{"my_organizations": {...}, "resource_access": {"my-app": {"roles": [...]}}}`). Only the listed paths are kept: other clients' roles under `resource_access` stay behind. A path the id_token lacks is left out, and `idp_claims` is absent when none is present.
+- origo never interprets them, never mixes them in with its own claims, and never releases them in its own `/userinfo` or `id_token`. They are the IdP's statements for the resource server to judge.
+- They are stored with the grant like the other claims. With `recheck_on_refresh` they are replaced from the IdP on every refresh, so a role or membership removed at the IdP is gone within one `token_ttl`. Without it they keep the sign-in's values until `max_grant_age`.
+- At most 16 KiB of JSON (`origo.oidc.MAX_EXTRA_CLAIMS_BYTES`). A sign-in or recheck whose claims are larger is refused, never truncated.
+- Managed sign-in (`ManagedSignIn`) finds the person through Keycloak's admin API, not an id_token, so its grants carry no `idp_claims`. A resource server that depends on them refuses those tokens by itself.
+- On Keycloak, the mapper behind each claim needs *Add to ID token* on, and *Add to userinfo* too if refreshed id_tokens are switched off.
 
 **Several origo instances, one IdP.** Each origo deployment registers its own callback URL at the IdP (one client per deployment, or one client listing every callback). Pending sign-ins live in origo's storage, so processes that share one SQLite file can take each other's callbacks; separate deployments with separate storage each hold their own grants.
 
