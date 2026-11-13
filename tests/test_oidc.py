@@ -1023,3 +1023,87 @@ def test_identity_provider_config_validation():
         OAuthProvider(base_url=BASE, public_registration=True, storage_path=None, cimd_allowed_clients="claude.ai")
     # Loopback http is fine for local development.
     IdentityProvider(issuer="http://localhost:8080/realms/dev", client_id="x")
+
+
+# --- Extra claims (idp_claims) ---
+
+ORGS = {"acme": {"id": "0b6e1c1e-4b7a-4f7e-9d43-2a1f0c1d2e3f"}}
+
+
+async def test_extra_claims_are_carried_under_idp_claims(fake, http):
+    provider = make_provider(fake, idp_kwargs={
+        "extra_claims": ["kajo_organizations", "resource_access.kajo.roles", "absent.claim"],
+    })
+    client = await http(provider)
+    tokens = await full_sign_in(
+        client, fake,
+        kajo_organizations=ORGS,
+        resource_access={"kajo": {"roles": ["activate"]}, "account": {"roles": ["manage-account"]}},
+    )
+    meta = provider.verify_token(tokens["access_token"])
+    # Only the listed paths, re-nested; a sibling client's roles stay behind,
+    # and a path the id_token lacks is left out.
+    assert meta["idp_claims"] == {
+        "kajo_organizations": ORGS,
+        "resource_access": {"kajo": {"roles": ["activate"]}},
+    }
+    # Never mixed in with origo's own claims, nor released by origo itself.
+    assert "kajo_organizations" not in meta
+    info = await client.get("/userinfo", headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    assert "idp_claims" not in info.json() and "kajo_organizations" not in info.json()
+    id_claims = json.loads(base64.urlsafe_b64decode(tokens["id_token"].split(".")[1] + "=="))
+    assert "idp_claims" not in id_claims
+
+
+async def test_extra_claims_absent_without_configuration_or_values(fake, http):
+    provider = make_provider(fake)
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake, kajo_organizations=ORGS)
+    assert "idp_claims" not in provider.verify_token(tokens["access_token"])
+
+    provider = make_provider(fake, idp_kwargs={"extra_claims": ["kajo_organizations"]})
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake)
+    assert "idp_claims" not in provider.verify_token(tokens["access_token"])
+
+
+async def test_extra_claims_survive_refresh_rotation(fake, http):
+    provider = make_provider(fake, idp_kwargs={"extra_claims": ["kajo_organizations"]})
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake, kajo_organizations=ORGS)
+    resp = await client.post("/token", data={
+        "grant_type": "refresh_token",
+        "client_id": "test-client",
+        "client_secret": "test-secret",
+        "refresh_token": tokens["refresh_token"],
+    })
+    assert resp.status_code == 200, resp.text
+    assert provider.verify_token(resp.json()["access_token"])["idp_claims"] == {"kajo_organizations": ORGS}
+
+
+async def test_extra_claims_result_cannot_mutate_the_grant(fake, http):
+    provider = make_provider(fake, idp_kwargs={"extra_claims": ["kajo_organizations"]})
+    client = await http(provider)
+    tokens = await full_sign_in(client, fake, kajo_organizations=ORGS)
+    provider.verify_token(tokens["access_token"])["idp_claims"]["kajo_organizations"]["evil"] = {"id": "x"}
+    assert provider.verify_token(tokens["access_token"])["idp_claims"] == {"kajo_organizations": ORGS}
+
+
+async def test_oversized_extra_claims_refuse_the_sign_in(fake, http):
+    from origo.oidc import MAX_EXTRA_CLAIMS_BYTES
+
+    client = await http(make_provider(fake, idp_kwargs={"extra_claims": ["big"]}))
+    cb, _ = await sign_in(client, fake, big="x" * MAX_EXTRA_CLAIMS_BYTES)
+    assert_refused(cb)
+
+
+def test_extra_claims_config_validation():
+    with pytest.raises(TypeError):
+        IdentityProvider(issuer=ISSUER, client_id="x", extra_claims="kajo_organizations")
+    for bad in ([""], ["a..b"], [".a"], ["a."], [None]):
+        with pytest.raises(ValueError):
+            IdentityProvider(issuer=ISSUER, client_id="x", extra_claims=bad)
+    with pytest.raises(ValueError, match="inside"):
+        IdentityProvider(issuer=ISSUER, client_id="x", extra_claims=["resource_access", "resource_access.kajo"])
+    idp = IdentityProvider(issuer=ISSUER, client_id="x", extra_claims=["a.b", "a.b", "c"])
+    assert idp.extra_claims == (("a", "b"), ("c",))

@@ -296,3 +296,25 @@ async def test_key_rotation_keeps_people_signed_in(idp, http, tmp_path):
     only_new = make_recheck_provider(idp, storage_path=db, keys=(KEY_B,))
     client = await http(only_new)
     assert (await _refresh(client, resp.json()["refresh_token"])).status_code == 200
+
+
+async def test_fresh_extra_claims_replace_the_stored_ones(idp, http):
+    provider = make_recheck_provider(idp, extra_claims=["kajo_organizations", "resource_access.kajo.roles"])
+    client = await http(provider)
+    orgs = {"acme": {"id": "0b6e1c1e-4b7a-4f7e-9d43-2a1f0c1d2e3f"}}
+    tokens = await full_sign_in(client, idp, kajo_organizations=orgs, resource_access={"kajo": {"roles": ["activate"]}})
+    assert provider.verify_token(tokens["access_token"])["idp_claims"]["resource_access"] == {"kajo": {"roles": ["activate"]}}
+    # The role and one organization are taken away at the IdP.
+    idp.user_claims["user-1"] = {"kajo_organizations": {}, "resource_access": {"kajo": {"roles": []}}}
+    resp = await _refresh(client, tokens["refresh_token"])
+    assert resp.status_code == 200, resp.text
+    assert provider.verify_token(resp.json()["access_token"])["idp_claims"] == {
+        "kajo_organizations": {},
+        "resource_access": {"kajo": {"roles": []}},
+    }
+    # Gone from the id_token altogether (the fake leaves out None claims):
+    # the stored copy goes too, nothing stale stays.
+    idp.user_claims["user-1"] = {"kajo_organizations": None, "resource_access": None}
+    resp = await _refresh(client, resp.json()["refresh_token"])
+    assert resp.status_code == 200, resp.text
+    assert "idp_claims" not in provider.verify_token(resp.json()["access_token"])
