@@ -88,6 +88,10 @@ class FakeIssuer:
 
 
 class FakeKeycloak:
+    # Roles are served only at the effective (/composite) role-mapping read,
+    # keyed (user, client uuid): what Keycloak 26.8.1 returns there includes
+    # roles through groups and composites (checked live, origo#153), which
+    # the direct-mapping read does not.
     def __init__(self):
         self.users = [{
             "id": "kc-ada", "username": "ada", "email": "ada@muutto365.fi", "emailVerified": True,
@@ -706,6 +710,7 @@ async def test_organizations_reach_the_gate_in_the_mappers_shape(http, issuer, k
 
 
 async def test_a_disabled_organization_still_counts(http, issuer, keycloak):
+    NoOrganizationsIdP.seen = []
     keycloak.organizations["kc-ada"] = [{"id": "org-1", "alias": "acme", "enabled": False}]
     client = await http(make_provider(issuer, keycloak, msi_kwargs=ORGS, idp_class=NoOrganizationsIdP))
     assert (await grant(client, issuer.assertion())).status_code == 400
@@ -756,3 +761,30 @@ async def test_looked_up_claims_reach_idp_claims_when_listed_in_extra_claims(htt
         "kc_organizations": {"acme": {"id": "org-1"}},
         "resource_access": {"origo": {"roles": ["publisher"]}},
     }
+
+
+async def test_roles_filed_under_another_clients_name_are_refused(http, issuer, keycloak):
+    """The roles are the identity provider's own client's (origo): filed at
+    resource_access.my-mcp.roles they would pass a gate on my-mcp."""
+    client = await http(make_provider(
+        issuer, keycloak, msi_kwargs={"client_roles_claim": "resource_access.my-mcp.roles"},
+        idp_kwargs={"groups_claim": "resource_access.my-mcp.roles", "allowed_groups": ["publisher"]},
+    ))
+    assert (await grant(client, issuer.assertion())).status_code == 503
+
+
+async def test_a_recreated_client_is_looked_up_again(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    # Recreated under a new id: the cached one now answers 404.
+    keycloak.clients[0] = {"id": "uuid-origo-new", "clientId": "origo"}
+    keycloak.client_roles = {("kc-ada", "uuid-origo-new"): [{"name": "publisher"}]}
+    real = keycloak.fetch_json
+
+    def fetch(url, form=None, headers=None, allow_list=False):
+        if "/role-mappings/clients/uuid-origo/" in url:
+            raise IdentityError("HTTP 404 Client not found", error="server_error", status=404)
+        return real(url, form, headers, allow_list)
+    keycloak.fetch_json = fetch
+    assert (await grant(client, issuer.assertion())).status_code == 503
+    assert (await grant(client, issuer.assertion())).status_code == 200

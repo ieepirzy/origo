@@ -116,13 +116,17 @@ class ManagedSignIn:
                            ``resource_access.my-mcp.roles``. Point the
                            identity provider's ``groups_claim`` at it to gate
                            on those roles. Omitted when the person has none,
-                           as the mapper omits it. Default None (not looked
-                           up).
+                           as the mapper omits it. A
+                           ``resource_access.<client>.roles`` path must name
+                           the identity provider's own client. Default None
+                           (not looked up).
         organizations_claim: Put the person's Organizations at this claim
                            (a dotted path) as ``{alias: {"id": id}}``, the
                            shape of the realm's organization-membership
                            mapper with "Add organization id" on, for a gate
-                           that reads it (``check_gate``'s ``claims``).
+                           that reads it (``check_gate``'s ``claims``): name
+                           exactly the claim that gate reads, or it sees none.
+                           Needs Organizations enabled on the realm.
                            Stricter than the mapper: a disabled Organization
                            counts too. Omitted when there are none. An
                            Organization without a readable alias and id fails
@@ -373,6 +377,17 @@ class ManagedSignIn:
         if name:
             upstream["name"] = name
         if self._client_roles_path:
+            path = self._client_roles_path
+            if (len(path) == 3 and path[0] == "resource_access" and path[2] == "roles"
+                    and path[1] != identity_provider.client_id):
+                # The roles are always the identity provider's own client's:
+                # filed under another client's name, a gate on that client
+                # would admit people for roles they hold elsewhere.
+                raise IdentityError(
+                    f"client_roles_claim {self.client_roles_claim!r} names another client than "
+                    f"{identity_provider.client_id!r}, whose roles it would carry",
+                    error="server_error",
+                )
             roles = await self._client_roles(admin, auth, identity_provider.client_id, user["id"])
             if roles:
                 _put_claim(upstream, self._client_roles_path, roles)
@@ -406,10 +421,16 @@ class ManagedSignIn:
                 )
             client_uuid = found[0]["id"]
             self._client_uuids[(admin, client_id)] = client_uuid
-        mappings = await self._fetch_list(
-            f"{admin}/users/{quote(user_id, safe='')}/role-mappings/clients/{quote(client_uuid, safe='')}/composite",
-            headers=auth,
-        )
+        try:
+            mappings = await self._fetch_list(
+                f"{admin}/users/{quote(user_id, safe='')}/role-mappings/clients/{quote(client_uuid, safe='')}/composite",
+                headers=auth,
+            )
+        except IdentityError:
+            # A client recreated under a new id (or a realm re-import) answers
+            # 404 here: look it up again next time rather than fail forever.
+            self._client_uuids.pop((admin, client_id), None)
+            raise
         roles: list[str] = []
         for role in mappings:
             value = role.get("name") if isinstance(role, dict) else None

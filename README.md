@@ -292,7 +292,8 @@ ManagedSignIn(
     issuer="https://identity.anthropic.com/issuers/iss_...",
     # The person's effective roles in the identity provider's own client,
     # where the realm's client-role mapper puts them. Point groups_claim here
-    # to gate on them. Needs view-clients as well.
+    # to gate on them ("my-mcp": the identity provider's client_id). Needs
+    # view-clients as well.
     client_roles_claim="resource_access.my-mcp.roles",
     # The person's organizations as {alias: {"id": id}}, the organization
     # membership mapper's shape with "Add organization id" on, for a gate
@@ -303,12 +304,15 @@ ManagedSignIn(
 ```
 
 Both fail closed: if the lookup cannot be made or its answer cannot be read
-(a missing role, an organization without an alias and id), `/token` answers
+(a missing realm-management role, an organization without an alias and id), `/token` answers
 `503 temporarily_unavailable` and issues nothing. A missing `view-clients` is
 caught at the client lookup, because Keycloak answers a role read for a client
 the caller may not view with an empty list, not an error. Every organization
 the person belongs to counts, a disabled one too (the mapper leaves those
-out). Neither claim may sit under `sub`, `email`, `email_verified`, `name` or
+out). `organizations_claim` must be exactly the claim your gate reads (a gate
+looking elsewhere sees no organizations), and needs organizations enabled on
+the realm. A `resource_access.<client>.roles` path must name the identity
+provider's own client, whose roles it carries; any other is refused. Neither claim may sit under `sub`, `email`, `email_verified`, `name` or
 `groups`, which origo sets itself. A claim also listed in the identity
 provider's `extra_claims` reaches `idp_claims` as it would from an id_token.
 
