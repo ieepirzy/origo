@@ -32,7 +32,14 @@ What the assertion must carry (all checked, any failure is ``invalid_grant``):
 
 The Keycloak lookup uses origo's own client at the IdP (client credentials),
 so no new secret: that client needs "Service accounts" enabled and the
-realm-management role ``view-users``.
+realm-management role ``view-users``. Two opt-in lookups make the managed
+upstream carry what a realm's other mappers put in an interactive id_token:
+``client_roles_claim`` (the IdP client's effective client roles; needs
+``view-clients`` too, since Keycloak 26 answers a role-mapping read for a
+client it may not view with an empty list, not an error) and
+``organizations_claim`` (the person's Organizations; needs
+``view-organizations``). Both fail closed: a lookup that cannot be made or
+read is ``server_error``, never "none".
 """
 
 import asyncio
@@ -101,6 +108,26 @@ class ManagedSignIn:
                            name only. Default: the
                            ``ORIGO_MANAGED_SIGNIN_DIRECTORY_URL`` environment
                            variable, else the issuer's own host.
+        client_roles_claim: Put the person's effective client roles in the
+                           identity provider's own client (``client_id``:
+                           direct, through groups and through composites) at
+                           this claim, a dotted path, as a list of role names:
+                           what a realm's client-role mapper emits, e.g.
+                           ``resource_access.my-mcp.roles``. Point the
+                           identity provider's ``groups_claim`` at it to gate
+                           on those roles. Omitted when the person has none,
+                           as the mapper omits it. Default None (not looked
+                           up).
+        organizations_claim: Put the person's Organizations at this claim
+                           (a dotted path) as ``{alias: {"id": id}}``, the
+                           shape of the realm's organization-membership
+                           mapper with "Add organization id" on, for a gate
+                           that reads it (``check_gate``'s ``claims``).
+                           Stricter than the mapper: a disabled Organization
+                           counts too. Omitted when there are none. An
+                           Organization without a readable alias and id fails
+                           the sign-in (``server_error``) rather than being
+                           skipped. Default None (not looked up).
 
     Assertions are not sender-constrained: claude.ai's client is public
     (``token_endpoint_auth_method: none``) and the issuer does not bind them
@@ -111,7 +138,8 @@ class ManagedSignIn:
     """
 
     def __init__(self, issuer: str, tenant: Optional[str] = None, max_assertion_age: int = 300, clock_skew: int = 60,
-                 group_paths: bool = False, directory_url: Optional[str] = None):
+                 group_paths: bool = False, directory_url: Optional[str] = None,
+                 client_roles_claim: Optional[str] = None, organizations_claim: Optional[str] = None):
         if not issuer:
             raise ValueError("ManagedSignIn requires issuer")
         _require_secure_url(issuer, "ManagedSignIn issuer")
@@ -131,6 +159,14 @@ class ManagedSignIn:
             if urlparse(directory_url).path not in ("", "/") or urlparse(directory_url).query:
                 raise ValueError("ManagedSignIn directory_url is a scheme, host and port only")
         self.directory_url = directory_url
+        self.client_roles_claim = client_roles_claim
+        self.organizations_claim = organizations_claim
+        self._client_roles_path = _upstream_claim_path(client_roles_claim, "client_roles_claim")
+        self._organizations_path = _upstream_claim_path(organizations_claim, "organizations_claim")
+        a, b = self._client_roles_path, self._organizations_path
+        if a and b and (a[: len(b)] == b or b[: len(a)] == a):
+            raise ValueError("ManagedSignIn client_roles_claim and organizations_claim overlap")
+        self._client_uuids: dict[tuple[str, str], str] = {}
         self._metadata: Optional[dict] = None
         self._metadata_fetched_at = 0.0
         self._metadata_retry_after = 0.0
@@ -336,9 +372,69 @@ class ManagedSignIn:
         upstream = {"sub": user["id"], "email": user["email"], "email_verified": True, "groups": names}
         if name:
             upstream["name"] = name
+        if self._client_roles_path:
+            roles = await self._client_roles(admin, auth, identity_provider.client_id, user["id"])
+            if roles:
+                _put_claim(upstream, self._client_roles_path, roles)
+        if self._organizations_path:
+            organizations = await self._organizations(admin, auth, user["id"])
+            if organizations:
+                _put_claim(upstream, self._organizations_path, organizations)
         identity = identity_provider.map_claims(upstream)
         identity_provider.check_gate(identity, upstream)
         return identity
+
+    async def _client_roles(self, admin: str, auth: dict, client_id: str, user_id: str) -> list[str]:
+        """The user's effective roles in ``client_id``, as Keycloak's
+        client-role mapper would emit them."""
+        client_uuid = self._client_uuids.get((admin, client_id))
+        if client_uuid is None:
+            # Exactly one exact match, or no roles can be read at all. Without
+            # view-clients Keycloak answers 403 here (or [] under
+            # query-clients) and the role read below would quietly be [].
+            query = urlencode({"clientId": client_id})
+            found = [
+                c for c in await self._fetch_list(f"{admin}/clients?{query}", headers=auth)
+                if isinstance(c, dict) and c.get("clientId") == client_id
+                and isinstance(c.get("id"), str) and c["id"]
+            ]
+            if len(found) != 1:
+                raise IdentityError(
+                    f"Keycloak client {client_id!r} not readable for the role lookup ({len(found)} found;"
+                    " the service account needs realm-management view-clients)",
+                    error="server_error",
+                )
+            client_uuid = found[0]["id"]
+            self._client_uuids[(admin, client_id)] = client_uuid
+        mappings = await self._fetch_list(
+            f"{admin}/users/{quote(user_id, safe='')}/role-mappings/clients/{quote(client_uuid, safe='')}/composite",
+            headers=auth,
+        )
+        roles: list[str] = []
+        for role in mappings:
+            value = role.get("name") if isinstance(role, dict) else None
+            if isinstance(value, str) and value and value not in roles:
+                roles.append(value)
+        return roles
+
+    async def _organizations(self, admin: str, auth: dict, user_id: str) -> dict:
+        """The user's Organizations as ``{alias: {"id": id}}``. Every entry
+        must be readable: one that is not fails the sign-in, so a gate that
+        refuses members of any Organization never sees fewer than there are."""
+        entries = await self._fetch_list(
+            f"{admin}/organizations/members/{quote(user_id, safe='')}/organizations?briefRepresentation=true",
+            headers=auth,
+        )
+        organizations: dict = {}
+        for entry in entries:
+            alias = entry.get("alias") if isinstance(entry, dict) else None
+            org_id = entry.get("id") if isinstance(entry, dict) else None
+            if not (isinstance(alias, str) and alias and isinstance(org_id, str) and org_id):
+                raise IdentityError(
+                    f"Keycloak returned an unreadable Organization for user {user_id!r}", error="server_error"
+                )
+            organizations[alias] = {"id": org_id}
+        return organizations
 
     async def _admin_access_token(self, identity_provider: IdentityProvider) -> str:
         if self._admin_token is not None and time.time() < self._admin_token_expires_at:
@@ -360,6 +456,30 @@ def _number(value, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
         raise IdentityError(f"assertion has no finite numeric {name}")
     return float(value)
+
+
+# The claims resolve() builds itself: an opt-in lookup may not overwrite them.
+_RESERVED_UPSTREAM_CLAIMS = frozenset({"sub", "email", "email_verified", "name", "groups"})
+
+
+def _upstream_claim_path(value: Optional[str], name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"ManagedSignIn {name} must be a non-empty string when given")
+    parts = tuple(value.split("."))
+    if any(not part for part in parts):
+        raise ValueError(f"ManagedSignIn {name} {value!r} has an empty segment")
+    if parts[0] in _RESERVED_UPSTREAM_CLAIMS:
+        raise ValueError(f"ManagedSignIn {name} may not be under {parts[0]!r}, which origo sets itself")
+    return parts
+
+
+def _put_claim(claims: dict, path: tuple[str, ...], value) -> None:
+    target = claims
+    for part in path[:-1]:
+        target = target.setdefault(part, {})
+    target[path[-1]] = value
 
 
 def _keycloak_admin_base(issuer: str, directory_url: Optional[str] = None) -> str:

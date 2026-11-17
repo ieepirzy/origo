@@ -98,6 +98,14 @@ class FakeKeycloak:
         self.searches: list[str] = []
         self.down = False
         self.locked: set[str] = set()
+        # The admin API reads behind the opt-in lookups (client_roles_claim,
+        # organizations_claim), as Keycloak 26 answers them.
+        self.clients = [{"id": "uuid-origo", "clientId": "origo"}, {"id": "uuid-other", "clientId": "origo-x"}]
+        self.client_roles = {("kc-ada", "uuid-origo"): [{"name": "publisher"}]}
+        self.organizations: dict[str, list] = {}
+        self.forbidden: set[str] = set()  # "clients", "organizations": a missing realm-management role
+        self.loose_client_search = False  # answer the clientId query with near matches too
+        self.requests: list[str] = []
 
     def fetch_json(self, url, form=None, headers=None, allow_list=False):
         if self.down:
@@ -113,6 +121,23 @@ class FakeKeycloak:
             return {"access_token": "kc-admin-token", "expires_in": 300}
         admin = "https://auth.example/admin/realms/staff"
         assert (headers or {}).get("Authorization") == "Bearer kc-admin-token"
+        self.requests.append(url)
+        if url.startswith(f"{admin}/clients?"):
+            if "clients" in self.forbidden:
+                raise IdentityError("HTTP 403", error="server_error", status=403)
+            wanted = parse_qs(urlparse(url).query)["clientId"][0]
+            if self.loose_client_search:
+                return list(self.clients)
+            return [c for c in self.clients if c["clientId"] == wanted]
+        if url.startswith(f"{admin}/users/") and "/role-mappings/clients/" in url and url.endswith("/composite"):
+            rest = url[len(f"{admin}/users/"):-len("/composite")]
+            uid, client_uuid = rest.split("/role-mappings/clients/")
+            return self.client_roles.get((uid, client_uuid), [])
+        if url.startswith(f"{admin}/organizations/members/"):
+            if "organizations" in self.forbidden:
+                raise IdentityError("HTTP 403", error="server_error", status=403)
+            uid = url[len(f"{admin}/organizations/members/"):].split("/", 1)[0]
+            return self.organizations.get(uid, [])
         if url.startswith(f"{admin}/users?"):
             self.searches.append(url)
             assert "exact=true" in url
@@ -144,12 +169,13 @@ def _claude_cimd(monkeypatch):
     monkeypatch.setattr("origo.endpoints._fetch_client_metadata_document", fetch)
 
 
-def make_provider(issuer, keycloak, tenant=None, idp_kwargs=None, managed=True, group_paths=False, **kwargs):
-    idp = IdentityProvider(issuer=KC_ISSUER, client_id="origo", client_secret="idp-secret", **(idp_kwargs or {}))
+def make_provider(issuer, keycloak, tenant=None, idp_kwargs=None, managed=True, group_paths=False, msi_kwargs=None,
+                  idp_class=IdentityProvider, **kwargs):
+    idp = idp_class(issuer=KC_ISSUER, client_id="origo", client_secret="idp-secret", **(idp_kwargs or {}))
     idp.fetch_json = keycloak.fetch_json
     msi = None
     if managed:
-        msi = ManagedSignIn(issuer=JAG_ISSUER, tenant=tenant, group_paths=group_paths)
+        msi = ManagedSignIn(issuer=JAG_ISSUER, tenant=tenant, group_paths=group_paths, **(msi_kwargs or {}))
         msi.fetch_json = lambda url, form=None, headers=None, allow_list=False: (
             issuer.fetch_json(url, form, headers, allow_list) if url.startswith(JAG_ISSUER)
             else keycloak.fetch_json(url, form, headers, allow_list)
@@ -581,3 +607,152 @@ def test_only_directory_urls_may_be_plain_http():
         msi.fetch_json("http://identity.example/issuers/iss_test/jwks.json")
     with pytest.raises(ValueError):
         _http_json("http://keycloak.keycloak.svc.cluster.local:8080/x")
+
+
+# --- Opt-in lookups: client roles and Organizations ---
+
+ROLES = {"client_roles_claim": "resource_access.origo.roles"}
+ROLE_GATE = {"groups_claim": "resource_access.origo.roles", "allowed_groups": ["publisher"]}
+ORGS = {"organizations_claim": "kc_organizations"}
+
+
+class NoOrganizationsIdP(IdentityProvider):
+    """A resource server's gate on the Organizations claim: members of any
+    Organization are refused (Some's home-tenant rule)."""
+
+    seen: list = []
+
+    def check_gate(self, identity, claims):
+        super().check_gate(identity, claims)
+        type(self).seen.append(claims.get("kc_organizations"))
+        if claims.get("kc_organizations"):
+            from origo.oidc import IdentityRefused
+            raise IdentityRefused("member of an Organization")
+
+
+async def test_by_default_neither_roles_nor_organizations_are_looked_up(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert not any("/clients" in u or "/organizations/" in u or "/role-mappings/" in u for u in keycloak.requests)
+
+
+async def test_client_roles_land_where_groups_claim_reads_them(http, issuer, keycloak):
+    provider = make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE)
+    resp = await grant(await http(provider), issuer.assertion())
+    assert resp.status_code == 200, resp.text
+    meta = provider.storage.verify_token(resp.json()["access_token"])
+    assert meta["claims"]["groups"] == ["publisher"]
+
+
+async def test_without_the_client_role_the_role_gate_refuses(http, issuer, keycloak):
+    keycloak.client_roles.clear()
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    resp = await grant(client, issuer.assertion())
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+
+
+async def test_roles_in_another_client_do_not_count(http, issuer, keycloak):
+    keycloak.client_roles = {("kc-ada", "uuid-other"): [{"name": "publisher"}]}
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+async def test_realm_groups_do_not_satisfy_a_role_gate(http, issuer, keycloak):
+    keycloak.client_roles.clear()
+    keycloak.groups["kc-ada"].append({"name": "publisher", "path": "/publisher"})
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+@pytest.mark.parametrize("break_lookup", ["forbidden", "absent", "duplicate"])
+async def test_an_unreadable_client_fails_closed_as_retryable(http, issuer, keycloak, break_lookup):
+    """Without view-clients, Keycloak 26 would answer the role read with []:
+    the client lookup is what must fail, loudly, not "no roles"."""
+    if break_lookup == "forbidden":
+        keycloak.forbidden.add("clients")
+    elif break_lookup == "absent":
+        keycloak.clients = []
+    else:
+        keycloak.clients.append({"id": "uuid-origo-2", "clientId": "origo"})
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    resp = await grant(client, issuer.assertion())
+    assert resp.status_code == 503 and resp.json()["error"] == "temporarily_unavailable"
+
+
+async def test_only_the_exact_client_id_is_taken_from_the_lookup(http, issuer, keycloak):
+    """A directory that answers with near matches (a search, a prefix):
+    only the client whose clientId is exactly the identity provider's."""
+    keycloak.loose_client_search = True
+    keycloak.client_roles[("kc-ada", "uuid-other")] = [{"name": "publisher"}]
+    keycloak.client_roles.pop(("kc-ada", "uuid-origo"))
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+async def test_the_client_lookup_is_cached(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ROLES, idp_kwargs=ROLE_GATE))
+    for _ in range(3):
+        assert (await grant(client, issuer.assertion())).status_code == 200
+    assert sum(1 for u in keycloak.requests if "/clients?" in u) == 1
+
+
+async def test_organizations_reach_the_gate_in_the_mappers_shape(http, issuer, keycloak):
+    NoOrganizationsIdP.seen = []
+    keycloak.organizations["kc-ada"] = [{"id": "org-1", "alias": "acme", "enabled": True}]
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ORGS, idp_class=NoOrganizationsIdP))
+    resp = await grant(client, issuer.assertion())
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+    assert NoOrganizationsIdP.seen == [{"acme": {"id": "org-1"}}]
+
+
+async def test_a_disabled_organization_still_counts(http, issuer, keycloak):
+    keycloak.organizations["kc-ada"] = [{"id": "org-1", "alias": "acme", "enabled": False}]
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ORGS, idp_class=NoOrganizationsIdP))
+    assert (await grant(client, issuer.assertion())).status_code == 400
+
+
+async def test_no_organizations_means_no_claim(http, issuer, keycloak):
+    NoOrganizationsIdP.seen = []
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ORGS, idp_class=NoOrganizationsIdP))
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert NoOrganizationsIdP.seen == [None]
+
+
+@pytest.mark.parametrize("entry", [
+    {"id": "org-1"}, {"alias": "acme"}, {"id": "", "alias": "acme"}, {"id": 1, "alias": "acme"}, "acme", None,
+])
+async def test_an_unreadable_organization_fails_closed(http, issuer, keycloak, entry):
+    keycloak.organizations["kc-ada"] = [entry]
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ORGS, idp_class=NoOrganizationsIdP))
+    assert (await grant(client, issuer.assertion())).status_code == 503
+
+
+async def test_an_organization_lookup_error_fails_closed(http, issuer, keycloak):
+    keycloak.forbidden.add("organizations")
+    client = await http(make_provider(issuer, keycloak, msi_kwargs=ORGS, idp_class=NoOrganizationsIdP))
+    resp = await grant(client, issuer.assertion())
+    assert resp.status_code == 503 and resp.json()["error"] == "temporarily_unavailable"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"client_roles_claim": ""}, {"client_roles_claim": "a..b"}, {"client_roles_claim": "groups"},
+    {"organizations_claim": "sub"}, {"organizations_claim": "email.x"},
+    {"client_roles_claim": "a.b", "organizations_claim": "a"},
+    {"client_roles_claim": "a", "organizations_claim": "a.b"},
+])
+def test_bad_claim_paths_are_refused(kwargs):
+    with pytest.raises(ValueError):
+        ManagedSignIn(issuer=JAG_ISSUER, **kwargs)
+
+
+async def test_looked_up_claims_reach_idp_claims_when_listed_in_extra_claims(http, issuer, keycloak):
+    keycloak.organizations["kc-ada"] = [{"id": "org-1", "alias": "acme"}]
+    provider = make_provider(issuer, keycloak, msi_kwargs={**ROLES, **ORGS},
+                             idp_kwargs={**ROLE_GATE, "extra_claims": ["kc_organizations", "resource_access.origo.roles"]})
+    resp = await grant(await http(provider), issuer.assertion())
+    assert resp.status_code == 200, resp.text
+    meta = provider.storage.verify_token(resp.json()["access_token"])
+    assert meta["claims"]["idp_claims"] == {
+        "kc_organizations": {"acme": {"id": "org-1"}},
+        "resource_access": {"origo": {"roles": ["publisher"]}},
+    }

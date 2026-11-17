@@ -213,7 +213,7 @@ IdentityProvider(
 - origo never interprets them, never mixes them in with its own claims, and never releases them in its own `/userinfo` or `id_token`. They are the IdP's statements for the resource server to judge.
 - They are stored with the grant like the other claims. With `recheck_on_refresh` they are replaced from the IdP on every refresh, so a role or membership removed at the IdP is gone within one `token_ttl`. Without it they keep the sign-in's values until `max_grant_age`.
 - At most 16 KiB of JSON (`origo.oidc.MAX_EXTRA_CLAIMS_BYTES`). A sign-in or recheck whose claims are larger is refused, never truncated.
-- Managed sign-in (`ManagedSignIn`) finds the person through Keycloak's admin API, not an id_token, so its grants carry no `idp_claims`. A resource server that depends on them refuses those tokens by itself.
+- Managed sign-in (`ManagedSignIn`) finds the person through Keycloak's admin API, not an id_token, so its grants carry `idp_claims` only for what its own lookups put there (`client_roles_claim`, `organizations_claim`, below). A resource server that depends on any other refuses those tokens by itself.
 - On Keycloak, the mapper behind each claim needs *Add to ID token* on, and *Add to userinfo* too if refreshed id_tokens are switched off.
 
 **Several origo instances, one IdP.** Each origo deployment registers its own callback URL at the IdP (one client per deployment, or one client listing every callback). Pending sign-ins live in origo's storage, so processes that share one SQLite file can take each other's callbacks; separate deployments with separate storage each hold their own grants.
@@ -281,6 +281,36 @@ path; the allow gate does.
 or set `ORIGO_MANAGED_SIGNIN_DIRECTORY_URL`. Plain http is accepted only for
 a `*.svc.cluster.local` name; the client-credentials token still comes from
 the issuer's token endpoint.
+
+**Client roles and organizations.** By default the person is looked up with
+their realm groups only. When the allow gate (or the resource server) reads
+something else an interactive sign-in gets from the realm's mappers, ask for
+it explicitly; each is opt-in and needs one more realm-management role:
+
+```python
+ManagedSignIn(
+    issuer="https://identity.anthropic.com/issuers/iss_...",
+    # The person's effective roles in the identity provider's own client,
+    # where the realm's client-role mapper puts them. Point groups_claim here
+    # to gate on them. Needs view-clients as well.
+    client_roles_claim="resource_access.my-mcp.roles",
+    # The person's organizations as {alias: {"id": id}}, the organization
+    # membership mapper's shape with "Add organization id" on, for a gate
+    # (IdentityProvider.check_gate's claims) that reads it. Needs
+    # view-organizations.
+    organizations_claim="my_organizations",
+)
+```
+
+Both fail closed: if the lookup cannot be made or its answer cannot be read
+(a missing role, an organization without an alias and id), `/token` answers
+`503 temporarily_unavailable` and issues nothing. A missing `view-clients` is
+caught at the client lookup, because Keycloak answers a role read for a client
+the caller may not view with an empty list, not an error. Every organization
+the person belongs to counts, a disabled one too (the mapper leaves those
+out). Neither claim may sit under `sub`, `email`, `email_verified`, `name` or
+`groups`, which origo sets itself. A claim also listed in the identity
+provider's `extra_claims` reaches `idp_claims` as it would from an id_token.
 
 No refresh token is issued: claude.ai asks for a fresh assertion, so removing
 someone from the organization or disabling them in Keycloak stops them at
