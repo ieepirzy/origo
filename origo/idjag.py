@@ -30,9 +30,12 @@ What the assertion must carry (all checked, any failure is ``invalid_grant``):
 - ``sub`` and ``email``;
 - ``aud_tenant`` equal to the configured ``tenant``, when one is configured.
 
-The Keycloak lookup uses origo's own client at the IdP (client credentials),
-so no new secret: that client needs "Service accounts" enabled and the
-realm-management role ``view-users``. Two opt-in lookups make the managed
+The Keycloak lookup uses origo's own client at the IdP (client credentials)
+by default, so no new secret: that client needs "Service accounts" enabled
+and the realm-management role ``view-users``. Where that client's secret is
+shared with something that should not read the realm, a separate directory
+client (``directory_client_id`` and its secret) makes the lookups instead,
+and the read roles go to its service account. Two opt-in lookups make the managed
 upstream carry what a realm's other mappers put in an interactive id_token:
 ``client_roles_claim`` (the IdP client's effective client roles; needs
 ``view-clients`` too, since Keycloak 26 answers a role-mapping read for a
@@ -43,6 +46,7 @@ read is ``server_error``, never "none".
 """
 
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -57,6 +61,7 @@ from .oidc import (
     IdentityProvider,
     IdentityRefused,
     _b64url_decode,
+    _form_encode,
     _http_json,
     _is_cluster_service_url,
     _JWKS_REFETCH_INTERVAL,
@@ -132,6 +137,27 @@ class ManagedSignIn:
                            Organization without a readable alias and id fails
                            the sign-in (``server_error``) rather than being
                            skipped. Default None (not looked up).
+        directory_client_id: A separate Keycloak client whose
+                           client-credentials token makes the admin-API
+                           lookups, instead of the identity provider's own
+                           client: give it (a service account only) the read
+                           roles, and the identity provider's client needs
+                           none. Its token comes from the identity provider's
+                           token endpoint. The roles read for
+                           ``client_roles_claim`` stay the identity provider's
+                           client's. Default: the
+                           ``ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID``
+                           environment variable, else None (the identity
+                           provider's client).
+        directory_client_secret: Its secret.
+        directory_client_secret_file: Or a file holding it, read on each
+                           token fetch (so a rotated secret is picked up
+                           without a restart; unreadable or empty fails the
+                           sign-in with ``server_error``). Exactly one of the
+                           two with ``directory_client_id``, neither without.
+                           Default: the
+                           ``ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE``
+                           environment variable.
 
     Assertions are not sender-constrained: claude.ai's client is public
     (``token_endpoint_auth_method: none``) and the issuer does not bind them
@@ -143,7 +169,9 @@ class ManagedSignIn:
 
     def __init__(self, issuer: str, tenant: Optional[str] = None, max_assertion_age: int = 300, clock_skew: int = 60,
                  group_paths: bool = False, directory_url: Optional[str] = None,
-                 client_roles_claim: Optional[str] = None, organizations_claim: Optional[str] = None):
+                 client_roles_claim: Optional[str] = None, organizations_claim: Optional[str] = None,
+                 directory_client_id: Optional[str] = None, directory_client_secret: Optional[str] = None,
+                 directory_client_secret_file: Optional[str] = None):
         if not issuer:
             raise ValueError("ManagedSignIn requires issuer")
         _require_secure_url(issuer, "ManagedSignIn issuer")
@@ -163,6 +191,27 @@ class ManagedSignIn:
             if urlparse(directory_url).path not in ("", "/") or urlparse(directory_url).query:
                 raise ValueError("ManagedSignIn directory_url is a scheme, host and port only")
         self.directory_url = directory_url
+        if directory_client_id is None:
+            directory_client_id = os.environ.get("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", "").strip() or None
+        if directory_client_secret is None and directory_client_secret_file is None:
+            directory_client_secret_file = (
+                os.environ.get("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE", "").strip() or None
+            )
+        for value, name in ((directory_client_id, "directory_client_id"),
+                            (directory_client_secret, "directory_client_secret"),
+                            (directory_client_secret_file, "directory_client_secret_file")):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"ManagedSignIn {name} must be a non-empty string when given")
+        if directory_client_secret is not None and directory_client_secret_file is not None:
+            raise ValueError("ManagedSignIn takes directory_client_secret or directory_client_secret_file, not both")
+        has_secret = directory_client_secret is not None or directory_client_secret_file is not None
+        if (directory_client_id is None) != (not has_secret):
+            # Half a directory client would quietly fall back to the identity
+            # provider's client, the one it exists to keep the reads off.
+            raise ValueError("ManagedSignIn directory_client_id and its secret are given together or not at all")
+        self.directory_client_id = directory_client_id
+        self._directory_client_secret = directory_client_secret
+        self.directory_client_secret_file = directory_client_secret_file
         self.client_roles_claim = client_roles_claim
         self.organizations_claim = organizations_claim
         self._client_roles_path = _upstream_claim_path(client_roles_claim, "client_roles_claim")
@@ -460,7 +509,10 @@ class ManagedSignIn:
     async def _admin_access_token(self, identity_provider: IdentityProvider) -> str:
         if self._admin_token is not None and time.time() < self._admin_token_expires_at:
             return self._admin_token
-        response = await identity_provider._token_request({"grant_type": "client_credentials"})
+        if self.directory_client_id is None:
+            response = await identity_provider._token_request({"grant_type": "client_credentials"})
+        else:
+            response = await self._directory_token_request(identity_provider)
         token = response.get("access_token")
         if not isinstance(token, str) or not token:
             raise IdentityError("Keycloak issued no service-account access token", error="server_error")
@@ -469,6 +521,29 @@ class ManagedSignIn:
         self._admin_token = token
         self._admin_token_expires_at = time.time() + max(lifetime - 30, 0)
         return token
+
+    async def _directory_token_request(self, identity_provider: IdentityProvider) -> dict:
+        """The directory client's client-credentials grant at the identity
+        provider's token endpoint. Never carries the identity provider's own
+        client credentials."""
+        secret = self._directory_client_secret
+        if secret is None:
+            try:
+                with open(self.directory_client_secret_file, encoding="utf-8") as f:
+                    secret = f.read().strip()
+            except OSError as exc:
+                raise IdentityError(
+                    f"directory client secret file unreadable: {exc.strerror or type(exc).__name__}",
+                    error="server_error",
+                ) from exc
+            if not secret:
+                raise IdentityError("directory client secret file is empty", error="server_error")
+        endpoint = (await identity_provider.metadata())["token_endpoint"]
+        # RFC 6749 §2.3.1: both halves form-urlencoded before being joined.
+        pair = f"{_form_encode(self.directory_client_id)}:{_form_encode(secret)}"
+        headers = {"Authorization": "Basic " + base64.b64encode(pair.encode()).decode()}
+        form = {"grant_type": "client_credentials", "client_id": self.directory_client_id}
+        return await self._fetch(endpoint, form=form, headers=headers)
 
 
 def _number(value, name: str) -> float:

@@ -99,6 +99,9 @@ class FakeKeycloak:
         }]
         self.groups = {"kc-ada": [{"name": "staff", "path": "/staff"}]}
         self.token_requests = 0
+        # Who may take the admin token: "<client_id>:<secret>" (Basic).
+        self.token_client = "origo:idp-secret"
+        self.token_calls: list[tuple[dict, dict]] = []
         self.searches: list[str] = []
         self.down = False
         self.locked: set[str] = set()
@@ -119,8 +122,10 @@ class FakeKeycloak:
                     "token_endpoint": f"{KC_ISSUER}/token", "jwks_uri": f"{KC_ISSUER}/certs"}
         if url == f"{KC_ISSUER}/token":
             assert form["grant_type"] == "client_credentials"
-            expected = base64.b64encode(b"origo:idp-secret").decode()
+            self.token_calls.append((dict(form), dict(headers or {})))
+            expected = base64.b64encode(self.token_client.encode()).decode()
             assert (headers or {}).get("Authorization") == f"Basic {expected}"
+            assert form.get("client_id") == self.token_client.split(":", 1)[0]
             self.token_requests += 1
             return {"access_token": "kc-admin-token", "expires_in": 300}
         admin = "https://auth.example/admin/realms/staff"
@@ -788,3 +793,90 @@ async def test_a_recreated_client_is_looked_up_again(http, issuer, keycloak):
     keycloak.fetch_json = fetch
     assert (await grant(client, issuer.assertion())).status_code == 503
     assert (await grant(client, issuer.assertion())).status_code == 200
+
+
+# --- A separate directory client for the lookups ---
+
+DIRECTORY_CLIENT = {"directory_client_id": "origo-directory", "directory_client_secret": "dir-secret"}
+
+
+async def test_a_directory_client_takes_the_admin_token_and_the_idp_secret_never_does(http, issuer, keycloak):
+    """With a directory client, the client-credentials grant is its own: the
+    identity provider's secret goes nowhere near it, the token comes from
+    the identity provider's token endpoint, and the roles read are still the
+    identity provider's client's."""
+    keycloak.token_client = "origo-directory:dir-secret"
+    client = await http(make_provider(issuer, keycloak, idp_kwargs=ROLE_GATE,
+                                      msi_kwargs={**DIRECTORY_CLIENT, **ROLES}))
+    resp = await grant(client, issuer.assertion())
+    assert resp.status_code == 200, resp.text
+    assert keycloak.token_calls
+    for form, headers in keycloak.token_calls:
+        assert form["client_id"] == "origo-directory"
+        sent = json.dumps([form, headers]) + base64.b64decode(headers["Authorization"].split()[1]).decode()
+        assert "idp-secret" not in sent and "origo:" not in sent
+    assert "https://auth.example/admin/realms/staff/clients?clientId=origo" in keycloak.requests
+
+
+async def test_without_a_directory_client_the_idp_client_takes_the_admin_token(http, issuer, keycloak):
+    client = await http(make_provider(issuer, keycloak))
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert [f["client_id"] for f, _ in keycloak.token_calls] == ["origo"]
+
+
+async def test_the_directory_secret_file_is_read_on_each_token_fetch(http, issuer, keycloak, tmp_path):
+    secret = tmp_path / "secret"
+    secret.write_text("dir-secret\n")
+    keycloak.token_client = "origo-directory:dir-secret"
+    provider = make_provider(issuer, keycloak, msi_kwargs={
+        "directory_client_id": "origo-directory", "directory_client_secret_file": str(secret)})
+    client = await http(provider)
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    # Rotated: the next token fetch sends the new secret.
+    secret.write_text("dir-secret-2")
+    keycloak.token_client = "origo-directory:dir-secret-2"
+    provider.managed_sign_in._admin_token = None
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert keycloak.token_requests == 2
+
+
+@pytest.mark.parametrize("content", [None, "", "  \n"])
+async def test_an_unreadable_or_empty_directory_secret_fails_closed(http, issuer, keycloak, tmp_path, content):
+    """No fallback to the identity provider's client: the sign-in is retryable
+    (503), and no token request is made at all."""
+    secret = tmp_path / "secret"
+    if content is not None:
+        secret.write_text(content)
+    client = await http(make_provider(issuer, keycloak, msi_kwargs={
+        "directory_client_id": "origo-directory", "directory_client_secret_file": str(secret)}))
+    resp = await grant(client, issuer.assertion())
+    assert resp.status_code == 503 and resp.json()["error"] == "temporarily_unavailable"
+    assert keycloak.token_calls == []
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"directory_client_id": "origo-directory"},
+    {"directory_client_secret": "s"},
+    {"directory_client_secret_file": "/run/secret"},
+    {"directory_client_id": "origo-directory", "directory_client_secret": "s",
+     "directory_client_secret_file": "/run/secret"},
+    {"directory_client_id": "", "directory_client_secret": "s"},
+    {"directory_client_id": "origo-directory", "directory_client_secret": ""},
+])
+def test_half_a_directory_client_is_refused(kwargs, monkeypatch):
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE", raising=False)
+    with pytest.raises(ValueError):
+        ManagedSignIn(issuer=JAG_ISSUER, **kwargs)
+
+
+def test_the_directory_client_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", "origo-directory")
+    monkeypatch.setenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE", "/run/secret")
+    msi = ManagedSignIn(issuer=JAG_ISSUER)
+    assert (msi.directory_client_id, msi.directory_client_secret_file) == ("origo-directory", "/run/secret")
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE")
+    with pytest.raises(ValueError):
+        ManagedSignIn(issuer=JAG_ISSUER)
+    monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID")
+    assert ManagedSignIn(issuer=JAG_ISSUER).directory_client_id is None
