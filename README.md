@@ -269,9 +269,10 @@ user whose **verified** email matches, with no pending required actions and
 no brute-force lockout, with the same subject
 (`<issuer>|<keycloak id>`), groups and allow gate as an interactive sign-in. No
 such user (or two) means `invalid_grant`: managed sign-in never creates
-identities. The lookup uses the identity provider's own client with the
-client-credentials grant, so the Keycloak client needs **Service accounts**
-enabled and the realm-management role **view-users**. Browser-flow policies
+identities. By default the lookup uses the identity provider's own client
+with the client-credentials grant, so the Keycloak client needs **Service
+accounts** enabled and the realm-management role **view-users** (or use a
+separate directory client, below). Browser-flow policies
 (conditional access in a custom authentication flow) do not apply to this
 path; the allow gate does.
 
@@ -281,6 +282,32 @@ path; the allow gate does.
 or set `ORIGO_MANAGED_SIGNIN_DIRECTORY_URL`. Plain http is accepted only for
 a `*.svc.cluster.local` name; the client-credentials token still comes from
 the issuer's token endpoint.
+
+**A separate directory client.** The lookup's read roles sit on whichever
+client takes the client-credentials token. If the identity provider's client
+secret is also held elsewhere (say, by a web app signing people in with the
+same client), give the reads to a dedicated client instead: a confidential
+Keycloak client with service accounts only and no login flows, holding the
+realm-management roles above, while the identity provider's client keeps
+**Service accounts** off.
+
+```python
+ManagedSignIn(
+    issuer="https://identity.anthropic.com/issuers/iss_...",
+    directory_client_id="my-mcp-directory",
+    # Read on each token fetch, so a rotated secret needs no restart.
+    directory_client_secret_file="/run/secrets/directory-client-secret",
+)
+```
+
+Or set `ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID` and
+`ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE` (`directory_client_secret=`
+takes the secret itself). Its token comes from the identity provider's token
+endpoint, and origo never falls back to the identity provider's client: an
+unreadable secret fails the sign-in (`server_error`, retryable), and half a
+configuration (an id without a secret, or the reverse) is refused at start.
+`client_roles_claim` still reads the person's roles in the identity
+provider's own client; only the caller changes.
 
 **Client roles and organizations.** By default the person is looked up with
 their realm groups only. When the allow gate (or the resource server) reads
