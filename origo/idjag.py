@@ -157,7 +157,12 @@ class ManagedSignIn:
                            two with ``directory_client_id``, neither without.
                            Default: the
                            ``ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE``
-                           environment variable.
+                           environment variable. The environment is read
+                           only when none of the three is given here.
+                           The directory client authenticates with
+                           client_secret_basic, and its token request goes
+                           through this object's ``fetch_json``, not the
+                           identity provider's.
 
     Assertions are not sender-constrained: claude.ai's client is public
     (``token_endpoint_auth_method: none``) and the issuer does not bind them
@@ -191,16 +196,17 @@ class ManagedSignIn:
             if urlparse(directory_url).path not in ("", "/") or urlparse(directory_url).query:
                 raise ValueError("ManagedSignIn directory_url is a scheme, host and port only")
         self.directory_url = directory_url
-        if directory_client_id is None:
+        if directory_client_id is None and directory_client_secret is None and directory_client_secret_file is None:
+            # The environment fills in a directory client as a whole, never
+            # half of one given here.
             directory_client_id = os.environ.get("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", "").strip() or None
-        if directory_client_secret is None and directory_client_secret_file is None:
             directory_client_secret_file = (
                 os.environ.get("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE", "").strip() or None
             )
         for value, name in ((directory_client_id, "directory_client_id"),
                             (directory_client_secret, "directory_client_secret"),
                             (directory_client_secret_file, "directory_client_secret_file")):
-            if value is not None and (not isinstance(value, str) or not value):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"ManagedSignIn {name} must be a non-empty string when given")
         if directory_client_secret is not None and directory_client_secret_file is not None:
             raise ValueError("ManagedSignIn takes directory_client_secret or directory_client_secret_file, not both")

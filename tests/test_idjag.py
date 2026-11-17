@@ -180,7 +180,7 @@ def _claude_cimd(monkeypatch):
 
 def make_provider(issuer, keycloak, tenant=None, idp_kwargs=None, managed=True, group_paths=False, msi_kwargs=None,
                   idp_class=IdentityProvider, **kwargs):
-    idp = idp_class(issuer=KC_ISSUER, client_id="origo", client_secret="idp-secret", **(idp_kwargs or {}))
+    idp = idp_class(**{"issuer": KC_ISSUER, "client_id": "origo", "client_secret": "idp-secret", **(idp_kwargs or {})})
     idp.fetch_json = keycloak.fetch_json
     msi = None
     if managed:
@@ -862,6 +862,7 @@ async def test_an_unreadable_or_empty_directory_secret_fails_closed(http, issuer
      "directory_client_secret_file": "/run/secret"},
     {"directory_client_id": "", "directory_client_secret": "s"},
     {"directory_client_id": "origo-directory", "directory_client_secret": ""},
+    {"directory_client_id": "  ", "directory_client_secret": "s"},
 ])
 def test_half_a_directory_client_is_refused(kwargs, monkeypatch):
     monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", raising=False)
@@ -880,3 +881,20 @@ def test_the_directory_client_comes_from_the_environment(monkeypatch):
         ManagedSignIn(issuer=JAG_ISSUER)
     monkeypatch.delenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID")
     assert ManagedSignIn(issuer=JAG_ISSUER).directory_client_id is None
+
+
+def test_the_environment_never_completes_half_a_directory_client(monkeypatch):
+    monkeypatch.setenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_ID", "origo-directory")
+    monkeypatch.setenv("ORIGO_MANAGED_SIGNIN_DIRECTORY_CLIENT_SECRET_FILE", "/run/secret")
+    with pytest.raises(ValueError):
+        ManagedSignIn(issuer=JAG_ISSUER, directory_client_secret="s")
+    with pytest.raises(ValueError):
+        ManagedSignIn(issuer=JAG_ISSUER, directory_client_id="other")
+
+
+async def test_a_public_idp_client_can_look_up_through_a_directory_client(http, issuer, keycloak):
+    keycloak.token_client = "origo-directory:dir-secret"
+    client = await http(make_provider(issuer, keycloak, idp_kwargs={"client_secret": None},
+                                      msi_kwargs=DIRECTORY_CLIENT))
+    assert (await grant(client, issuer.assertion())).status_code == 200
+    assert [f["client_id"] for f, _ in keycloak.token_calls] == ["origo-directory"]
